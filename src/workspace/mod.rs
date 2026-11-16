@@ -39,6 +39,22 @@ impl GitPathStatus {
 pub struct GitSnapshot {
     pub files: HashMap<PathBuf, GitPathStatus>,
     pub branch: Option<String>,
+    pub ahead_behind: Option<(u32, u32)>,
+}
+
+pub fn branch_chip(branch: &str, ahead_behind: Option<(u32, u32)>) -> String {
+    match ahead_behind {
+        Some((ahead, behind)) => format!("{branch} ↑{ahead} ↓{behind}"),
+        None => branch.to_string(),
+    }
+}
+
+pub fn parse_ahead_behind(output: &[u8]) -> Option<(u32, u32)> {
+    let text = String::from_utf8_lossy(output);
+    let mut parts = text.split_whitespace();
+    let ahead = parts.next()?.parse().ok()?;
+    let behind = parts.next()?.parse().ok()?;
+    Some((ahead, behind))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -342,10 +358,15 @@ pub fn spawn_git_status(root: PathBuf, tx: mpsc::UnboundedSender<GitStatusUpdate
             .output()
             .await;
         let update = match output {
-            Ok(output) if output.status.success() => Ok(GitSnapshot {
-                files: parse_git_status(&root, &output.stdout),
-                branch: git_branch(&root).await,
-            }),
+            Ok(output) if output.status.success() => {
+                let (branch, ahead_behind) =
+                    tokio::join!(git_branch(&root), git_ahead_behind(&root));
+                Ok(GitSnapshot {
+                    files: parse_git_status(&root, &output.stdout),
+                    branch,
+                    ahead_behind,
+                })
+            }
             Ok(output) => {
                 let message = String::from_utf8_lossy(&output.stderr);
                 tracing::warn!("git status exited {}: {}", output.status, message.trim());
@@ -373,6 +394,20 @@ async fn git_branch(root: &Path) -> Option<String> {
     }
     let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if name.is_empty() { None } else { Some(name) }
+}
+
+async fn git_ahead_behind(root: &Path) -> Option<(u32, u32)> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_ahead_behind(&output.stdout)
 }
 
 pub fn classify_watch_kind(kind: EventKind) -> Option<WatchKind> {
@@ -577,6 +612,9 @@ pub enum GitWrite {
         reload: Option<PathBuf>,
     },
     Commit(String),
+    Pull,
+    Push,
+    Publish(String),
 }
 
 pub struct GitArgv {
@@ -642,7 +680,31 @@ pub fn prepare_git_write(root: &Path, write: &GitWrite) -> Result<GitArgv, Strin
                 stdin: None,
             })
         }
+        GitWrite::Pull => Ok(GitArgv {
+            args: vec!["pull".into(), "--ff-only".into()],
+            stdin: None,
+        }),
+        GitWrite::Push => Ok(GitArgv {
+            args: vec!["push".into()],
+            stdin: None,
+        }),
+        GitWrite::Publish(branch) => {
+            if !publishable_branch(branch) {
+                return Err("No branch to publish".into());
+            }
+            Ok(GitArgv {
+                args: vec!["push".into(), "-u".into(), "origin".into(), branch.clone()],
+                stdin: None,
+            })
+        }
     }
+}
+
+fn publishable_branch(branch: &str) -> bool {
+    !branch.is_empty()
+        && !branch.starts_with('-')
+        && !branch.contains([' ', '\0', '\n', '~', '^', ':', '\\', '?', '*', '['])
+        && !branch.contains("..")
 }
 
 #[derive(Clone, Debug)]
@@ -651,6 +713,7 @@ pub struct GitWriteResult {
     pub message: String,
     pub reload: Option<PathBuf>,
     pub committed: Option<String>,
+    pub notice: Option<String>,
 }
 
 pub fn spawn_git_write(root: PathBuf, write: GitWrite, tx: mpsc::UnboundedSender<GitWriteResult>) {
@@ -663,11 +726,14 @@ pub fn spawn_git_write(root: PathBuf, write: GitWrite, tx: mpsc::UnboundedSender
                 message,
                 reload: None,
                 committed: None,
+                notice: None,
             },
         };
         if result.ok {
             match &write {
                 GitWrite::Commit(message) => result.committed = Some(message.trim().to_string()),
+                GitWrite::Pull => result.notice = Some("Pulled".into()),
+                GitWrite::Push | GitWrite::Publish(_) => result.notice = Some("Pushed".into()),
                 GitWrite::Apply { reload, .. } => result.reload = reload.clone(),
                 _ => {}
             }
@@ -716,6 +782,7 @@ fn git_finished(output: std::process::Output) -> GitWriteResult {
             message: String::new(),
             reload: None,
             committed: None,
+            notice: None,
         }
     } else {
         let message = String::from_utf8_lossy(&output.stderr)
@@ -735,6 +802,7 @@ fn git_failed(message: String) -> GitWriteResult {
         message,
         reload: None,
         committed: None,
+        notice: None,
     }
 }
 
@@ -975,9 +1043,6 @@ fn new_file_diff(relative: &str, text: &str) -> Option<ParsedGitDiff> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitPanelRow {
-    Summary,
-    Message,
-    Commit,
     Section {
         staged: bool,
     },
@@ -1001,12 +1066,7 @@ pub fn git_panel_rows(files: &HashMap<PathBuf, GitPathStatus>) -> Vec<GitPanelRo
     }
     staged.sort_by(|left, right| left.0.cmp(&right.0));
     changed.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut rows = vec![
-        GitPanelRow::Summary,
-        GitPanelRow::Message,
-        GitPanelRow::Commit,
-        GitPanelRow::Section { staged: true },
-    ];
+    let mut rows = vec![GitPanelRow::Section { staged: true }];
     for (path, status) in staged {
         rows.push(GitPanelRow::File {
             path,
@@ -1764,6 +1824,19 @@ diff --git a/readme.md b/readme.md
         let ok = prepare_git_write(root, &GitWrite::Commit("Keep the review".into())).unwrap();
         assert_eq!(ok.args, ["commit", "-m", "Keep the review"]);
         assert!(!ok.args.iter().any(|arg| arg == "--no-verify"));
+        let pull = prepare_git_write(root, &GitWrite::Pull).unwrap();
+        assert_eq!(pull.args, ["pull", "--ff-only"]);
+        let push = prepare_git_write(root, &GitWrite::Push).unwrap();
+        assert_eq!(push.args, ["push"]);
+        let publish = prepare_git_write(root, &GitWrite::Publish("main".into())).unwrap();
+        assert_eq!(publish.args, ["push", "-u", "origin", "main"]);
+        assert!(prepare_git_write(root, &GitWrite::Publish(String::new())).is_err());
+        assert!(prepare_git_write(root, &GitWrite::Publish("--force".into())).is_err());
+        assert_eq!(branch_chip("main", Some((2, 1))), "main ↑2 ↓1");
+        assert_eq!(branch_chip("main", None), "main");
+        assert_eq!(parse_ahead_behind(b"2\t1\n"), Some((2, 1)));
+        assert_eq!(parse_ahead_behind(b"0 0\n"), Some((0, 0)));
+        assert!(parse_ahead_behind(b"nope").is_none());
     }
 
     #[test]

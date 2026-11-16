@@ -194,6 +194,8 @@ pub enum HunkAction {
 #[derive(Clone, Debug)]
 pub enum GitClick {
     Message,
+    Pull,
+    Push,
     Commit,
     StageAll,
     UnstageAll,
@@ -343,6 +345,8 @@ pub struct App {
     pub agent_tx: mpsc::UnboundedSender<crate::agent::AgentEvent>,
     pub agent_run: Option<AgentRun>,
     pub git_branch: Option<String>,
+    pub git_ahead_behind: Option<(u32, u32)>,
+    pub git_publish_armed: bool,
     pub git_repo: bool,
     pub git_open: bool,
     pub git_selected: usize,
@@ -443,6 +447,8 @@ impl App {
             agent_tx,
             agent_run: None,
             git_branch: None,
+            git_ahead_behind: None,
+            git_publish_armed: false,
             git_repo: false,
             git_open: false,
             git_selected: 0,
@@ -525,7 +531,14 @@ impl App {
                 if self.git_status != snapshot.files {
                     self.git_status = snapshot.files;
                 }
+                if self.git_branch != snapshot.branch {
+                    self.git_publish_armed = false;
+                }
                 self.git_branch = snapshot.branch;
+                self.git_ahead_behind = snapshot.ahead_behind;
+                if self.git_ahead_behind.is_some() {
+                    self.git_publish_armed = false;
+                }
                 if discovered {
                     let open: Vec<_> = self.order.clone();
                     for id in open {
@@ -584,6 +597,8 @@ impl App {
         self.git_open = false;
         self.git_message_focus = false;
         self.git_branch = None;
+        self.git_ahead_behind = None;
+        self.git_publish_armed = false;
         self.git_status.clear();
         self.git_selected = 0;
         self.diff_view = None;
@@ -602,7 +617,14 @@ impl App {
         self.git_status.keys().any(|path| self.buffer_dirty(path))
     }
 
+    pub fn git_busy(&self) -> bool {
+        self.git_write_running
+    }
+
     pub fn enqueue_git_write(&mut self, write: GitWrite) {
+        if !matches!(write, GitWrite::Publish(_)) {
+            self.git_publish_armed = false;
+        }
         if let Err(message) = crate::workspace::prepare_git_write(&self.root, &write) {
             self.message = Some(message);
             return;
@@ -628,6 +650,8 @@ impl App {
                     self.git_message_focus = false;
                 }
                 self.message = Some("Committed".into());
+            } else if let Some(notice) = result.notice {
+                self.message = Some(notice);
             }
         } else if !result.message.is_empty() {
             self.message = Some(result.message);
@@ -638,6 +662,7 @@ impl App {
     }
 
     pub fn stage_path(&mut self, path: PathBuf) {
+        self.git_publish_armed = false;
         if self.buffer_dirty(&path) {
             self.message = Some("Save first".into());
             return;
@@ -646,6 +671,7 @@ impl App {
     }
 
     pub fn unstage_path(&mut self, path: PathBuf) {
+        self.git_publish_armed = false;
         if self.buffer_dirty(&path) {
             self.message = Some("Save first".into());
             return;
@@ -662,6 +688,7 @@ impl App {
     }
 
     pub fn stage_all(&mut self) {
+        self.git_publish_armed = false;
         if self.dirty_change() {
             self.message = Some("Save first".into());
             return;
@@ -678,6 +705,7 @@ impl App {
     }
 
     pub fn unstage_all(&mut self) {
+        self.git_publish_armed = false;
         if self.dirty_change() {
             self.message = Some("Save first".into());
             return;
@@ -694,6 +722,7 @@ impl App {
     }
 
     pub fn commit_git(&mut self) {
+        self.git_publish_armed = false;
         if !crate::workspace::can_commit(&self.git_message, &self.git_status) {
             self.message = Some(if self.git_message.trim().is_empty() {
                 "Write a commit message".into()
@@ -703,6 +732,36 @@ impl App {
             return;
         }
         self.enqueue_git_write(GitWrite::Commit(self.git_message.clone()));
+    }
+
+    pub fn pull_git(&mut self) {
+        if !self.git_repo {
+            return;
+        }
+        self.git_publish_armed = false;
+        self.enqueue_git_write(GitWrite::Pull);
+    }
+
+    pub fn push_git(&mut self) {
+        if !self.git_repo {
+            return;
+        }
+        if self.git_ahead_behind.is_none() {
+            if !self.git_publish_armed {
+                self.git_publish_armed = true;
+                self.message = Some("No upstream. Click Push again to publish.".into());
+                return;
+            }
+            self.git_publish_armed = false;
+            let Some(branch) = self.git_branch.clone().filter(|branch| !branch.is_empty()) else {
+                self.message = Some("No branch to publish".into());
+                return;
+            };
+            self.enqueue_git_write(GitWrite::Publish(branch));
+            return;
+        }
+        self.git_publish_armed = false;
+        self.enqueue_git_write(GitWrite::Push);
     }
 
     pub fn request_hunk(&mut self, index: usize, action: HunkAction) {
@@ -716,15 +775,19 @@ impl App {
             return;
         };
         if self.buffer_dirty(&path) {
+            self.git_publish_armed = false;
             self.message = Some("Save first".into());
             return;
         }
         let Some(parsed) = view.parsed.as_ref() else {
+            self.git_publish_armed = false;
             return;
         };
         let Some(patch) = crate::workspace::hunk_patch(parsed, index) else {
+            self.git_publish_armed = false;
             return;
         };
+        self.git_publish_armed = false;
         match action {
             HunkAction::Stage => self.enqueue_git_write(GitWrite::Apply {
                 patch,
@@ -748,6 +811,7 @@ impl App {
     }
 
     pub fn discard_hunk(&mut self, patch: String, path: PathBuf) {
+        self.git_publish_armed = false;
         if self.buffer_dirty(&path) {
             self.message = Some("Save first".into());
             return;
@@ -1451,8 +1515,14 @@ pub fn click_was_double(last: Option<(Instant, u16, u16)>, x: u16, y: u16) -> bo
     last.is_some_and(|(t, lx, ly)| lx == x && ly == y && t.elapsed() < Duration::from_millis(400))
 }
 
+pub const GIT_FOOTER_ROWS: usize = 3;
+
 pub fn explorer_inner_rows(height: u16) -> usize {
     height.saturating_sub(2) as usize
+}
+
+pub fn git_list_rows(height: u16) -> usize {
+    explorer_inner_rows(height).saturating_sub(GIT_FOOTER_ROWS)
 }
 
 pub fn max_explorer_scroll(len: usize, inner: usize) -> usize {
@@ -1683,9 +1753,47 @@ mod tests {
             app.receive_git_status(Ok(GitSnapshot {
                 files: HashMap::new(),
                 branch: Some("main".into()),
+                ahead_behind: None,
             }));
             assert!(app.git_repo);
             assert_eq!(app.git_branch.as_deref(), Some("main"));
+        });
+    }
+
+    #[test]
+    fn push_without_upstream_asks_before_publishing() {
+        with_runtime(|| {
+            let mut app = test_app();
+            app.root = PathBuf::from("/not-a-repo");
+            app.git_repo = true;
+            app.git_branch = Some("main".into());
+            app.push_git();
+            assert!(app.git_publish_armed);
+            assert_eq!(
+                app.message.as_deref(),
+                Some("No upstream. Click Push again to publish.")
+            );
+            app.push_git();
+            assert!(!app.git_publish_armed);
+
+            app.git_publish_armed = true;
+            app.commit_git();
+            assert!(!app.git_publish_armed);
+            assert_eq!(app.message.as_deref(), Some("Write a commit message"));
+
+            app.git_publish_armed = true;
+            app.stage_all();
+            assert!(!app.git_publish_armed);
+            assert_eq!(app.message.as_deref(), Some("No changes to stage"));
+
+            app.git_publish_armed = true;
+            app.pull_git();
+            assert!(!app.git_publish_armed);
+
+            app.git_ahead_behind = Some((2, 1));
+            app.git_publish_armed = true;
+            app.push_git();
+            assert!(!app.git_publish_armed);
         });
     }
 

@@ -294,6 +294,7 @@ mod tests {
         app.git_repo = true;
         app.git_open = true;
         app.git_branch = Some("main".into());
+        app.git_ahead_behind = Some((2, 1));
         app.git_message = "Keep the review".into();
         app.git_status.insert(
             PathBuf::from("/repo/src/main.rs"),
@@ -315,13 +316,77 @@ mod tests {
         assert!(text.contains("Staged"));
         assert!(text.contains("Changes"));
         assert!(text.contains("Commit"));
+        assert!(text.contains("Pull"));
+        assert!(text.contains("Push"));
+        assert!(text.contains("main ↑2 ↓1"));
         assert!(text.contains("main.rs"));
         assert!(text.contains("notes.txt"));
         assert!(text.contains("Keep the review"));
-        assert!(
-            app.git_hits
-                .iter()
-                .any(|hit| matches!(hit.action, crate::app::state::GitClick::Commit))
+        let first = row_text(terminal.backend().buffer(), app.explorer_area.1 + 1);
+        assert!(first.contains("Staged"));
+        assert!(first.contains("─"));
+        assert!(!first.contains("Pull"));
+        let pull = hit_for(&app, |action| {
+            matches!(action, crate::app::state::GitClick::Pull)
+        });
+        let push = hit_for(&app, |action| {
+            matches!(action, crate::app::state::GitClick::Push)
+        });
+        let commit = hit_for(&app, |action| {
+            matches!(action, crate::app::state::GitClick::Commit)
+        });
+        let message = hit_for(&app, |action| {
+            matches!(action, crate::app::state::GitClick::Message)
+        });
+        let last_inner = app.explorer_area.1 + app.explorer_area.3 - 2;
+        assert_eq!(commit.y, last_inner);
+        assert_eq!(pull.y, last_inner - 2);
+        assert_eq!(pull.y, push.y);
+        assert_eq!(commit.y, message.y);
+        assert!(pull.x < push.x);
+        assert!(message.x < commit.x);
+        let buffer = terminal.backend().buffer();
+        let sync = row_text(buffer, pull.y);
+        assert!(sync.contains("↓1"));
+        assert!(sync.contains("↑2"));
+        assert!(sync.contains("Pull"));
+        assert!(sync.contains("Push"));
+        assert!(!sync.contains("Commit"));
+        let between = row_text(buffer, pull.y + 1);
+        assert!(between.contains("─"));
+        assert!(!between.contains("Pull"));
+        assert!(!between.contains("Commit"));
+        assert_eq!(commit.y, pull.y + 2);
+        let pull_text = slice_text(buffer, pull.x, pull.y, pull.width);
+        let push_text = slice_text(buffer, push.x, push.y, push.width);
+        assert!(pull_text.contains("↓1"));
+        assert!(pull_text.contains("Pull"));
+        assert!(push_text.contains("↑2"));
+        assert!(push_text.contains("Push"));
+        assert!(push.x >= pull.x + pull.width);
+        let theme = app.theme();
+        assert_eq!(buffer[(pull.x, pull.y)].bg, theme.accent);
+        assert_eq!(buffer[(push.x, push.y)].bg, theme.accent);
+        assert_eq!(buffer[(message.x, message.y)].bg, theme.bg_status);
+        assert_eq!(buffer[(commit.x, commit.y)].bg, theme.accent);
+        assert_ne!(
+            buffer[(message.x, message.y)].bg,
+            buffer[(commit.x, commit.y)].bg
+        );
+        let commit_row = row_text(buffer, commit.y);
+        assert!(commit_row.contains("Commit"));
+        assert!(commit_row.contains("Keep the review"));
+        let inner_right = app.explorer_area.0 + app.explorer_area.2 - 1;
+        assert!(push.x + push.width <= inner_right);
+        assert!(commit.x + commit.width <= inner_right);
+        app.git_ahead_behind = Some((0, 0));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let quiet = hit_for(&app, |action| {
+            matches!(action, crate::app::state::GitClick::Pull)
+        });
+        assert_eq!(
+            terminal.backend().buffer()[(quiet.x, quiet.y)].bg,
+            theme.border
         );
         assert!(app.git_hits.iter().any(|hit| matches!(
             hit.action,
@@ -341,5 +406,28 @@ mod tests {
             }
         }
         text
+    }
+
+    fn row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|col| buffer[(col, y)].symbol().to_string())
+            .collect()
+    }
+
+    fn slice_text(buffer: &ratatui::buffer::Buffer, x: u16, y: u16, width: u16) -> String {
+        (x..x.saturating_add(width))
+            .map(|col| buffer[(col, y)].symbol().to_string())
+            .collect()
+    }
+
+    fn hit_for(
+        app: &App,
+        pred: impl Fn(&crate::app::state::GitClick) -> bool,
+    ) -> crate::app::state::GitHit {
+        app.git_hits
+            .iter()
+            .find(|hit| pred(&hit.action))
+            .expect("git hit")
+            .clone()
     }
 }

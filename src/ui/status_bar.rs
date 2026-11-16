@@ -8,6 +8,7 @@ use crate::app::App;
 use crate::app::events::status_text;
 use crate::app::state::{Overlay, StatusAction, StatusHit};
 use crate::language::LspStatus;
+use crate::workspace::branch_chip;
 
 struct Piece {
     text: String,
@@ -118,7 +119,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             Style::default().fg(theme.fg_muted)
         };
         left.push(Piece {
-            text: format!(" {branch} "),
+            text: format!(" {} ", branch_chip(branch, app.git_ahead_behind)),
             style: branch_style,
             action: Some(StatusAction::Git),
         });

@@ -59,10 +59,6 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             }
             KeyCode::Char('s') | KeyCode::Char('S') => return commands::save_active(app),
             KeyCode::Char('p') | KeyCode::Char('P') => return commands::open_search(app),
-            KeyCode::Char('d') | KeyCode::Char('D') if shift => {
-                app.toggle_diff();
-                return;
-            }
             KeyCode::Char('g') | KeyCode::Char('G') if shift => {
                 app.toggle_git();
                 return;
@@ -399,7 +395,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                         app.active = Some(tab.document_id);
                         app.focus = Focus::Editor;
                         app.overlay = Overlay::None;
-                        app.diff_view = None;
                     }
                 }
             } else if in_search {
@@ -438,24 +433,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                 app.git_message_focus = false;
                 app.focus = Focus::Editor;
                 if y == app.editor_area.1 {
-                    if let Some(diff) = content_tab_at(app, x, y) {
-                        if diff && !app.diff_is_showing() {
-                            app.toggle_diff();
-                        } else if !diff && app.diff_is_showing() {
-                            app.diff_view = None;
-                        }
-                    }
-                    return;
-                }
-                if app.diff_is_showing() {
-                    if let Some(hit) = app
-                        .diff_hits
-                        .iter()
-                        .find(|hit| y == hit.y && x >= hit.x && x < hit.x.saturating_add(hit.width))
-                        .copied()
-                    {
-                        app.request_hunk(hit.hunk, hit.action);
-                    }
                     return;
                 }
                 if !commands::begin_hscroll_drag(app, x, y) {
@@ -605,13 +582,6 @@ fn side_tab_at(app: &App, x: u16, y: u16) -> Option<bool> {
         .map(|hit| hit.changes)
 }
 
-fn content_tab_at(app: &App, x: u16, y: u16) -> Option<bool> {
-    app.content_tabs
-        .iter()
-        .find(|hit| y == hit.y && x >= hit.x && x < hit.x.saturating_add(hit.width))
-        .map(|hit| hit.diff)
-}
-
 fn in_rect(area: Option<(u16, u16, u16, u16)>, x: u16, y: u16) -> bool {
     area.is_some_and(|(ax, ay, w, h)| {
         x >= ax && x < ax.saturating_add(w) && y >= ay && y < ay.saturating_add(h)
@@ -625,8 +595,7 @@ mod tests {
     use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use tokio::sync::mpsc;
 
-    use crate::app::state::{App, DiffSource, DiffView, Overlay};
-    use crate::editor::DocumentId;
+    use crate::app::state::{App, Overlay};
     use crate::language::LanguageClient;
 
     use super::handle_event;
@@ -673,27 +642,6 @@ mod tests {
             let mut app = test_app();
             handle_event(&mut app, right_click(10, 5));
             assert!(symbol_menu(&app));
-        });
-    }
-
-    #[test]
-    fn symbol_menu_stays_closed_in_diff_mode() {
-        with_runtime(|| {
-            let mut app = test_app();
-            app.git_repo = true;
-            app.diff_view = Some(DiffView {
-                document_id: app.active.unwrap_or(DocumentId(0)),
-                path: Some(PathBuf::from("src/main.rs")),
-                source: DiffSource::Unstaged,
-                lines: Vec::new(),
-                parsed: None,
-                allow_hunks: false,
-                error: None,
-                scroll: 0,
-                loading: false,
-            });
-            handle_event(&mut app, right_click(10, 5));
-            assert!(matches!(app.overlay, Overlay::None));
         });
     }
 

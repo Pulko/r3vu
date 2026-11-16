@@ -114,11 +114,46 @@ pub enum LineMark {
     Modified,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeSide {
+    Unstaged,
+    Staged,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HunkBar {
+    StageDiscard,
+    Unstage,
+    StageUnstageDiscard,
+    Revert,
+    Renamed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LineChanges {
     pub marks: Vec<LineMark>,
+    pub sides: Vec<ChangeSide>,
+    pub staged_under: Vec<bool>,
     pub deleted_before: Vec<usize>,
     pub removed_before: Vec<Vec<String>>,
+    pub removed_sides: Vec<ChangeSide>,
+    pub index_of: Vec<Option<usize>>,
+    pub index_len: usize,
+}
+
+impl Default for LineChanges {
+    fn default() -> Self {
+        Self {
+            marks: Vec::new(),
+            sides: Vec::new(),
+            staged_under: Vec::new(),
+            deleted_before: vec![0],
+            removed_before: vec![Vec::new()],
+            removed_sides: vec![ChangeSide::Unstaged],
+            index_of: Vec::new(),
+            index_len: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,13 +161,15 @@ pub struct Hunk {
     pub start: usize,
     pub end: usize,
     pub removed: Vec<String>,
+    pub bar: HunkBar,
+    pub index_anchor: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VisualRow {
+    Bar { anchor: usize },
     Line(usize),
     Removed { text: String, anchor: usize },
-    Eof { anchor: usize },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,23 +200,30 @@ impl HunkReplacement {
 
 #[derive(Clone, Debug)]
 pub enum DiffBaseline {
-    Index(String),
+    Present(String),
     Absent,
 }
 
 impl DiffBaseline {
     pub fn original(&self) -> &str {
         match self {
-            DiffBaseline::Index(text) => text,
+            DiffBaseline::Present(text) => text,
             DiffBaseline::Absent => "",
         }
     }
 }
 
 #[derive(Clone, Debug)]
+pub struct FileBaselines {
+    pub head: DiffBaseline,
+    pub index: DiffBaseline,
+}
+
+#[derive(Clone, Debug)]
 pub struct GitDiffResult {
     pub document_id: crate::editor::DocumentId,
-    pub baseline: Option<DiffBaseline>,
+    pub head: Option<DiffBaseline>,
+    pub index: Option<DiffBaseline>,
 }
 
 #[derive(Clone, Debug)]
@@ -1196,39 +1240,40 @@ pub fn spawn_git_diff(
 ) {
     tokio::spawn(async move {
         let relative = path.strip_prefix(&root).unwrap_or(&path);
-        let spec = format!(":{}", relative.to_string_lossy().replace('\\', "/"));
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("show")
-            .arg(spec)
-            .output()
-            .await;
-        let result = match output {
-            Ok(output) if output.status.success() => {
-                let original = String::from_utf8_lossy(&output.stdout).into_owned();
-                GitDiffResult {
-                    document_id,
-                    baseline: Some(DiffBaseline::Index(original)),
-                }
-            }
-            Ok(output) => {
-                let message = String::from_utf8_lossy(&output.stderr)
-                    .trim()
-                    .to_string()
-                    .replace("fatal: ", "");
-                GitDiffResult {
-                    document_id,
-                    baseline: path_absent_from_head(&message).then_some(DiffBaseline::Absent),
-                }
-            }
-            Err(_) => GitDiffResult {
-                document_id,
-                baseline: None,
-            },
-        };
-        let _ = tx.send(result);
+        let spec = relative.to_string_lossy().replace('\\', "/");
+        let (head, index) = tokio::join!(
+            show_baseline(root.clone(), format!("HEAD:{spec}")),
+            show_baseline(root, format!(":{spec}")),
+        );
+        let _ = tx.send(GitDiffResult {
+            document_id,
+            head,
+            index,
+        });
     });
+}
+
+async fn show_baseline(root: PathBuf, spec: String) -> Option<DiffBaseline> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .arg("show")
+        .arg(spec)
+        .output()
+        .await;
+    match output {
+        Ok(output) if output.status.success() => Some(DiffBaseline::Present(
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )),
+        Ok(output) => {
+            let message = String::from_utf8_lossy(&output.stderr)
+                .trim()
+                .to_string()
+                .replace("fatal: ", "");
+            path_absent_from_head(&message).then_some(DiffBaseline::Absent)
+        }
+        Err(_) => None,
+    }
 }
 
 pub fn classify_lines(original: &str, current: &str) -> LineChanges {
@@ -1275,11 +1320,138 @@ pub fn classify_lines(original: &str, current: &str) -> LineChanges {
         removed_before[index].append(&mut pending_text);
         deleted_before[index] += pending_deletes;
     }
+    let len = marks.len();
     LineChanges {
+        sides: vec![ChangeSide::Unstaged; len],
+        staged_under: vec![false; len],
+        removed_sides: vec![ChangeSide::Unstaged; deleted_before.len()],
+        index_of: vec![None; len],
+        index_len: 0,
         marks,
         deleted_before,
         removed_before,
     }
+}
+
+pub fn review_changes(head: &str, index: &str, buffer: &str) -> LineChanges {
+    let mut changes = classify_lines(index, buffer);
+    let staged = classify_lines(head, index);
+    let origin = line_origins(index, buffer);
+    changes.index_of = origin.clone();
+    changes.index_len = staged.marks.len();
+    for buffer_line in 0..changes.marks.len() {
+        let Some(index_line) = origin.get(buffer_line).copied().flatten() else {
+            continue;
+        };
+        if changes.marks[buffer_line] != LineMark::Unchanged {
+            let staged_mark = staged
+                .marks
+                .get(index_line)
+                .copied()
+                .unwrap_or(LineMark::Unchanged);
+            let staged_removed = staged
+                .removed_before
+                .get(index_line)
+                .is_some_and(|lines| !lines.is_empty());
+            changes.staged_under[buffer_line] =
+                staged_mark != LineMark::Unchanged || staged_removed;
+            continue;
+        }
+        project_staged(&mut changes, buffer_line, index_line, &staged);
+    }
+    let end = changes.marks.len();
+    if changes.deleted_before.get(end).copied().unwrap_or(0) == 0 {
+        let index_end = staged.marks.len();
+        if staged
+            .deleted_before
+            .get(index_end)
+            .copied()
+            .is_some_and(|deleted| deleted > 0)
+        {
+            changes.removed_before[end] = removed_at(&staged, index_end);
+            changes.deleted_before[end] = staged.deleted_before[index_end];
+            changes.removed_sides[end] = ChangeSide::Staged;
+        }
+    }
+    changes
+}
+
+fn project_staged(
+    changes: &mut LineChanges,
+    buffer_line: usize,
+    index_line: usize,
+    staged: &LineChanges,
+) {
+    let mark = staged
+        .marks
+        .get(index_line)
+        .copied()
+        .unwrap_or(LineMark::Unchanged);
+    match mark {
+        LineMark::Added => {
+            changes.marks[buffer_line] = LineMark::Added;
+            changes.sides[buffer_line] = ChangeSide::Staged;
+        }
+        LineMark::Modified => {
+            changes.marks[buffer_line] = LineMark::Modified;
+            changes.sides[buffer_line] = ChangeSide::Staged;
+            if changes.removed_before[buffer_line].is_empty() {
+                changes.removed_before[buffer_line] = removed_at(staged, index_line);
+                changes.removed_sides[buffer_line] = ChangeSide::Staged;
+            }
+        }
+        LineMark::Unchanged => {}
+    }
+    let pure = staged.deleted_before.get(index_line).copied().unwrap_or(0);
+    if pure > 0
+        && changes.deleted_before[buffer_line] == 0
+        && changes.marks[buffer_line] == LineMark::Unchanged
+    {
+        changes.removed_before[buffer_line] = removed_at(staged, index_line);
+        changes.deleted_before[buffer_line] = pure;
+        changes.removed_sides[buffer_line] = ChangeSide::Staged;
+    }
+}
+
+fn line_origins(original: &str, current: &str) -> Vec<Option<usize>> {
+    use similar::{ChangeTag, TextDiff};
+
+    let old_lines = split_lines(original);
+    let new_lines = split_lines(current);
+    let old_refs: Vec<&str> = old_lines.iter().map(String::as_str).collect();
+    let new_refs: Vec<&str> = new_lines.iter().map(String::as_str).collect();
+    let diff = TextDiff::from_slices(&old_refs, &new_refs);
+    let mut origin = vec![None; new_lines.len()];
+    let mut new_index = 0usize;
+    let mut old_index = 0usize;
+    let mut pending_old: Vec<usize> = Vec::new();
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Equal => {
+                pending_old.clear();
+                if new_index < origin.len() {
+                    origin[new_index] = Some(old_index);
+                }
+                new_index += 1;
+                old_index += 1;
+            }
+            ChangeTag::Delete => {
+                pending_old.push(old_index);
+                old_index += 1;
+            }
+            ChangeTag::Insert => {
+                if new_index < origin.len() {
+                    origin[new_index] = if pending_old.is_empty() {
+                        None
+                    } else {
+                        Some(pending_old.remove(0))
+                    };
+                }
+                new_index += 1;
+            }
+        }
+    }
+    origin
 }
 
 fn diff_line_text(value: &str) -> String {
@@ -1291,11 +1463,8 @@ pub fn change_hunks(changes: &LineChanges) -> Vec<Hunk> {
     let mut index = 0;
     while index < changes.marks.len() {
         if changes.deleted_before[index] > 0 && changes.marks[index] == LineMark::Unchanged {
-            hunks.push(Hunk {
-                start: index,
-                end: index,
-                removed: removed_at(changes, index),
-            });
+            let removed = removed_at(changes, index);
+            hunks.push(make_hunk(changes, index, index, removed));
             index += 1;
             continue;
         }
@@ -1307,11 +1476,7 @@ pub fn change_hunks(changes: &LineChanges) -> Vec<Hunk> {
                 removed.extend(removed_at(changes, index));
                 index += 1;
             }
-            hunks.push(Hunk {
-                start,
-                end: index,
-                removed,
-            });
+            hunks.push(make_hunk(changes, start, index, removed));
             continue;
         }
         index += 1;
@@ -1323,13 +1488,130 @@ pub fn change_hunks(changes: &LineChanges) -> Vec<Hunk> {
         .is_some_and(|deleted| deleted > 0)
     {
         let start = changes.marks.len();
-        hunks.push(Hunk {
-            start,
-            end: start,
-            removed: removed_at(changes, start),
-        });
+        let removed = removed_at(changes, start);
+        hunks.push(make_hunk(changes, start, start, removed));
     }
     hunks
+}
+
+fn make_hunk(changes: &LineChanges, start: usize, end: usize, removed: Vec<String>) -> Hunk {
+    let (bar, index_anchor) = hunk_bar(changes, start, end);
+    Hunk {
+        start,
+        end,
+        removed,
+        bar,
+        index_anchor,
+    }
+}
+
+fn hunk_bar(changes: &LineChanges, start: usize, end: usize) -> (HunkBar, Option<usize>) {
+    let mut unstaged = false;
+    let mut staged = false;
+    if changes
+        .removed_before
+        .get(start)
+        .is_some_and(|lines| !lines.is_empty())
+    {
+        if changes.removed_sides.get(start).copied() == Some(ChangeSide::Staged) {
+            staged = true;
+        } else {
+            unstaged = true;
+        }
+    }
+    let scan_end = if end == start { start } else { end };
+    for line in start..scan_end {
+        if changes.marks.get(line).copied() == Some(LineMark::Unchanged) {
+            continue;
+        }
+        match changes.sides.get(line).copied() {
+            Some(ChangeSide::Staged) => staged = true,
+            Some(ChangeSide::Unstaged) => {
+                unstaged = true;
+                if changes.staged_under.get(line).copied().unwrap_or(false) {
+                    staged = true;
+                }
+            }
+            None => {}
+        }
+    }
+    let index_anchor = if start >= changes.index_of.len() {
+        Some(changes.index_len)
+    } else {
+        changes.index_of.get(start).copied().flatten().or_else(|| {
+            (start..scan_end).find_map(|line| changes.index_of.get(line).copied().flatten())
+        })
+    };
+    let bar = match (unstaged, staged) {
+        (true, true) => HunkBar::StageUnstageDiscard,
+        (false, true) => HunkBar::Unstage,
+        _ => HunkBar::StageDiscard,
+    };
+    (bar, index_anchor)
+}
+
+pub fn present_hunks(changes: &LineChanges, dirty: bool, renamed: bool) -> Vec<Hunk> {
+    let mut hunks = change_hunks(changes);
+    for hunk in &mut hunks {
+        if renamed {
+            hunk.bar = HunkBar::Renamed;
+        } else if dirty
+            && matches!(
+                hunk.bar,
+                HunkBar::StageDiscard | HunkBar::StageUnstageDiscard
+            )
+        {
+            hunk.bar = HunkBar::Revert;
+        }
+    }
+    hunks
+}
+
+pub fn patch_touching(diff: &ParsedGitDiff, start: usize, end: usize) -> Option<String> {
+    let mut picked = Vec::new();
+    for (index, hunk) in diff.hunks.iter().enumerate() {
+        if hunk_overlaps(&hunk.header, start, end) {
+            picked.push(index);
+        }
+    }
+    if picked.is_empty() {
+        None
+    } else {
+        Some(join_hunks(diff, &picked))
+    }
+}
+
+fn hunk_overlaps(header: &str, start: usize, end: usize) -> bool {
+    let Some((_, _, new_start, new_count, _)) = parse_hunk_header(header) else {
+        return false;
+    };
+    let new_start = new_start.saturating_sub(1);
+    let end = if end == start { start + 1 } else { end };
+    if new_count == 0 {
+        return new_start >= start && new_start < end;
+    }
+    let new_end = new_start + new_count;
+    start < new_end && new_start < end
+}
+
+fn join_hunks(diff: &ParsedGitDiff, indices: &[usize]) -> String {
+    let mut out = String::new();
+    for line in &diff.preamble {
+        out.push_str(line);
+        out.push('\n');
+    }
+    for index in indices {
+        let Some(hunk) = diff.hunks.get(*index) else {
+            continue;
+        };
+        out.push_str(&hunk.header);
+        out.push('\n');
+        for line in &hunk.lines {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn removed_at(changes: &LineChanges, index: usize) -> Vec<String> {
@@ -1396,15 +1678,15 @@ fn rope_end(rope: &Rope) -> Position {
     Position::new(line, line_visible_chars(rope, line))
 }
 
-pub fn visual_rows(line_count: usize, hunks: &[Hunk], open: &[usize]) -> Vec<VisualRow> {
+pub fn visual_rows(line_count: usize, hunks: &[Hunk], folded: &[usize]) -> Vec<VisualRow> {
     let mut rows = Vec::new();
     let mut index = 0;
     while index < line_count {
-        if let Some(hunk) = hunks
-            .iter()
-            .find(|hunk| hunk.start == index && open.contains(&hunk.start))
-        {
-            push_removed(&mut rows, hunk);
+        if let Some(hunk) = hunks.iter().find(|hunk| hunk.start == index) {
+            rows.push(VisualRow::Bar { anchor: hunk.start });
+            if !folded.contains(&hunk.start) {
+                push_removed(&mut rows, hunk);
+            }
         }
         rows.push(VisualRow::Line(index));
         index += 1;
@@ -1413,10 +1695,10 @@ pub fn visual_rows(line_count: usize, hunks: &[Hunk], open: &[usize]) -> Vec<Vis
         .iter()
         .find(|hunk| hunk.start == line_count && hunk.end == line_count)
     {
-        if open.contains(&hunk.start) {
+        rows.push(VisualRow::Bar { anchor: line_count });
+        if !folded.contains(&hunk.start) {
             push_removed(&mut rows, hunk);
         }
-        rows.push(VisualRow::Eof { anchor: line_count });
     }
     rows
 }
@@ -1438,7 +1720,7 @@ pub fn visual_index_for_line(rows: &[VisualRow], line: usize) -> Option<usize> {
 pub fn buffer_line_at(rows: &[VisualRow], visual_index: usize) -> Option<usize> {
     match rows.get(visual_index)? {
         VisualRow::Line(line) => Some(*line),
-        VisualRow::Removed { anchor, .. } | VisualRow::Eof { anchor } => Some(*anchor),
+        VisualRow::Bar { anchor } | VisualRow::Removed { anchor, .. } => Some(*anchor),
     }
 }
 
@@ -1929,22 +2211,33 @@ diff --git a/readme.md b/readme.md
         assert_eq!(hunks[0].end, 3);
         assert_eq!(hunks[0].removed, vec!["beta".to_string()]);
         let closed = visual_rows(changes.marks.len(), &hunks, &[]);
-        assert!(closed.iter().all(|row| matches!(row, VisualRow::Line(_))));
-        let open = visual_rows(changes.marks.len(), &hunks, &[1]);
-        assert_eq!(open[0], VisualRow::Line(0));
+        assert_eq!(closed[0], VisualRow::Line(0));
+        assert_eq!(closed[1], VisualRow::Bar { anchor: 1 });
         assert_eq!(
-            open[1],
+            closed[2],
             VisualRow::Removed {
                 text: "beta".into(),
                 anchor: 1,
             }
         );
-        assert_eq!(open[2], VisualRow::Line(1));
-        assert_eq!(open[3], VisualRow::Line(2));
-        assert_eq!(buffer_line_at(&open, 0), Some(0));
-        assert_eq!(buffer_line_at(&open, 1), Some(1));
-        assert_eq!(buffer_line_at(&open, 4), Some(3));
-        assert_eq!(visual_index_for_line(&open, 3), Some(4));
+        assert_eq!(closed[3], VisualRow::Line(1));
+        assert_eq!(closed[4], VisualRow::Line(2));
+        assert_eq!(buffer_line_at(&closed, 0), Some(0));
+        assert_eq!(buffer_line_at(&closed, 2), Some(1));
+        assert_eq!(buffer_line_at(&closed, 5), Some(3));
+        assert_eq!(visual_index_for_line(&closed, 3), Some(5));
+        let folded = visual_rows(changes.marks.len(), &hunks, &[1]);
+        assert!(
+            folded
+                .iter()
+                .any(|row| matches!(row, VisualRow::Bar { anchor: 1 }))
+        );
+        assert!(
+            folded
+                .iter()
+                .all(|row| !matches!(row, VisualRow::Removed { .. }))
+        );
+        assert!(folded.iter().any(|row| matches!(row, VisualRow::Line(1))));
     }
 
     #[test]
@@ -1953,20 +2246,17 @@ diff --git a/readme.md b/readme.md
         let hunks = change_hunks(&changes);
         assert_eq!(hunks.len(), 1);
         assert_eq!(hunks[0].start, 1);
-        let closed = visual_rows(1, &hunks, &[]);
-        assert_eq!(closed[0], VisualRow::Line(0));
-        assert_eq!(closed[1], VisualRow::Eof { anchor: 1 });
-        let open = visual_rows(1, &hunks, &[1]);
+        let rows = visual_rows(1, &hunks, &[]);
+        assert_eq!(rows[0], VisualRow::Line(0));
+        assert_eq!(rows[1], VisualRow::Bar { anchor: 1 });
         assert_eq!(
-            open[1],
+            rows[2],
             VisualRow::Removed {
                 text: "gone".into(),
                 anchor: 1,
             }
         );
-        assert_eq!(open[2], VisualRow::Eof { anchor: 1 });
-        assert_eq!(buffer_line_at(&open, 1), Some(1));
-        assert_eq!(buffer_line_at(&open, 2), Some(1));
+        assert_eq!(buffer_line_at(&rows, 2), Some(1));
     }
 
     #[test]
@@ -2028,6 +2318,62 @@ diff --git a/readme.md b/readme.md
         let changes = classify_lines("", "alpha\nbeta");
         assert_eq!(changes.marks, vec![LineMark::Added, LineMark::Added]);
         assert!(changes.deleted_before.iter().all(|count| *count == 0));
+    }
+
+    #[test]
+    fn review_keeps_staged_and_unstaged_on_one_bar() {
+        let head = "alpha\nbeta\ngamma\n";
+        let index = "alpha\nBETA\ngamma\n";
+        let staged = review_changes(head, index, index);
+        assert_eq!(staged.marks[1], LineMark::Modified);
+        assert_eq!(staged.sides[1], ChangeSide::Staged);
+        assert_eq!(staged.removed_before[1], vec!["beta".to_string()]);
+        let hunks = present_hunks(&staged, false, false);
+        assert_eq!(hunks[0].bar, HunkBar::Unstage);
+
+        let mixed = review_changes(head, index, "alpha\nX\ngamma\n");
+        assert_eq!(mixed.sides[1], ChangeSide::Unstaged);
+        assert!(mixed.staged_under[1]);
+        assert_eq!(mixed.removed_before[1], vec!["BETA".to_string()]);
+        assert_eq!(
+            present_hunks(&mixed, false, false)[0].bar,
+            HunkBar::StageUnstageDiscard
+        );
+        assert_eq!(present_hunks(&mixed, true, false)[0].bar, HunkBar::Revert);
+
+        let edited = review_changes(head, head, "alpha\nBETA\ngamma\n");
+        assert_eq!(
+            present_hunks(&edited, false, false)[0].bar,
+            HunkBar::StageDiscard
+        );
+        assert_eq!(present_hunks(&edited, true, false)[0].bar, HunkBar::Revert);
+        assert_eq!(present_hunks(&edited, false, true)[0].bar, HunkBar::Renamed);
+    }
+
+    #[test]
+    fn review_shows_a_staged_deletion() {
+        let changes = review_changes("keep\ngone\n", "keep\n", "keep\n");
+        let hunks = present_hunks(&changes, false, false);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].removed, vec!["gone".to_string()]);
+        assert_eq!(hunks[0].bar, HunkBar::Unstage);
+        let rows = visual_rows(changes.marks.len(), &hunks, &[]);
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            VisualRow::Removed { text, .. } if text == "gone"
+        )));
+    }
+
+    #[test]
+    fn patch_touching_selects_the_overlapping_hunk() {
+        let parsed = parse_git_diff(
+            "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -2,1 +2,1 @@\n-beta\n+BETA\n@@ -8,0 +8,1 @@\n+tail\n",
+        );
+        let first = patch_touching(&parsed, 1, 2).unwrap();
+        assert!(first.contains("@@ -2,1 +2,1 @@"));
+        assert!(!first.contains("+tail"));
+        let deletion = parse_git_diff("@@ -4,1 +4,0 @@\n-gone\n");
+        assert!(patch_touching(&deletion, 3, 3).unwrap().contains("-gone"));
     }
 
     #[test]

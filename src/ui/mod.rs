@@ -222,40 +222,36 @@ mod tests {
         assert!(!editor.contains("Diff"));
         assert!(!status.contains("topic"));
         assert_eq!(app.side_tabs.len(), 1);
-        assert_eq!(app.content_tabs.len(), 1);
-        assert!(!app.content_tabs[0].diff);
+        assert!(app.content_tabs.is_empty());
     }
 
     #[test]
-    fn editor_border_puts_diff_on_the_right() {
+    fn editor_border_has_no_diff_tab() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(PathBuf::from("."), LanguageClient { tx });
         app.git_repo = true;
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let y = app.editor_area.1;
-        let row = (0..app.editor_area.2)
+        let symbols: Vec<String> = (0..app.editor_area.2)
             .map(|col| {
                 terminal.backend().buffer()[(app.editor_area.0 + col, y)]
                     .symbol()
                     .to_string()
             })
-            .collect::<String>();
-        let editor = row.find("Editor").expect("file title");
-        let diff = row.find("Diff").expect("diff title");
-        assert!(editor < diff);
-        assert_eq!(app.content_tabs.len(), 2);
-        assert!(!app.content_tabs[0].diff);
-        assert!(app.content_tabs[1].diff);
-        assert!(app.content_tabs[0].x < app.content_tabs[1].x);
+            .collect();
+        let row = symbols.concat();
+        let editor = symbols
+            .windows(6)
+            .position(|cells| cells.concat() == "Editor")
+            .expect("file title");
+        assert!(!row.contains("Diff"));
+        assert!(app.content_tabs.is_empty());
         let accent = Color::Rgb(110, 186, 196);
         let buffer = terminal.backend().buffer();
-        let editor_cell = &buffer[(app.content_tabs[0].x + 1, y)];
+        let editor_cell = &buffer[(app.editor_area.0 + editor as u16, y)];
         assert_eq!(editor_cell.symbol(), "E");
         assert_eq!(editor_cell.fg, accent);
-        let diff_cell = &buffer[(app.content_tabs[1].x + 1, y)];
-        assert_eq!(diff_cell.symbol(), "D");
-        assert_ne!(diff_cell.fg, accent);
         let status = (0..app.status_area.2)
             .map(|col| {
                 buffer[(app.status_area.0 + col, app.status_area.1)]
@@ -264,27 +260,52 @@ mod tests {
             })
             .collect::<String>();
         assert!(!status.contains("Diff"));
+    }
 
-        app.diff_view = Some(crate::app::state::DiffView {
-            document_id: crate::editor::DocumentId(0),
-            path: Some(PathBuf::from("src/main.rs")),
-            source: crate::app::state::DiffSource::Unstaged,
-            lines: Vec::new(),
-            parsed: None,
-            allow_hunks: false,
-            error: None,
-            scroll: 0,
-            loading: false,
-        });
+    #[test]
+    fn changed_lines_show_stage_and_discard() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(PathBuf::from("."), LanguageClient { tx });
+        app.git_repo = true;
+        let id = crate::editor::DocumentId(app.next_id);
+        app.next_id += 1;
+        app.documents.insert(
+            id,
+            crate::editor::Document::new(
+                id,
+                Some(PathBuf::from("/repo/src/main.rs")),
+                "fn changed() {}\n".into(),
+            ),
+        );
+        app.views.insert(id, crate::editor::EditorView::new(id));
+        app.order.push(id);
+        app.active = Some(id);
+        app.focus = Focus::Editor;
+        app.diff_baselines.insert(
+            id,
+            crate::workspace::FileBaselines {
+                head: crate::workspace::DiffBaseline::Present("fn main() {}\n".into()),
+                index: crate::workspace::DiffBaseline::Present("fn main() {}\n".into()),
+            },
+        );
+        app.recompute_inline(id);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let y = app.editor_area.1;
-        let buffer = terminal.backend().buffer();
-        let file_cell = &buffer[(app.content_tabs[0].x + 1, y)];
-        assert_eq!(file_cell.symbol(), "s");
-        assert_ne!(file_cell.fg, accent);
-        let diff_cell = &buffer[(app.content_tabs[1].x + 1, y)];
-        assert_eq!(diff_cell.symbol(), "D");
-        assert_eq!(diff_cell.fg, accent);
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("▾"));
+        assert!(text.contains("Stage"));
+        assert!(text.contains("Discard"));
+        assert!(text.contains("changed"));
+        assert!(text.contains("main"));
+        assert!(text.contains("~"));
+        assert!(!text.contains("Unstaged"));
+        assert!(!text.contains("Staged"));
+        assert!(!text.contains("Diff"));
+        assert!(
+            app.diff_hits
+                .iter()
+                .any(|hit| hit.action == crate::app::state::HunkAction::Fold)
+        );
     }
 
     #[test]

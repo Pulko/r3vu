@@ -7,23 +7,17 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
-use crate::app::state::{
-    ContentTabHit, DiffHit, DiffSource, Focus, HScrollHit, HunkAction, TabHitBox,
-};
+use crate::app::state::{DiffHit, Focus, HScrollHit, HunkAction, TabHitBox};
 use crate::editor::{Range, display_col, hscroll_bar, line_text, max_line_display_width};
 use crate::syntax::HighlightKind;
 use crate::ui::theme::{Theme, highlight_color, highlight_modifier};
-use crate::workspace::{DiffKind, LineChanges, LineMark, VisualRow};
+use crate::workspace::{HunkBar, LineChanges, LineMark, VisualRow};
 
 pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
     app.hscroll_hit = None;
     app.diff_hits.clear();
     let theme = app.theme();
     render_tabs(frame, tabs, app, theme);
-    if app.diff_is_showing() {
-        render_diff(frame, area, app, theme);
-        return;
-    }
     let Some(id) = app.active else {
         frame.render_widget(
             Paragraph::new("Open a file from the explorer or press Ctrl+P")
@@ -51,10 +45,7 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
     let number_width = ((doc.rope.len_lines().max(1).ilog10() as u16) + 2).max(4);
     let rows = app.visual_rows(id);
     let changes = app.inline_changes.get(&id).cloned();
-    let hunks = changes
-        .as_ref()
-        .map(crate::workspace::change_hunks)
-        .unwrap_or_default();
+    let hunks = app.present_hunks(id);
     let gutter = number_width + 1;
     app.gutter_width = gutter;
     let inner_h = area.height.saturating_sub(2) as usize;
@@ -65,7 +56,7 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
         .take(inner_h)
         .filter_map(|row| match row {
             VisualRow::Line(line) => Some(*line),
-            VisualRow::Removed { .. } | VisualRow::Eof { .. } => None,
+            VisualRow::Removed { .. } | VisualRow::Bar { .. } => None,
         })
         .collect();
     let highlight_start = visible_lines.first().copied().unwrap_or(0);
@@ -90,11 +81,34 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
     };
 
     let mut lines = Vec::new();
+    let mut bar_hits = Vec::new();
     for row in 0..inner_h.max(1) {
         let Some(visual) = rows.get(view.viewport.top + row).cloned() else {
             lines.push(Line::from(""));
             continue;
         };
+        let y = area.y.saturating_add(1).saturating_add(lines.len() as u16);
+        if let VisualRow::Bar { anchor } = visual {
+            let bar = hunks
+                .iter()
+                .find(|hunk| hunk.start == anchor)
+                .map(|hunk| hunk.bar)
+                .unwrap_or(HunkBar::StageDiscard);
+            let open = !app.folded_hunks.contains(&(id, anchor));
+            let (line, hits) = hunk_bar(
+                bar,
+                anchor,
+                open,
+                theme,
+                number_width,
+                inner_w,
+                area.x.saturating_add(1),
+                y,
+            );
+            bar_hits.extend(hits);
+            lines.push(line);
+            continue;
+        }
         if let VisualRow::Removed { text, .. } = &visual {
             lines.push(removed_line(
                 text,
@@ -106,10 +120,6 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
             ));
             continue;
         }
-        if matches!(visual, VisualRow::Eof { .. }) {
-            lines.push(eof_line(number_width, theme));
-            continue;
-        }
         let VisualRow::Line(line_idx) = visual else {
             continue;
         };
@@ -118,25 +128,23 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
             continue;
         }
         let text = line_text(&doc.rope, line_idx);
-        let button = changes.as_ref().and_then(|changes| {
-            hunks
-                .iter()
-                .any(|hunk| hunk.start == line_idx)
-                .then(|| change_style(changes, line_idx, theme))
-                .flatten()
-        });
-        let mut spans = line_number(line_idx, number_width, button, theme);
+        let wash = changes
+            .as_ref()
+            .and_then(|changes| line_wash(changes, line_idx, theme));
+        let mut spans = line_number(line_idx, number_width, theme);
         spans.push(match changes.as_ref() {
             Some(changes) => gutter_span(changes, line_idx, theme),
             None => Span::raw(" "),
         });
+        let current = view.cursor.line == line_idx;
         spans.extend(paint_line(
             &text,
             line_idx,
             view.viewport.left,
             inner_w,
             tab_width,
-            view.cursor.line == line_idx,
+            current,
+            if current { None } else { wash },
             sel,
             &highlights,
             &diag,
@@ -166,6 +174,7 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
                 y: area.y + 1 + (cursor_row - view.viewport.top) as u16,
             })
     });
+    app.diff_hits.extend(bar_hits);
     frame.render_widget(
         Paragraph::new(lines)
             .style(theme.text())
@@ -242,24 +251,9 @@ fn paint_hscroll(frame: &mut Frame, area: Rect, app: &mut App, theme: Theme, inn
     );
 }
 
-fn line_number(
-    line_idx: usize,
-    number_width: u16,
-    revert: Option<Style>,
-    theme: Theme,
-) -> Vec<Span<'static>> {
+fn line_number(line_idx: usize, number_width: u16, theme: Theme) -> Vec<Span<'static>> {
     let ln = format!("{:>width$}", line_idx + 1, width = number_width as usize);
-    let Some(revert) = revert else {
-        return vec![Span::styled(ln, Style::default().fg(theme.fg_dim))];
-    };
-    let mut spans = vec![Span::styled("↩", revert)];
-    if number_width > 1 {
-        spans.push(Span::styled(
-            ln[1..].to_string(),
-            Style::default().fg(theme.fg_dim),
-        ));
-    }
-    spans
+    vec![Span::styled(ln, Style::default().fg(theme.fg_dim))]
 }
 
 fn removed_line(
@@ -270,24 +264,138 @@ fn removed_line(
     tab_width: usize,
     theme: Theme,
 ) -> Line<'static> {
+    let body = scrolled_plain(text, left, width, tab_width);
+    let shown = UnicodeWidthStr::width(body.as_str()).min(width);
+    let pad = " ".repeat(width.saturating_sub(shown));
+    let wash = Style::default().fg(theme.deleted).bg(theme.deleted_bg);
     Line::from(vec![
-        Span::styled(" ".repeat(number_width as usize), Style::default()),
-        Span::styled("-", Style::default().fg(theme.on_accent).bg(theme.deleted)),
         Span::styled(
-            scrolled_plain(text, left, width, tab_width),
-            Style::default().fg(theme.deleted),
+            " ".repeat(number_width as usize),
+            Style::default().bg(theme.deleted_bg),
         ),
+        Span::styled("-", wash),
+        Span::styled(body, wash),
+        Span::styled(pad, wash),
     ])
 }
 
-fn eof_line(number_width: u16, theme: Theme) -> Line<'static> {
-    let deleted = Style::default().fg(theme.on_accent).bg(theme.deleted);
-    let mut spans = vec![Span::styled("↩", deleted)];
-    if number_width > 1 {
-        spans.push(Span::raw(" ".repeat(number_width as usize - 1)));
+fn hunk_bar(
+    bar: HunkBar,
+    anchor: usize,
+    open: bool,
+    theme: Theme,
+    number_width: u16,
+    inner_w: usize,
+    x: u16,
+    y: u16,
+) -> (Line<'static>, Vec<DiffHit>) {
+    let icon = if open { "▾" } else { "▸" };
+    let note = match bar {
+        HunkBar::Renamed => "Renamed ",
+        HunkBar::Revert => "Unsaved ",
+        HunkBar::Unstage | HunkBar::StageUnstageDiscard | HunkBar::StageDiscard => "",
+    };
+    let actions: &[(&str, HunkAction)] = match bar {
+        HunkBar::StageDiscard => &[
+            (" Stage ", HunkAction::Stage),
+            (" Discard ", HunkAction::Discard),
+        ],
+        HunkBar::Unstage => &[(" Unstage ", HunkAction::Unstage)],
+        HunkBar::StageUnstageDiscard => &[
+            (" Stage ", HunkAction::Stage),
+            (" Unstage ", HunkAction::Unstage),
+            (" Discard ", HunkAction::Discard),
+        ],
+        HunkBar::Revert => &[(" Revert ", HunkAction::Revert)],
+        HunkBar::Renamed => &[],
+    };
+    let content_w = number_width as usize + 1 + inner_w;
+    let fold = format!(" {icon} ");
+    let fold_w = UnicodeWidthStr::width(fold.as_str());
+    let note_w = UnicodeWidthStr::width(note);
+    let actions_w: usize = actions
+        .iter()
+        .map(|(label, _)| UnicodeWidthStr::width(*label))
+        .sum();
+    let used = fold_w.saturating_add(note_w).saturating_add(actions_w);
+    let gap = content_w.saturating_sub(used);
+    let mut spans = vec![Span::styled(
+        fit_width(&fold, fold_w.min(content_w)),
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    )];
+    let mut hits = Vec::new();
+    if fold_w > 0 && fold_w <= content_w {
+        hits.push(DiffHit {
+            x,
+            y,
+            width: fold_w as u16,
+            anchor,
+            action: HunkAction::Fold,
+        });
     }
-    spans.push(Span::styled("▾", deleted));
-    Line::from(spans)
+    if !note.is_empty() && fold_w < content_w {
+        let note_style = if matches!(bar, HunkBar::Revert) {
+            Style::default().fg(theme.modified)
+        } else {
+            Style::default().fg(theme.fg_dim)
+        };
+        spans.push(Span::styled(
+            fit_width(note, content_w.saturating_sub(fold_w)),
+            note_style,
+        ));
+    }
+    if gap > 0 {
+        spans.push(Span::raw(" ".repeat(gap)));
+    }
+    let mut cursor = x.saturating_add(content_w.saturating_sub(actions_w) as u16);
+    for (label, action) in actions {
+        let width = UnicodeWidthStr::width(*label) as u16;
+        if cursor.saturating_add(width) > x.saturating_add(content_w as u16) {
+            break;
+        }
+        hits.push(DiffHit {
+            x: cursor,
+            y,
+            width,
+            anchor,
+            action: *action,
+        });
+        let action_style = match action {
+            HunkAction::Discard => Style::default()
+                .fg(theme.deleted)
+                .add_modifier(Modifier::BOLD),
+            HunkAction::Revert => Style::default()
+                .fg(theme.modified)
+                .add_modifier(Modifier::BOLD),
+            HunkAction::Stage | HunkAction::Unstage => Style::default()
+                .fg(theme.on_accent)
+                .bg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+            HunkAction::Fold => Style::default().fg(theme.accent),
+        };
+        spans.push(Span::styled((*label).to_string(), action_style));
+        cursor = cursor.saturating_add(width);
+    }
+    (Line::from(spans), hits)
+}
+
+fn fit_width(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut width = 0usize;
+    for grapheme in text.graphemes(true) {
+        let next = UnicodeWidthStr::width(grapheme);
+        if width + next > max_width {
+            break;
+        }
+        out.push_str(grapheme);
+        width += next;
+    }
+    out
 }
 
 fn scrolled_plain(text: &str, left: usize, width: usize, tab_width: usize) -> String {
@@ -325,157 +433,50 @@ fn scrolled_plain(text: &str, left: usize, width: usize, tab_width: usize) -> St
 }
 
 fn gutter_span(changes: &LineChanges, line_idx: usize, theme: Theme) -> Span<'static> {
-    let Some(style) = change_style(changes, line_idx, theme) else {
-        return Span::raw(" ");
-    };
-    let deleted = changes.deleted_before.get(line_idx).copied().unwrap_or(0) > 0;
-    let mark = changes
+    match changes
         .marks
         .get(line_idx)
         .copied()
-        .unwrap_or(LineMark::Unchanged);
-    if deleted && mark == LineMark::Unchanged {
-        Span::styled("▾", style)
-    } else {
-        Span::styled(" ", style)
+        .unwrap_or(LineMark::Unchanged)
+    {
+        LineMark::Added => Span::styled("+", Style::default().fg(theme.added)),
+        LineMark::Modified => Span::styled("~", Style::default().fg(theme.modified)),
+        LineMark::Unchanged => Span::raw(" "),
     }
 }
 
-fn change_style(changes: &LineChanges, line_idx: usize, theme: Theme) -> Option<Style> {
-    let mark = changes
+fn line_wash(changes: &LineChanges, line_idx: usize, theme: Theme) -> Option<Color> {
+    match changes
         .marks
         .get(line_idx)
         .copied()
-        .unwrap_or(LineMark::Unchanged);
-    let deleted = changes.deleted_before.get(line_idx).copied().unwrap_or(0) > 0;
-    let color = if deleted && mark == LineMark::Unchanged {
-        theme.deleted
-    } else {
-        match mark {
-            LineMark::Added => theme.added,
-            LineMark::Modified => theme.modified,
-            LineMark::Unchanged => return None,
-        }
-    };
-    Some(Style::default().fg(theme.on_accent).bg(color))
-}
-
-fn render_diff(frame: &mut Frame, area: Rect, app: &mut App, theme: Theme) {
-    let Some(diff) = app.diff_view.clone() else {
-        return;
-    };
-    let height = area.height.saturating_sub(2) as usize;
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let title = diff
-        .path
-        .as_ref()
-        .map(|path| app.relative(path))
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "Editor".into());
-    let lines = if diff.loading {
-        vec![Line::from(Span::styled(
-            "Loading Git diff…",
-            Style::default().fg(theme.fg_dim),
-        ))]
-    } else if let Some(error) = &diff.error {
-        vec![Line::from(Span::styled(
-            format!("Git diff unavailable: {error}"),
-            Style::default().fg(theme.warning),
-        ))]
-    } else if diff.lines.is_empty() {
-        vec![Line::from(Span::styled(
-            "No changes from HEAD",
-            Style::default().fg(theme.fg_dim),
-        ))]
-    } else {
-        diff.lines
-            .iter()
-            .enumerate()
-            .skip(diff.scroll)
-            .take(height)
-            .map(|(index, line)| {
-                let row = index - diff.scroll;
-                let y = area.y.saturating_add(1).saturating_add(row as u16);
-                diff_line(
-                    app,
-                    line,
-                    theme,
-                    inner_w,
-                    area.x.saturating_add(1),
-                    y,
-                    diff.source,
-                    diff.allow_hunks,
-                )
-            })
-            .collect()
-    };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(theme.text())
-            .block(content_block(area, app, &title)),
-        area,
-    );
+        .unwrap_or(LineMark::Unchanged)
+    {
+        LineMark::Added => Some(theme.added_bg),
+        LineMark::Modified => Some(theme.modified_bg),
+        LineMark::Unchanged => None,
+    }
 }
 
 fn content_block(area: Rect, app: &mut App, title: &str) -> Block<'static> {
     let theme = app.theme();
     let focused = app.focus == Focus::Editor;
-    let diff_on = app.diff_is_showing();
-    let show_diff = app.git_repo;
-    let diff_label = " Diff ";
-    let diff_w = UnicodeWidthStr::width(diff_label) as u16;
-    let room = area.width.saturating_sub(2);
-    let left_max = (if show_diff {
-        room.saturating_sub(diff_w.saturating_add(1))
-    } else {
-        room
-    }) as usize;
-    let left = fit_border_title(title, left_max);
-    let left_w = UnicodeWidthStr::width(left.as_str()) as u16;
-    let left_x = area.x.saturating_add(1);
-    let right_x = area
-        .x
-        .saturating_add(area.width)
-        .saturating_sub(1)
-        .saturating_sub(diff_w);
     app.content_tabs.clear();
-    if room > 0 && left_w > 0 {
-        app.content_tabs.push(ContentTabHit {
-            x: left_x,
-            y: area.y,
-            width: left_w.min(room),
-            diff: false,
-        });
-        if show_diff && right_x >= left_x.saturating_add(left_w) && diff_w <= room {
-            app.content_tabs.push(ContentTabHit {
-                x: right_x,
-                y: area.y,
-                width: diff_w,
-                diff: true,
-            });
-        }
-    }
-    let tab = |label: String, on: bool, alignment: Alignment| {
-        let style = if on {
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.fg_muted)
-        };
-        Line::from(Span::styled(label, style)).alignment(alignment)
-    };
+    let room = area.width.saturating_sub(2) as usize;
+    let label = fit_border_title(title, room);
     let border = if focused { theme.accent } else { theme.border };
-    let left_on = if show_diff { !diff_on } else { focused };
-    let mut block = Block::default()
+    let title_style = if focused {
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.fg_muted)
+    };
+    Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
         .style(theme.text())
-        .title(tab(left, left_on, Alignment::Left));
-    if show_diff {
-        block = block.title(tab(diff_label.to_string(), diff_on, Alignment::Right));
-    }
-    block
+        .title(Line::from(Span::styled(label, title_style)).alignment(Alignment::Left))
 }
 
 fn fit_border_title(title: &str, max_width: usize) -> String {
@@ -501,88 +502,6 @@ fn fit_border_title(title: &str, max_width: usize) -> String {
         width += next;
     }
     format!(" {body}… ")
-}
-
-fn diff_line(
-    app: &mut App,
-    line: &crate::workspace::DiffLine,
-    theme: Theme,
-    inner_w: usize,
-    x: u16,
-    y: u16,
-    source: DiffSource,
-    allow_hunks: bool,
-) -> Line<'static> {
-    let style = match line.kind {
-        DiffKind::Header => Style::default().fg(theme.accent),
-        DiffKind::Insert => Style::default().fg(theme.added),
-        DiffKind::Delete => Style::default().fg(theme.deleted),
-        DiffKind::Equal => Style::default().fg(theme.fg_muted),
-    };
-    let actions: Vec<(&str, HunkAction)> = match (allow_hunks, line.hunk, source) {
-        (true, Some(_), DiffSource::Unstaged) => {
-            vec![
-                (" Stage ", HunkAction::Stage),
-                (" Discard ", HunkAction::Discard),
-            ]
-        }
-        (true, Some(_), DiffSource::Staged) => vec![(" Unstage ", HunkAction::Unstage)],
-        _ => Vec::new(),
-    };
-    if actions.is_empty() {
-        return Line::from(Span::styled(fit_diff(&line.text, inner_w), style));
-    }
-    let hunk = line.hunk.unwrap_or(0);
-    let actions_w: usize = actions
-        .iter()
-        .map(|(label, _)| UnicodeWidthStr::width(*label))
-        .sum();
-    let text_w = inner_w.saturating_sub(actions_w.saturating_add(1));
-    let text = fit_diff(&line.text, text_w);
-    let gap =
-        inner_w.saturating_sub(UnicodeWidthStr::width(text.as_str()).saturating_add(actions_w));
-    let mut spans = vec![Span::styled(text, style), Span::raw(" ".repeat(gap))];
-    let mut cursor = x.saturating_add((inner_w.saturating_sub(actions_w)) as u16);
-    for (label, action) in actions {
-        let width = UnicodeWidthStr::width(label) as u16;
-        app.diff_hits.push(DiffHit {
-            x: cursor,
-            y,
-            width,
-            hunk,
-            action,
-        });
-        let action_style = match action {
-            HunkAction::Discard => Style::default().fg(theme.deleted),
-            HunkAction::Stage | HunkAction::Unstage => Style::default()
-                .fg(theme.on_accent)
-                .bg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        };
-        spans.push(Span::styled((*label).to_string(), action_style));
-        cursor = cursor.saturating_add(width);
-    }
-    Line::from(spans)
-}
-
-fn fit_diff(text: &str, max_width: usize) -> String {
-    if UnicodeWidthStr::width(text) <= max_width {
-        return text.to_string();
-    }
-    let ellipsis = "…";
-    let keep = max_width.saturating_sub(UnicodeWidthStr::width(ellipsis));
-    let mut out = String::new();
-    let mut width = 0;
-    for grapheme in text.graphemes(true) {
-        let grapheme_width = UnicodeWidthStr::width(grapheme);
-        if width + grapheme_width > keep {
-            break;
-        }
-        out.push_str(grapheme);
-        width += grapheme_width;
-    }
-    out.push('…');
-    out
 }
 
 fn render_markdown(frame: &mut Frame, area: Rect, app: &mut App, theme: Theme) {
@@ -920,6 +839,7 @@ fn paint_line(
     width: usize,
     tab_width: usize,
     current: bool,
+    wash: Option<Color>,
     sel: Option<Range>,
     highlights: &[crate::syntax::HighlightSpan],
     diags: &[crate::language::Diagnostic],
@@ -946,10 +866,11 @@ fn paint_line(
     let mut out = Vec::new();
     let mut display = 0usize;
     let mut col = 0usize;
-    let bg_current = if current {
+    let mut painted = 0usize;
+    let base_bg = if current {
         Some(theme.bg_current)
     } else {
-        None
+        wash
     };
     for (g, w) in chars {
         let start_col = col;
@@ -964,7 +885,7 @@ fn paint_line(
             break;
         }
         let mut style = Style::default();
-        if let Some(bg) = bg_current {
+        if let Some(bg) = base_bg {
             style = style.bg(bg);
         }
         if let Some(kind) = highlight_at(highlights, line_idx, start_col) {
@@ -994,14 +915,25 @@ fn paint_line(
                 .fg(diagnostic_color(diag.severity, theme));
         }
         let visible = if g == "\t" { " ".repeat(w) } else { g.clone() };
+        painted += UnicodeWidthStr::width(visible.as_str());
         out.push(Span::styled(visible, style));
     }
-    if out.is_empty() {
+    if painted < width {
         let mut style = Style::default();
-        if let Some(bg) = bg_current {
+        if let Some(bg) = base_bg {
             style = style.bg(bg);
         }
-        out.push(Span::styled(" ", style));
+        let fill = if out.is_empty() { " " } else { "" };
+        let extra = width - painted;
+        if extra > 0 {
+            out.push(Span::styled(
+                format!("{fill}{}", " ".repeat(extra.saturating_sub(fill.len()))),
+                style,
+            ));
+        }
+    }
+    if out.is_empty() {
+        out.push(Span::styled(" ", Style::default()));
     }
     out
 }

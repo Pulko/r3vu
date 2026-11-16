@@ -98,7 +98,6 @@ fn sync_normalized_buffer(app: &mut App, id: DocumentId, before: &str, notify_ls
 }
 
 pub fn type_text(app: &mut App, text: &str) {
-    app.diff_view = None;
     if app.markdown_preview_open() {
         app.markdown_preview = None;
     }
@@ -165,24 +164,6 @@ pub fn type_text(app: &mut App, text: &str) {
 }
 
 pub fn move_sel(app: &mut App, movement: Movement, selecting: bool) {
-    if let Some(diff) = app.diff_view.as_mut() {
-        match movement {
-            Movement::Up | Movement::PageUp => {
-                let amount = if movement == Movement::PageUp { 10 } else { 1 };
-                diff.scroll = diff.scroll.saturating_sub(amount);
-            }
-            Movement::Down | Movement::PageDown => {
-                let amount = if movement == Movement::PageDown {
-                    10
-                } else {
-                    1
-                };
-                diff.scroll = (diff.scroll + amount).min(diff.lines.len().saturating_sub(1));
-            }
-            _ => {}
-        }
-        return;
-    }
     if app.markdown_preview_open() {
         match movement {
             Movement::Up | Movement::Left => app.scroll_markdown_preview(-1),
@@ -433,7 +414,7 @@ pub fn hover(app: &mut App) {
 }
 
 pub fn schedule_hover(app: &mut App, x: u16, y: u16) {
-    if app.diff_view.is_some() || !matches!(app.overlay, Overlay::None | Overlay::Hover { .. }) {
+    if !matches!(app.overlay, Overlay::None | Overlay::Hover { .. }) {
         cancel_hover(app);
         return;
     }
@@ -1456,32 +1437,24 @@ pub fn click_editor(app: &mut App, x: u16, y: u16, selecting: bool) {
     if app.markdown_preview_open() {
         return;
     }
-    if !selecting && in_revert_column(app, x, y) && shows_revert(app, x, y) {
-        if let Some(line) = visual_target_line(app, x, y) {
-            app.revert_hunk_at_line(id, line);
-            let height = app.editor_area.3.saturating_sub(2).max(1) as usize;
-            let width = app.editor_area.2.saturating_sub(app.gutter_width) as usize;
-            let tab_width = app.config.tab_width;
-            if let (Some(doc), Some(view)) = (app.documents.get(&id), app.views.get_mut(&id)) {
-                view.ensure_visible(&doc.rope, height, width, tab_width);
+    if !selecting {
+        if let Some(hit) = app
+            .diff_hits
+            .iter()
+            .find(|hit| y == hit.y && x >= hit.x && x < hit.x.saturating_add(hit.width))
+            .copied()
+        {
+            app.request_hunk(hit.anchor, hit.action);
+            if hit.action == crate::app::state::HunkAction::Revert {
+                reveal_cursor(app, id);
             }
-            reveal_cursor(app, id);
+            return;
         }
-        return;
     }
-    let removed = removed_row_click(app, x, y);
-    if removed {
-        if !selecting {
-            if let Some(line) = visual_target_line(app, x, y) {
-                app.toggle_hunk_at_line(id, line);
-            }
-        }
-        return;
-    }
-    if !selecting && gutter_click(app, x, y) {
-        if let Some(line) = visual_target_line(app, x, y) {
-            app.toggle_hunk_at_line(id, line);
-        }
+    if matches!(
+        visual_row_at(app, x, y),
+        Some(crate::workspace::VisualRow::Removed { .. } | crate::workspace::VisualRow::Bar { .. })
+    ) {
         return;
     }
     let Some(pos) = editor_position_at(app, x, y) else {
@@ -1500,55 +1473,6 @@ pub fn click_editor(app: &mut App, x: u16, y: u16, selecting: bool) {
     reveal_cursor(app, id);
 }
 
-fn removed_row_click(app: &App, x: u16, y: u16) -> bool {
-    let Some(row) = visual_row_at(app, x, y) else {
-        return false;
-    };
-    matches!(row, crate::workspace::VisualRow::Removed { .. })
-}
-
-fn in_revert_column(app: &App, x: u16, y: u16) -> bool {
-    editor_rel_x(app, x, y) == Some(0)
-}
-
-fn shows_revert(app: &App, x: u16, y: u16) -> bool {
-    let Some(id) = app.active else {
-        return false;
-    };
-    let Some(row) = visual_row_at(app, x, y) else {
-        return false;
-    };
-    let hunks = app
-        .inline_changes
-        .get(&id)
-        .map(crate::workspace::change_hunks)
-        .unwrap_or_default();
-    match row {
-        crate::workspace::VisualRow::Line(line) => hunks.iter().any(|hunk| hunk.start == line),
-        crate::workspace::VisualRow::Eof { .. } => true,
-        crate::workspace::VisualRow::Removed { .. } => false,
-    }
-}
-
-fn gutter_click(app: &App, x: u16, y: u16) -> bool {
-    let Some(rel_x) = editor_rel_x(app, x, y) else {
-        return false;
-    };
-    rel_x + 1 == app.gutter_width
-}
-
-fn editor_rel_x(app: &App, x: u16, y: u16) -> Option<u16> {
-    let (ex, ey, _ew, eh) = app.editor_area;
-    if y <= ey || x <= ex {
-        return None;
-    }
-    let rel_y = y.saturating_sub(ey).saturating_sub(1);
-    if rel_y >= eh.saturating_sub(2) {
-        return None;
-    }
-    Some(x.saturating_sub(ex).saturating_sub(1))
-}
-
 fn visual_row_at(app: &App, x: u16, y: u16) -> Option<crate::workspace::VisualRow> {
     let id = app.active?;
     let (ex, ey, _ew, eh) = app.editor_area;
@@ -1561,17 +1485,6 @@ fn visual_row_at(app: &App, x: u16, y: u16) -> Option<crate::workspace::VisualRo
     }
     let visual = app.views.get(&id)?.viewport.top + rel_y as usize;
     app.visual_rows(id).get(visual).cloned()
-}
-
-fn visual_target_line(app: &App, _x: u16, y: u16) -> Option<usize> {
-    let id = app.active?;
-    let (_, ey, _, eh) = app.editor_area;
-    let rel_y = y.saturating_sub(ey).saturating_sub(1);
-    if rel_y >= eh.saturating_sub(2) {
-        return None;
-    }
-    let visual = app.views.get(&id)?.viewport.top + rel_y as usize;
-    crate::workspace::buffer_line_at(&app.visual_rows(id), visual)
 }
 
 pub fn editor_position_at(app: &App, x: u16, y: u16) -> Option<Position> {
@@ -1628,11 +1541,6 @@ pub fn reveal_cursor(app: &mut App, id: crate::editor::DocumentId) {
 }
 
 pub fn scroll_editor(app: &mut App, delta: i32) {
-    if let Some(diff) = app.diff_view.as_mut() {
-        diff.scroll = (diff.scroll as i32 + delta)
-            .clamp(0, diff.lines.len().saturating_sub(1) as i32) as usize;
-        return;
-    }
     if app.markdown_preview_open() {
         app.scroll_markdown_preview(delta);
         return;
@@ -1758,9 +1666,6 @@ pub fn drag_hscroll(app: &mut App, x: u16) {
 }
 
 fn assign_horizontal(app: &mut App, left: i32) {
-    if app.diff_view.is_some() {
-        return;
-    }
     let Some(id) = app.active else { return };
     let width = app.editor_area.2.saturating_sub(2 + app.gutter_width) as usize;
     let tab_width = app.config.tab_width;
@@ -2257,7 +2162,7 @@ pub fn receive_git_write(app: &mut App, result: crate::workspace::GitWriteResult
         }
     }
     app.refresh_git_status();
-    app.refresh_open_file_diff();
+    app.refresh_open_reviews();
 }
 
 pub fn click_explorer(app: &mut App, y: u16) {

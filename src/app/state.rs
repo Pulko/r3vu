@@ -15,8 +15,8 @@ use crate::language::{
 };
 use crate::syntax::SyntaxService;
 use crate::workspace::{
-    DiffBaseline, DiffLine, ExplorerEntry, FileDiffResult, FileFinder, GitDiffResult,
-    GitPathStatus, GitWrite, GitWriteResult, LineChanges, ParsedGitDiff, SearchMatch,
+    ExplorerEntry, FileBaselines, FileDiffResult, FileFinder, GitDiffResult, GitPathStatus,
+    GitWrite, GitWriteResult, LineChanges, ParsedGitDiff, SearchMatch,
 };
 
 use super::config::Config;
@@ -105,7 +105,6 @@ pub struct ContentTabHit {
     pub x: u16,
     pub y: u16,
     pub width: u16,
-    pub diff: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -179,16 +178,12 @@ pub enum StatusAction {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DiffSource {
-    Unstaged,
-    Staged,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HunkAction {
     Stage,
     Unstage,
     Discard,
+    Revert,
+    Fold,
 }
 
 #[derive(Clone, Debug)]
@@ -216,7 +211,7 @@ pub struct DiffHit {
     pub x: u16,
     pub y: u16,
     pub width: u16,
-    pub hunk: usize,
+    pub anchor: usize,
     pub action: HunkAction,
 }
 
@@ -246,16 +241,11 @@ pub struct TabHitBox {
 }
 
 #[derive(Clone, Debug)]
-pub struct DiffView {
-    pub document_id: DocumentId,
-    pub path: Option<PathBuf>,
-    pub source: DiffSource,
-    pub lines: Vec<DiffLine>,
-    pub parsed: Option<ParsedGitDiff>,
-    pub allow_hunks: bool,
-    pub error: Option<String>,
-    pub scroll: usize,
-    pub loading: bool,
+pub struct ReviewPatches {
+    pub unstaged: Option<ParsedGitDiff>,
+    pub staged: Option<ParsedGitDiff>,
+    pub renamed: bool,
+    token: u64,
 }
 
 pub const HOVER_DWELL: Duration = Duration::from_millis(400);
@@ -329,14 +319,15 @@ pub struct App {
     git_status_running: bool,
     git_status_again: bool,
     git_status_at: Option<Instant>,
-    pub diff_view: Option<DiffView>,
+    pub diff_baselines: HashMap<DocumentId, FileBaselines>,
+    pub review_patches: HashMap<DocumentId, ReviewPatches>,
+    pub reveal_change: Option<DocumentId>,
     pub markdown_preview: Option<crate::markdown::Preview>,
     pub gutter_width: u16,
     pub menu_area: Option<(u16, u16, u16, u16)>,
     pub menu_rows: Vec<(usize, u16)>,
     pub inline_changes: HashMap<DocumentId, LineChanges>,
-    pub diff_baselines: HashMap<DocumentId, DiffBaseline>,
-    pub open_hunks: HashSet<(DocumentId, usize)>,
+    pub folded_hunks: HashSet<(DocumentId, usize)>,
     pub thread: Thread,
     pub thread_visible: bool,
     pub thread_area: (u16, u16, u16, u16),
@@ -431,14 +422,15 @@ impl App {
             git_status_running: false,
             git_status_again: false,
             git_status_at: None,
-            diff_view: None,
+            diff_baselines: HashMap::new(),
+            review_patches: HashMap::new(),
+            reveal_change: None,
             markdown_preview: None,
             gutter_width: 4,
             menu_area: None,
             menu_rows: Vec::new(),
             inline_changes: HashMap::new(),
-            diff_baselines: HashMap::new(),
-            open_hunks: HashSet::new(),
+            folded_hunks: HashSet::new(),
             thread: Thread::new(),
             thread_visible: false,
             thread_area: (0, 0, 0, 0),
@@ -526,7 +518,6 @@ impl App {
         self.git_status_running = false;
         match result {
             Ok(snapshot) => {
-                let discovered = !self.git_repo;
                 self.git_repo = true;
                 if self.git_status != snapshot.files {
                     self.git_status = snapshot.files;
@@ -539,11 +530,10 @@ impl App {
                 if self.git_ahead_behind.is_some() {
                     self.git_publish_armed = false;
                 }
-                if discovered {
-                    let open: Vec<_> = self.order.clone();
-                    for id in open {
-                        self.request_inline_diff(id);
-                    }
+                let open: Vec<_> = self.order.clone();
+                for id in open {
+                    self.request_inline_diff(id);
+                    self.request_review_patches(id);
                 }
             }
             Err(crate::workspace::GitStatusError::NotARepository) => self.hide_git(),
@@ -584,12 +574,8 @@ impl App {
         self.focus = Focus::Explorer;
     }
 
-    pub fn diff_is_showing(&self) -> bool {
-        self.git_repo && self.diff_view.is_some()
-    }
-
     pub fn file_content_showing(&self) -> bool {
-        self.active.is_some() && !self.diff_is_showing() && !self.markdown_preview_open()
+        self.active.is_some() && !self.markdown_preview_open()
     }
 
     fn hide_git(&mut self) {
@@ -601,10 +587,11 @@ impl App {
         self.git_publish_armed = false;
         self.git_status.clear();
         self.git_selected = 0;
-        self.diff_view = None;
         self.inline_changes.clear();
         self.diff_baselines.clear();
-        self.open_hunks.clear();
+        self.review_patches.clear();
+        self.folded_hunks.clear();
+        self.reveal_change = None;
     }
 
     pub fn buffer_dirty(&self, path: &Path) -> bool {
@@ -764,14 +751,20 @@ impl App {
         self.enqueue_git_write(GitWrite::Push);
     }
 
-    pub fn request_hunk(&mut self, index: usize, action: HunkAction) {
-        let Some(view) = self.diff_view.clone() else {
+    pub fn request_hunk(&mut self, anchor: usize, action: HunkAction) {
+        let Some(id) = self.active else {
             return;
         };
-        if !view.allow_hunks {
+        if action == HunkAction::Fold {
+            self.toggle_hunk_fold(id, anchor);
             return;
         }
-        let Some(path) = view.path.clone() else {
+        if action == HunkAction::Revert {
+            self.revert_hunk_at_line(id, anchor);
+            return;
+        }
+        let Some(path) = self.documents.get(&id).and_then(|doc| doc.path.clone()) else {
+            self.message = Some("Git diff requires a saved file".into());
             return;
         };
         if self.buffer_dirty(&path) {
@@ -779,12 +772,43 @@ impl App {
             self.message = Some("Save first".into());
             return;
         }
-        let Some(parsed) = view.parsed.as_ref() else {
+        let Some(patches) = self.review_patches.get(&id).cloned() else {
+            self.git_publish_armed = false;
+            self.message = Some("No hunk to apply".into());
+            return;
+        };
+        if patches.renamed {
+            self.git_publish_armed = false;
+            self.message = Some("Stage the renamed file from Changes".into());
+            return;
+        }
+        let Some(hunk) = self
+            .present_hunks(id)
+            .into_iter()
+            .find(|hunk| hunk.start == anchor)
+        else {
             self.git_publish_armed = false;
             return;
         };
-        let Some(patch) = crate::workspace::hunk_patch(parsed, index) else {
+        let patch = match action {
+            HunkAction::Stage | HunkAction::Discard => patches
+                .unstaged
+                .as_ref()
+                .and_then(|diff| crate::workspace::patch_touching(diff, hunk.start, hunk.end)),
+            HunkAction::Unstage => {
+                let index_anchor = hunk.index_anchor.unwrap_or(hunk.start);
+                let (start, end) =
+                    Self::unstage_range(self.inline_changes.get(&id), index_anchor, &hunk);
+                patches
+                    .staged
+                    .as_ref()
+                    .and_then(|diff| crate::workspace::patch_touching(diff, start, end))
+            }
+            HunkAction::Revert | HunkAction::Fold => None,
+        };
+        let Some(patch) = patch else {
             self.git_publish_armed = false;
+            self.message = Some("No hunk to apply".into());
             return;
         };
         self.git_publish_armed = false;
@@ -807,6 +831,14 @@ impl App {
                     action: ConfirmAction::DiscardHunk { patch, path },
                 };
             }
+            HunkAction::Revert | HunkAction::Fold => {}
+        }
+    }
+
+    pub fn toggle_hunk_fold(&mut self, document_id: DocumentId, anchor: usize) {
+        let key = (document_id, anchor);
+        if !self.folded_hunks.insert(key) {
+            self.folded_hunks.remove(&key);
         }
     }
 
@@ -824,119 +856,133 @@ impl App {
         });
     }
 
-    pub fn open_git_entry(&mut self, path: PathBuf, staged: bool) {
+    fn unstage_range(
+        changes: Option<&LineChanges>,
+        index_anchor: usize,
+        hunk: &crate::workspace::Hunk,
+    ) -> (usize, usize) {
+        if hunk.end == hunk.start {
+            return (index_anchor, index_anchor);
+        }
+        let Some(changes) = changes else {
+            return (index_anchor, index_anchor.saturating_add(1));
+        };
+        let mut min = index_anchor;
+        let mut max = index_anchor;
+        for line in hunk.start..hunk.end {
+            if let Some(index) = changes.index_of.get(line).copied().flatten() {
+                min = min.min(index);
+                max = max.max(index);
+            }
+        }
+        (min, max.saturating_add(1))
+    }
+
+    pub fn open_git_entry(&mut self, path: PathBuf, _staged: bool) {
         self.git_message_focus = false;
         if path.is_file() {
             self.open_path(path.clone());
         }
         self.markdown_preview = None;
-        self.load_file_diff(path, staged);
-    }
-
-    pub fn refresh_open_file_diff(&mut self) {
-        let Some(diff) = self.diff_view.as_ref() else {
+        let Some(id) = self
+            .documents
+            .iter()
+            .find_map(|(id, doc)| (doc.path.as_ref() == Some(&path)).then_some(*id))
+        else {
             return;
         };
-        let staged = diff.source == DiffSource::Staged;
-        if let Some(path) = diff.path.clone() {
-            self.load_file_diff(path, staged);
+        self.reveal_change = Some(id);
+        self.request_inline_diff(id);
+        self.request_review_patches(id);
+        self.scroll_to_first_change(id);
+    }
+
+    pub fn refresh_open_reviews(&mut self) {
+        let open = self.order.clone();
+        for id in open {
+            self.request_review_patches(id);
         }
     }
 
     pub fn receive_file_diff(&mut self, result: FileDiffResult) {
-        if result.token != self.file_diff_token {
-            return;
-        }
-        let Some(view) = self.diff_view.as_mut() else {
-            return;
-        };
-        let same = match view.source {
-            DiffSource::Staged => result.staged,
-            DiffSource::Unstaged => !result.staged,
-        };
-        if !same || view.path.as_ref() != Some(&result.path) {
-            return;
-        }
-        view.lines = result.lines;
-        view.parsed = result.parsed;
-        view.allow_hunks = result.allow_hunks;
-        view.error = result.error;
-        view.loading = false;
-    }
-
-    fn load_file_diff(&mut self, path: PathBuf, staged: bool) {
-        use crate::workspace::GitFileStatus;
-        let status = self.git_status.get(&path).copied();
-        let side = if staged {
-            status.and_then(|item| item.staged)
-        } else {
-            status.and_then(|item| item.unstaged)
-        };
-        let document_id = self
+        let Some(id) = self
             .documents
             .iter()
-            .find(|(_, doc)| doc.path.as_ref() == Some(&path))
-            .map(|(id, _)| *id)
-            .unwrap_or(DocumentId(0));
-        let source = if staged {
-            DiffSource::Staged
-        } else {
-            DiffSource::Unstaged
+            .find_map(|(id, doc)| (doc.path.as_ref() == Some(&result.path)).then_some(*id))
+        else {
+            return;
         };
-        self.file_diff_token = self.file_diff_token.saturating_add(1);
-        if side == Some(GitFileStatus::Untracked) {
-            let text = std::fs::read_to_string(&path).unwrap_or_default();
-            let relative = crate::workspace::repo_relative(&self.root, &path).unwrap_or_default();
-            let (lines, parsed) = crate::workspace::untracked_diff(&relative, &text);
-            let allow_hunks = parsed.is_some();
-            self.diff_view = Some(DiffView {
-                document_id,
-                path: Some(path),
-                source,
-                lines,
-                parsed,
-                allow_hunks,
-                error: None,
-                scroll: 0,
-                loading: false,
-            });
+        let Some(patches) = self.review_patches.get_mut(&id) else {
+            return;
+        };
+        if patches.token != result.token || patches.renamed {
             return;
         }
+        if result.staged {
+            patches.staged = result.parsed;
+        } else {
+            patches.unstaged = result.parsed;
+        }
+    }
+
+    pub fn request_review_patches(&mut self, document_id: DocumentId) {
+        if !self.git_repo {
+            return;
+        }
+        let Some(path) = self
+            .documents
+            .get(&document_id)
+            .and_then(|doc| doc.path.clone())
+        else {
+            return;
+        };
+        use crate::workspace::GitFileStatus;
+        self.file_diff_token = self.file_diff_token.saturating_add(1);
+        let token = self.file_diff_token;
+        let status = self.git_status.get(&path).copied();
         let renamed = status.is_some_and(|item| {
             item.staged == Some(GitFileStatus::Renamed)
                 || item.unstaged == Some(GitFileStatus::Renamed)
         });
-        let allow = !renamed
-            && matches!(
-                side,
-                Some(kind) if kind != GitFileStatus::Renamed && kind != GitFileStatus::Untracked
-            );
-        let scroll = self
-            .diff_view
-            .as_ref()
-            .filter(|diff| diff.path.as_ref() == Some(&path) && diff.source == source)
-            .map(|diff| diff.scroll)
-            .unwrap_or(0);
-        let token = self.file_diff_token;
-        self.diff_view = Some(DiffView {
-            document_id,
-            path: Some(path.clone()),
-            source,
-            lines: Vec::new(),
-            parsed: None,
-            allow_hunks: false,
-            error: None,
-            scroll,
-            loading: true,
-        });
-        crate::workspace::spawn_file_diff(
-            self.root.clone(),
-            path,
-            staged,
-            allow,
+        let mut patches = ReviewPatches {
+            unstaged: None,
+            staged: None,
+            renamed,
             token,
-            self.file_diff_tx.clone(),
-        );
+        };
+        if renamed {
+            self.review_patches.insert(document_id, patches);
+            return;
+        }
+        if status.and_then(|item| item.unstaged) == Some(GitFileStatus::Untracked) {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let relative = crate::workspace::repo_relative(&self.root, &path).unwrap_or_default();
+            patches.unstaged = crate::workspace::untracked_diff(&relative, &text).1;
+        } else if status.and_then(|item| item.unstaged).is_some() {
+            crate::workspace::spawn_file_diff(
+                self.root.clone(),
+                path.clone(),
+                false,
+                true,
+                token,
+                self.file_diff_tx.clone(),
+            );
+        }
+        if status.is_some_and(|item| {
+            item.staged.is_some_and(|kind| {
+                kind != GitFileStatus::Untracked && kind != GitFileStatus::Renamed
+            })
+        }) {
+            crate::workspace::spawn_file_diff(
+                self.root.clone(),
+                path,
+                true,
+                true,
+                token,
+                self.file_diff_tx.clone(),
+            );
+        }
+        self.review_patches.insert(document_id, patches);
     }
 
     pub fn reload_clean_document(&mut self, path: &Path) {
@@ -1008,7 +1054,6 @@ impl App {
             let id = *id;
             self.active = Some(id);
             self.focus = Focus::Editor;
-            self.diff_view = None;
             return;
         }
         match Document::load(DocumentId(self.next_id), path.clone()) {
@@ -1030,8 +1075,8 @@ impl App {
                 self.active = Some(id);
                 self.focus = Focus::Editor;
                 self.overlay = Overlay::None;
-                self.diff_view = None;
                 self.request_inline_diff(id);
+                self.request_review_patches(id);
             }
             Err(err) => {
                 self.message = Some(format!("open failed: {err}"));
@@ -1103,15 +1148,12 @@ impl App {
         self.order.retain(|x| *x != id);
         self.inline_changes.remove(&id);
         self.diff_baselines.remove(&id);
-        self.open_hunks.retain(|(doc_id, _)| *doc_id != id);
-        self.active = self.order.last().copied();
-        if self
-            .diff_view
-            .as_ref()
-            .is_some_and(|diff| diff.document_id == id)
-        {
-            self.diff_view = None;
+        self.review_patches.remove(&id);
+        self.folded_hunks.retain(|(doc_id, _)| *doc_id != id);
+        if self.reveal_change == Some(id) {
+            self.reveal_change = None;
         }
+        self.active = self.order.last().copied();
         if self
             .markdown_preview
             .as_ref()
@@ -1170,36 +1212,6 @@ impl App {
         self.active = Some(self.order[next]);
         self.focus = Focus::Editor;
         self.overlay = Overlay::None;
-        self.diff_view = None;
-    }
-
-    pub fn toggle_diff(&mut self) {
-        if !self.git_repo {
-            self.diff_view = None;
-            return;
-        }
-        let Some(doc) = self.active_doc() else {
-            self.diff_view = None;
-            return;
-        };
-        let Some(path) = doc.path.clone() else {
-            self.message = Some("Git diff requires a saved file".into());
-            return;
-        };
-        if self
-            .diff_view
-            .as_ref()
-            .is_some_and(|diff| diff.path.as_ref() == Some(&path))
-        {
-            self.diff_view = None;
-            return;
-        }
-        self.markdown_preview = None;
-        let staged = self
-            .git_status
-            .get(&path)
-            .is_some_and(|status| status.unstaged.is_none() && status.staged.is_some());
-        self.load_file_diff(path, staged);
     }
 
     pub fn markdown_preview_open(&self) -> bool {
@@ -1223,7 +1235,6 @@ impl App {
             self.message = Some("Markdown preview is for Markdown files".into());
             return;
         }
-        self.diff_view = None;
         self.markdown_preview = Some(crate::markdown::Preview::open(id));
     }
 
@@ -1280,39 +1291,62 @@ impl App {
     }
 
     pub fn recompute_inline(&mut self, document_id: DocumentId) {
-        let Some(original) = self
-            .diff_baselines
-            .get(&document_id)
-            .map(|baseline| baseline.original().to_string())
-        else {
+        let Some(baselines) = self.diff_baselines.get(&document_id) else {
             return;
         };
+        let head = baselines.head.original().to_string();
+        let index = baselines.index.original().to_string();
         let Some(text) = self.documents.get(&document_id).map(|doc| doc.text()) else {
             return;
         };
-        let changes = crate::workspace::classify_lines(&original, &text);
-        let valid_starts: HashSet<usize> = crate::workspace::change_hunks(&changes)
+        let changes = crate::workspace::review_changes(&head, &index, &text);
+        let valid: HashSet<usize> = crate::workspace::change_hunks(&changes)
             .into_iter()
             .map(|hunk| hunk.start)
             .collect();
-        self.open_hunks
-            .retain(|(id, start)| *id != document_id || valid_starts.contains(start));
+        self.folded_hunks
+            .retain(|(id, start)| *id != document_id || valid.contains(start));
         self.inline_changes.insert(document_id, changes);
+        if self.reveal_change == Some(document_id) {
+            self.scroll_to_first_change(document_id);
+            if self.reveal_change == Some(document_id) {
+                self.reveal_change = None;
+            }
+        }
     }
 
     pub fn receive_diff(&mut self, result: GitDiffResult) {
         let document_id = result.document_id;
-        match result.baseline.clone() {
-            Some(baseline) => {
-                self.diff_baselines.insert(document_id, baseline);
+        match (result.head, result.index) {
+            (Some(head), Some(index)) => {
+                self.diff_baselines
+                    .insert(document_id, FileBaselines { head, index });
                 self.recompute_inline(document_id);
             }
-            None => {
+            _ => {
                 self.diff_baselines.remove(&document_id);
                 self.inline_changes.remove(&document_id);
-                self.open_hunks.retain(|(id, _)| *id != document_id);
+                self.folded_hunks.retain(|(id, _)| *id != document_id);
+                if self.reveal_change == Some(document_id) {
+                    self.reveal_change = None;
+                }
             }
         }
+    }
+
+    pub fn present_hunks(&self, document_id: DocumentId) -> Vec<crate::workspace::Hunk> {
+        let Some(changes) = self.inline_changes.get(&document_id) else {
+            return Vec::new();
+        };
+        let dirty = self
+            .documents
+            .get(&document_id)
+            .is_some_and(|doc| doc.is_dirty());
+        let renamed = self
+            .review_patches
+            .get(&document_id)
+            .is_some_and(|patches| patches.renamed);
+        crate::workspace::present_hunks(changes, dirty, renamed)
     }
 
     pub fn visual_rows(&self, document_id: DocumentId) -> Vec<crate::workspace::VisualRow> {
@@ -1321,13 +1355,9 @@ impl App {
             .get(&document_id)
             .map(|doc| doc.rope.len_lines())
             .unwrap_or(0);
-        let hunks = self
-            .inline_changes
-            .get(&document_id)
-            .map(crate::workspace::change_hunks)
-            .unwrap_or_default();
+        let hunks = self.present_hunks(document_id);
         let folded: Vec<usize> = self
-            .open_hunks
+            .folded_hunks
             .iter()
             .filter(|(id, _)| *id == document_id)
             .map(|(_, start)| *start)
@@ -1335,21 +1365,17 @@ impl App {
         crate::workspace::visual_rows(line_count, &hunks, &folded)
     }
 
-    pub fn toggle_hunk_at_line(&mut self, document_id: DocumentId, line: usize) {
-        let Some(changes) = self.inline_changes.get(&document_id) else {
-            return;
-        };
-        let Some(hunk) = crate::workspace::change_hunks(changes)
-            .into_iter()
-            .find(|hunk| {
-                line >= hunk.start && line < hunk.end.max(hunk.start + 1) && hunk.start <= line
-            })
+    pub fn scroll_to_first_change(&mut self, document_id: DocumentId) {
+        let rows = self.visual_rows(document_id);
+        let Some(index) = rows
+            .iter()
+            .position(|row| matches!(row, crate::workspace::VisualRow::Bar { .. }))
         else {
             return;
         };
-        let key = (document_id, hunk.start);
-        if !self.open_hunks.insert(key) {
-            self.open_hunks.remove(&key);
+        self.reveal_change = None;
+        if let Some(view) = self.views.get_mut(&document_id) {
+            view.viewport.top = index;
         }
     }
 
@@ -1565,7 +1591,9 @@ mod tests {
 
     use crate::editor::{Document, DocumentId};
     use crate::language::LanguageClient;
-    use crate::workspace::{GitFileStatus, GitPathStatus, GitSnapshot, GitStatusError};
+    use crate::workspace::{
+        DiffBaseline, FileBaselines, GitFileStatus, GitPathStatus, GitSnapshot, GitStatusError,
+    };
 
     use super::*;
 
@@ -1592,96 +1620,98 @@ mod tests {
         app.active = Some(id);
     }
 
-    fn sample_diff(path: &std::path::Path, source: DiffSource) -> DiffView {
-        DiffView {
-            document_id: DocumentId(0),
-            path: Some(path.to_path_buf()),
-            source,
-            lines: Vec::new(),
-            parsed: None,
-            allow_hunks: true,
-            error: None,
-            scroll: 0,
-            loading: false,
-        }
-    }
-
     #[test]
-    fn toggle_diff_opens_the_changed_side() {
+    fn inline_review_offers_stage_or_unstage() {
         with_runtime(|| {
             let mut app = test_app();
             app.git_repo = true;
             let path = PathBuf::from("/repo/src/main.rs");
-            open_saved(&mut app, path.clone());
-            app.git_status.insert(
-                path.clone(),
-                GitPathStatus {
-                    staged: None,
-                    unstaged: Some(GitFileStatus::Modified),
+            let id = DocumentId(app.next_id);
+            app.next_id += 1;
+            app.documents.insert(
+                id,
+                Document::new(id, Some(path.clone()), "fn main() { changed }\n".into()),
+            );
+            app.order.push(id);
+            app.active = Some(id);
+            app.diff_baselines.insert(
+                id,
+                FileBaselines {
+                    head: DiffBaseline::Present("fn main() {}\n".into()),
+                    index: DiffBaseline::Present("fn main() { changed }\n".into()),
                 },
             );
-            app.toggle_diff();
-            let diff = app.diff_view.as_ref().expect("unstaged diff");
-            assert_eq!(diff.source, DiffSource::Unstaged);
-            assert_eq!(diff.path.as_deref(), Some(path.as_path()));
-
-            app.toggle_diff();
-            assert!(app.diff_view.is_none());
-
-            app.git_status.insert(
-                path.clone(),
-                GitPathStatus {
-                    staged: Some(GitFileStatus::Modified),
-                    unstaged: None,
-                },
-            );
-            app.toggle_diff();
+            app.recompute_inline(id);
             assert_eq!(
-                app.diff_view.as_ref().expect("staged diff").source,
-                DiffSource::Staged
+                app.present_hunks(id)[0].bar,
+                crate::workspace::HunkBar::Unstage
             );
 
-            app.diff_view = None;
-            app.git_status.insert(
-                path.clone(),
-                GitPathStatus {
-                    staged: Some(GitFileStatus::Modified),
-                    unstaged: Some(GitFileStatus::Modified),
+            app.diff_baselines.insert(
+                id,
+                FileBaselines {
+                    head: DiffBaseline::Present("fn main() {}\n".into()),
+                    index: DiffBaseline::Present("fn main() {}\n".into()),
                 },
             );
-            app.toggle_diff();
+            app.recompute_inline(id);
             assert_eq!(
-                app.diff_view.as_ref().expect("worktree diff").source,
-                DiffSource::Unstaged
+                app.present_hunks(id)[0].bar,
+                crate::workspace::HunkBar::StageDiscard
+            );
+            let rows = app.visual_rows(id);
+            assert!(
+                rows.iter()
+                    .any(|row| matches!(row, crate::workspace::VisualRow::Bar { .. }))
+            );
+            assert!(
+                rows.iter()
+                    .any(|row| matches!(row, crate::workspace::VisualRow::Removed { .. }))
+            );
+            let anchor = app.present_hunks(id)[0].start;
+            app.toggle_hunk_fold(id, anchor);
+            assert!(
+                app.visual_rows(id)
+                    .iter()
+                    .all(|row| { !matches!(row, crate::workspace::VisualRow::Removed { .. }) })
+            );
+            assert!(
+                app.visual_rows(id)
+                    .iter()
+                    .any(|row| { matches!(row, crate::workspace::VisualRow::Bar { .. }) })
+            );
+            app.toggle_hunk_fold(id, anchor);
+            assert!(
+                app.visual_rows(id)
+                    .iter()
+                    .any(|row| { matches!(row, crate::workspace::VisualRow::Removed { .. }) })
             );
         });
     }
 
     #[test]
-    fn open_path_closes_the_diff_and_changes_reopens_it() {
+    fn open_git_entry_opens_the_file_for_review() {
         with_runtime(|| {
             let mut app = test_app();
-            let path = PathBuf::from("/repo/src/main.rs");
-            open_saved(&mut app, path.clone());
-            app.diff_view = Some(sample_diff(&path, DiffSource::Unstaged));
-            app.open_path(path.clone());
-            assert!(app.diff_view.is_none());
-
+            app.git_repo = true;
             let file = std::env::temp_dir().join(format!("r3vu-diff-{}", std::process::id()));
             std::fs::write(&file, "hello\n").unwrap();
-            app.diff_view = Some(sample_diff(&path, DiffSource::Unstaged));
-            app.open_path(file.clone());
-            assert!(app.diff_view.is_none());
-            assert!(
-                app.documents
-                    .values()
-                    .any(|doc| doc.path.as_deref() == Some(file.as_path()))
+            app.git_status.insert(
+                file.clone(),
+                GitPathStatus {
+                    staged: Some(GitFileStatus::Modified),
+                    unstaged: None,
+                },
             );
-
             app.open_git_entry(file.clone(), true);
-            let diff = app.diff_view.as_ref().expect("changes diff");
-            assert_eq!(diff.source, DiffSource::Staged);
-            assert_eq!(diff.path.as_deref(), Some(file.as_path()));
+            let doc = app
+                .documents
+                .values()
+                .find(|doc| doc.path.as_deref() == Some(file.as_path()))
+                .expect("open file");
+            assert_eq!(app.active, Some(doc.id));
+            assert!(app.review_patches.contains_key(&doc.id));
+            assert!(app.markdown_preview.is_none());
             let _ = std::fs::remove_file(file);
         });
     }
@@ -1696,6 +1726,7 @@ mod tests {
             std::fs::write(&path, "# r3vu\r\n\r\nA mouse.\r\n").unwrap();
             let (tx, _rx) = mpsc::unbounded_channel();
             let mut app = App::new(root.clone(), LanguageClient { tx });
+            app.git_repo = true;
             app.git_status.insert(
                 path.clone(),
                 GitPathStatus {
@@ -1704,10 +1735,14 @@ mod tests {
                 },
             );
             app.open_git_entry(path.clone(), false);
-            let diff = app.diff_view.as_ref().expect("new file diff");
-            assert!(diff.allow_hunks);
-            assert!(diff.lines.iter().any(|line| line.hunk == Some(0)));
-            let patch = crate::workspace::hunk_patch(diff.parsed.as_ref().unwrap(), 0).unwrap();
+            let doc = app
+                .documents
+                .values()
+                .find(|doc| doc.path.as_deref() == Some(path.as_path()))
+                .expect("open buffer");
+            let patches = app.review_patches.get(&doc.id).expect("review patches");
+            let patch =
+                crate::workspace::hunk_patch(patches.unstaged.as_ref().unwrap(), 0).unwrap();
             assert!(patch.contains("+# r3vu\r\n+\r\n+A mouse.\r\n"));
             std::fs::remove_file(&path).unwrap();
             app.reload_clean_document(&path);
@@ -1731,16 +1766,15 @@ mod tests {
             app.git_open = true;
             app.git_branch = Some("main".into());
             app.git_repo = true;
-            app.diff_view = Some(sample_diff(&path, DiffSource::Unstaged));
+            app.inline_changes
+                .insert(app.active.unwrap(), LineChanges::default());
             app.receive_git_status(Err(GitStatusError::NotARepository));
             assert!(!app.git_repo);
             assert!(!app.git_open);
             assert!(app.git_branch.is_none());
-            assert!(app.diff_view.is_none());
             assert!(app.inline_changes.is_empty());
-            app.toggle_diff();
+            assert!(app.review_patches.is_empty());
             app.toggle_git();
-            assert!(app.diff_view.is_none());
             assert!(!app.git_open);
 
             app.git_repo = true;

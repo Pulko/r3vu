@@ -457,18 +457,16 @@ pub(crate) fn shortcut_rows(git: bool) -> Vec<(&'static str, &'static str)> {
     ];
     if git {
         rows.extend([
-            ("Ctrl+Shift+D", "Git diff"),
-            ("Click Diff", "Stage and review the file"),
             ("Ctrl+Shift+G", "Git panel"),
             ("Click Changes", "Stage and commit"),
             ("Space", "Stage or unstage the file"),
-            ("Click Stage", "Stage, unstage, or discard a hunk"),
+            ("Click ▾", "Fold or unfold a change"),
+            ("Click Stage", "Stage, unstage, discard, or revert a hunk"),
         ]);
     }
     rows.extend([
         ("Ctrl+Shift+M", "Preview Markdown"),
         ("Click Markdown", "Preview this file"),
-        ("Click ↩", "Revert this change"),
         ("Click ◧", "Show or hide the explorer"),
         ("Ctrl+B", "Toggle explorer"),
         ("Ctrl+W", "Close file"),

@@ -13,9 +13,10 @@ pub fn handle_event(app: &mut App, event: Event) {
         Event::Key(key) if key.kind != KeyEventKind::Release => handle_key(app, key),
         Event::Mouse(mouse) => handle_mouse(app, mouse),
         Event::Paste(text) => {
-            if matches!(app.overlay, Overlay::Prompt { .. }) {
-                commands::insert_prompt(app, &text.replace(['\n', '\r'], ""));
-            } else if app.git_message_focus && matches!(app.overlay, Overlay::None) {
+            if commands::overlay_insert(app, &text) {
+                return;
+            }
+            if app.git_message_focus && matches!(app.overlay, Overlay::None) {
                 app.git_message.push_str(&text.replace(['\n', '\r'], " "));
             } else if app.focus == Focus::Thread && matches!(app.overlay, Overlay::None) {
                 app.thread
@@ -80,7 +81,18 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('w') | KeyCode::Char('W') => return app.close_active(false),
             KeyCode::Char('c') | KeyCode::Char('C') => return commands::copy(app),
             KeyCode::Char('x') | KeyCode::Char('X') => return commands::cut(app),
-            KeyCode::Char('v') | KeyCode::Char('V') => return commands::paste(app),
+            KeyCode::Char('v') | KeyCode::Char('V') => {
+                if matches!(
+                    app.overlay,
+                    Overlay::Search { .. } | Overlay::SearchFile { .. } | Overlay::Prompt { .. }
+                ) {
+                    let text = app.clipboard.paste();
+                    commands::overlay_insert(app, &text);
+                } else {
+                    commands::paste(app);
+                }
+                return;
+            }
             KeyCode::Char('n') | KeyCode::Char('N') => return app.open_untitled(),
             KeyCode::Char('/') | KeyCode::Char('_') | KeyCode::Char('?') => {
                 return commands::open_help(app);
@@ -630,9 +642,12 @@ fn in_rect(area: Option<(u16, u16, u16, u16)>, x: u16, y: u16) -> bool {
 mod tests {
     use std::path::PathBuf;
 
-    use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use tokio::sync::mpsc;
 
+    use crate::app::commands;
     use crate::app::state::{App, Overlay};
     use crate::language::LanguageClient;
 
@@ -680,6 +695,49 @@ mod tests {
             let mut app = test_app();
             handle_event(&mut app, right_click(10, 5));
             assert!(symbol_menu(&app));
+        });
+    }
+
+    fn overlay_query(app: &App) -> String {
+        match &app.overlay {
+            Overlay::Search { query, .. } | Overlay::SearchFile { query, .. } => query.clone(),
+            other => panic!("expected a search query, got {other:?}"),
+        }
+    }
+
+    fn editor_text(app: &App) -> String {
+        app.active_doc().map(|doc| doc.text()).unwrap_or_default()
+    }
+
+    fn ctrl_v() -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL))
+    }
+
+    #[test]
+    fn paste_fills_find_and_search_without_touching_the_editor() {
+        with_runtime(|| {
+            let mut app = test_app();
+            let before = editor_text(&app);
+
+            commands::open_search(&mut app);
+            handle_event(&mut app, Event::Paste("src/main.rs".into()));
+            assert_eq!(overlay_query(&app), "src/main.rs");
+
+            commands::open_content_search(&mut app);
+            handle_event(&mut app, Event::Paste("foo\nbar\u{1}".into()));
+            assert_eq!(overlay_query(&app), "foo bar");
+
+            app.clipboard.copy("file-query");
+            commands::open_search(&mut app);
+            handle_event(&mut app, ctrl_v());
+            assert_eq!(overlay_query(&app), "file-query");
+
+            app.clipboard.copy("search-query");
+            commands::open_content_search(&mut app);
+            handle_event(&mut app, ctrl_v());
+            assert_eq!(overlay_query(&app), "search-query");
+
+            assert_eq!(editor_text(&app), before);
         });
     }
 

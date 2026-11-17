@@ -953,6 +953,40 @@ pub fn overlay_char(app: &mut App, ch: char) {
     refresh_overlay_query(app);
 }
 
+pub fn overlay_insert(app: &mut App, text: &str) -> bool {
+    if !matches!(
+        app.overlay,
+        Overlay::Search { .. } | Overlay::SearchFile { .. } | Overlay::Prompt { .. }
+    ) {
+        return false;
+    }
+    let text = sanitize_overlay_paste(text);
+    if text.is_empty() {
+        return true;
+    }
+    if insert_prompt(app, &text) {
+        return true;
+    }
+    match &mut app.overlay {
+        Overlay::Search { query, .. } | Overlay::SearchFile { query, .. } => {
+            query.push_str(&text);
+        }
+        _ => return true,
+    }
+    refresh_overlay_query(app);
+    true
+}
+
+fn sanitize_overlay_paste(text: &str) -> String {
+    text.chars()
+        .filter_map(|ch| match ch {
+            '\n' | '\r' => Some(' '),
+            ch if ch.is_control() => None,
+            ch => Some(ch),
+        })
+        .collect()
+}
+
 fn overlay_backspace(app: &mut App) -> bool {
     if delete_prompt_before(app) {
         return true;

@@ -7,7 +7,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
-use crate::app::state::{GIT_FOOTER_ROWS, GitClick, GitHit};
+use crate::app::state::{GitClick, GitHit, git_footer_layout};
 use crate::ui::theme::Theme;
 use crate::workspace::{GitFileStatus, GitPanelRow, git_panel_rows};
 
@@ -15,16 +15,19 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     app.git_hits.clear();
     let theme = app.theme();
     let rows = git_panel_rows(&app.git_status);
-    let inner_h = area.height.saturating_sub(2).max(1) as usize;
+    let inner_h = area.height.saturating_sub(2) as usize;
     let inner_w = area.width.saturating_sub(2) as usize;
-    let footer = inner_h.min(GIT_FOOTER_ROWS);
-    let list_h = inner_h.saturating_sub(footer);
+    let body_open = app.git_body_open;
+    let layout = git_footer_layout(inner_h, body_open);
+    let list_h = inner_h.saturating_sub(layout.rows);
     keep_selection_visible(app, rows.len(), list_h);
     let ready = crate::workspace::can_commit(&app.git_message, &app.git_status);
     let sync_ready = app.git_repo && !app.git_busy();
     let ahead_behind = app.git_ahead_behind;
     let message = app.git_message.clone();
     let message_focus = app.git_message_focus;
+    let body = app.git_body.clone();
+    let body_focus = app.git_body_focus;
     let selected = app.git_selected;
     let scroll = app.git_scroll;
     let origin_x = area.x.saturating_add(1);
@@ -37,8 +40,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     while lines.len() < list_h {
         lines.push(Line::from(""));
     }
-    let footer_y = area.y.saturating_add(1).saturating_add(lines.len() as u16);
-    if footer >= 2 {
+    let mut footer_y = area.y.saturating_add(1).saturating_add(lines.len() as u16);
+    if layout.sync {
         lines.push(sync_footer(
             app,
             theme,
@@ -48,33 +51,40 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             ahead_behind,
             sync_ready,
         ));
-        let commit_at = if footer >= 3 {
-            lines.push(footer_rule(theme, inner_w));
-            footer_y.saturating_add(2)
-        } else {
-            footer_y.saturating_add(1)
-        };
+        footer_y = footer_y.saturating_add(1);
+    }
+    if layout.rule {
+        lines.push(footer_rule(theme, inner_w));
+        footer_y = footer_y.saturating_add(1);
+    }
+    if layout.subject {
         lines.push(commit_footer(
             app,
             theme,
             inner_w,
             origin_x,
-            commit_at,
+            footer_y,
             &message,
             message_focus,
             ready,
         ));
-    } else if footer == 1 {
-        lines.push(sync_footer(
-            app,
-            theme,
-            inner_w,
-            origin_x,
-            footer_y,
-            ahead_behind,
-            sync_ready,
-        ));
+        footer_y = footer_y.saturating_add(1);
     }
+    if layout.body_gap {
+        lines.push(Line::from(""));
+        footer_y = footer_y.saturating_add(1);
+    }
+    lines.extend(body_lines(
+        app,
+        theme,
+        inner_w,
+        origin_x,
+        footer_y,
+        &body,
+        body_focus,
+        body_open,
+        layout.body_lines,
+    ));
     frame.render_widget(
         Paragraph::new(lines)
             .style(theme.text())
@@ -321,6 +331,131 @@ fn commit_footer(
         );
     }
     Line::from(spans)
+}
+
+fn body_lines(
+    app: &mut App,
+    theme: Theme,
+    inner_w: usize,
+    x: u16,
+    y: u16,
+    body: &str,
+    focus: bool,
+    open: bool,
+    rows: usize,
+) -> Vec<Line<'static>> {
+    if rows == 0 || inner_w == 0 {
+        return Vec::new();
+    }
+    let mark = if open { "▾" } else { "▸" };
+    let mark_w = UnicodeWidthStr::width(mark);
+    let text_w = inner_w.saturating_sub(mark_w.saturating_add(1));
+    let visible = visible_body_lines(body, text_w, rows, open);
+    let empty = body.is_empty();
+    let field = body_field_style(theme, focus, empty);
+    let mark_style = field.fg(theme.accent);
+    let mut out = Vec::with_capacity(rows);
+    for (index, line) in visible.into_iter().enumerate() {
+        let row_y = y.saturating_add(index as u16);
+        let mut spans = Vec::new();
+        let gap = usize::from(inner_w > mark_w);
+        if index == 0 && mark_w > 0 {
+            hit(app, x, row_y, mark_w as u16, GitClick::BodyFold);
+            spans.push(Span::styled(mark.to_string(), mark_style));
+        }
+        let field_w = if index == 0 {
+            inner_w.saturating_sub(mark_w)
+        } else {
+            inner_w
+        };
+        if field_w > 0 {
+            let shown = if empty && index == 0 {
+                fill("body (optional)", text_w)
+            } else {
+                fill(&line, text_w)
+            };
+            let indent = if index == 0 { 0 } else { mark_w };
+            let content = format!("{}{}{}", " ".repeat(indent), " ".repeat(gap), shown);
+            hit(
+                app,
+                x.saturating_add(if index == 0 { mark_w as u16 } else { 0 }),
+                row_y,
+                field_w as u16,
+                GitClick::Body,
+            );
+            spans.push(Span::styled(content, field));
+        }
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+fn body_field_style(theme: Theme, focus: bool, empty: bool) -> Style {
+    if focus {
+        Style::default()
+            .fg(theme.fg)
+            .bg(theme.bg_selected)
+            .add_modifier(Modifier::BOLD)
+    } else if empty {
+        Style::default().fg(theme.fg_dim).bg(theme.bg_status)
+    } else {
+        Style::default().fg(theme.fg).bg(theme.bg_status)
+    }
+}
+
+fn visible_body_lines(text: &str, width: usize, rows: usize, open: bool) -> Vec<String> {
+    if rows == 0 {
+        return Vec::new();
+    }
+    if !open {
+        let first = text.split('\n').next().unwrap_or("");
+        return vec![first.to_string()];
+    }
+    if width == 0 {
+        return vec![String::new(); rows];
+    }
+    let mut wrapped = wrap_body(text, width);
+    if wrapped.len() > rows {
+        let start = wrapped.len() - rows;
+        wrapped.drain(0..start);
+    }
+    while wrapped.len() < rows {
+        wrapped.push(String::new());
+    }
+    wrapped
+}
+
+fn wrap_body(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for para in text.split('\n') {
+        if para.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        let mut current_w = 0usize;
+        for grapheme in para.graphemes(true) {
+            let grapheme_w = UnicodeWidthStr::width(grapheme);
+            if grapheme_w > width {
+                if !current.is_empty() {
+                    lines.push(std::mem::take(&mut current));
+                    current_w = 0;
+                }
+                continue;
+            }
+            if current_w + grapheme_w > width {
+                lines.push(std::mem::take(&mut current));
+                current_w = 0;
+            }
+            current.push_str(grapheme);
+            current_w += grapheme_w;
+        }
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 fn button_style(theme: Theme, enabled: bool, hot: bool) -> Style {

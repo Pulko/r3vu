@@ -735,7 +735,10 @@ pub enum GitWrite {
         reverse: bool,
         reload: Option<PathBuf>,
     },
-    Commit(String),
+    Commit {
+        message: String,
+        body: String,
+    },
     Pull,
     Push,
     Publish(String),
@@ -793,18 +796,21 @@ pub fn prepare_git_write(root: &Path, write: &GitWrite) -> Result<GitArgv, Strin
                 stdin: Some(patch.clone()),
             })
         }
-        GitWrite::Commit(message) => {
+        GitWrite::Commit { message, body } => {
             let message = message.trim();
             if message.is_empty() {
                 return Err("Write a commit message".into());
             }
-            if message.contains('\0') {
+            if message.contains('\0') || body.contains('\0') {
                 return Err("Commit message is invalid".into());
             }
-            Ok(GitArgv {
-                args: vec!["commit".into(), "-m".into(), message.to_string()],
-                stdin: None,
-            })
+            let mut args = vec!["commit".into(), "-m".into(), message.to_string()];
+            let body = body.trim();
+            if !body.is_empty() {
+                args.push("-m".into());
+                args.push(body.to_string());
+            }
+            Ok(GitArgv { args, stdin: None })
         }
         GitWrite::Pull => Ok(GitArgv {
             args: vec!["pull".into(), "--ff-only".into()],
@@ -863,6 +869,7 @@ pub struct GitWriteResult {
     pub reload: Option<PathBuf>,
     pub close_path: Option<PathBuf>,
     pub committed: Option<String>,
+    pub committed_body: Option<String>,
     pub notice: Option<String>,
 }
 
@@ -877,12 +884,16 @@ pub fn spawn_git_write(root: PathBuf, write: GitWrite, tx: mpsc::UnboundedSender
                 reload: None,
                 close_path: None,
                 committed: None,
+                committed_body: None,
                 notice: None,
             },
         };
         if result.ok {
             match &write {
-                GitWrite::Commit(message) => result.committed = Some(message.trim().to_string()),
+                GitWrite::Commit { message, body } => {
+                    result.committed = Some(message.trim().to_string());
+                    result.committed_body = Some(body.trim().to_string());
+                }
                 GitWrite::Pull => result.notice = Some("Pulled".into()),
                 GitWrite::Push | GitWrite::Publish(_) => result.notice = Some("Pushed".into()),
                 GitWrite::Apply { reload, .. } => result.reload = reload.clone(),
@@ -936,6 +947,7 @@ fn git_finished(output: std::process::Output) -> GitWriteResult {
             reload: None,
             close_path: None,
             committed: None,
+            committed_body: None,
             notice: None,
         }
     } else {
@@ -957,6 +969,7 @@ fn git_failed(message: String) -> GitWriteResult {
         reload: None,
         close_path: None,
         committed: None,
+        committed_body: None,
         notice: None,
     }
 }
@@ -2212,10 +2225,51 @@ diff --git a/readme.md b/readme.md
         let escaped =
             prepare_git_write(root, &GitWrite::Stage(PathBuf::from("/repo/../etc/passwd")));
         assert!(escaped.is_err());
-        let commit = prepare_git_write(root, &GitWrite::Commit("  ".into()));
+        let commit = prepare_git_write(
+            root,
+            &GitWrite::Commit {
+                message: "  ".into(),
+                body: "notes".into(),
+            },
+        );
         assert!(commit.is_err());
-        let ok = prepare_git_write(root, &GitWrite::Commit("Keep the review".into())).unwrap();
+        let ok = prepare_git_write(
+            root,
+            &GitWrite::Commit {
+                message: "Keep the review".into(),
+                body: "  ".into(),
+            },
+        )
+        .unwrap();
         assert_eq!(ok.args, ["commit", "-m", "Keep the review"]);
+        let with_body = prepare_git_write(
+            root,
+            &GitWrite::Commit {
+                message: "Keep the review".into(),
+                body: " Explain why.\nSecond line ".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            with_body.args,
+            [
+                "commit",
+                "-m",
+                "Keep the review",
+                "-m",
+                "Explain why.\nSecond line"
+            ]
+        );
+        assert!(
+            prepare_git_write(
+                root,
+                &GitWrite::Commit {
+                    message: "Keep the review".into(),
+                    body: "bad\0body".into(),
+                },
+            )
+            .is_err()
+        );
         assert!(!ok.args.iter().any(|arg| arg == "--no-verify"));
         let pull = prepare_git_write(root, &GitWrite::Pull).unwrap();
         assert_eq!(pull.args, ["pull", "--ff-only"]);

@@ -18,6 +18,12 @@ pub fn handle_event(app: &mut App, event: Event) {
             }
             if app.git_message_focus && matches!(app.overlay, Overlay::None) {
                 app.git_message.push_str(&text.replace(['\n', '\r'], " "));
+            } else if app.git_body_focus && matches!(app.overlay, Overlay::None) {
+                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                if normalized.contains('\n') {
+                    app.git_body_open = true;
+                }
+                app.git_body.push_str(&normalized);
             } else if app.focus == Focus::Thread && matches!(app.overlay, Overlay::None) {
                 app.thread
                     .compose
@@ -44,8 +50,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             commands::dismiss_overlay(app);
             return;
         }
-        if app.git_message_focus {
+        if app.git_message_focus || app.git_body_focus {
             app.git_message_focus = false;
+            app.git_body_focus = false;
             return;
         }
         if app.markdown_preview.is_some() {
@@ -189,6 +196,24 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 KeyCode::Char(ch) => app.git_message.push(ch),
                 KeyCode::Tab => {
                     app.git_message_focus = false;
+                    app.focus = Focus::Editor;
+                }
+                _ => {}
+            }
+            return;
+        }
+        if app.git_body_focus {
+            match key.code {
+                KeyCode::Enter => {
+                    app.git_body.push('\n');
+                    app.git_body_open = true;
+                }
+                KeyCode::Backspace => {
+                    app.git_body.pop();
+                }
+                KeyCode::Char(ch) => app.git_body.push(ch),
+                KeyCode::Tab => {
+                    app.git_body_focus = false;
                     app.focus = Focus::Editor;
                 }
                 _ => {}
@@ -492,6 +517,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                 }
             } else if in_editor {
                 app.git_message_focus = false;
+                app.git_body_focus = false;
                 app.focus = Focus::Editor;
                 if y == app.editor_area.1 {
                     if let Some((hit_x, hit_y, width)) = app.restore_hit

@@ -194,6 +194,8 @@ pub enum HunkAction {
 #[derive(Clone, Debug)]
 pub enum GitClick {
     Message,
+    Body,
+    BodyFold,
     Pull,
     Push,
     Commit,
@@ -372,6 +374,9 @@ pub struct App {
     pub git_scroll: usize,
     pub git_message: String,
     pub git_message_focus: bool,
+    pub git_body: String,
+    pub git_body_focus: bool,
+    pub git_body_open: bool,
     pub git_hits: Vec<GitHit>,
     pub side_tabs: Vec<SideTabHit>,
     pub content_tabs: Vec<ContentTabHit>,
@@ -483,6 +488,9 @@ impl App {
             git_scroll: 0,
             git_message: String::new(),
             git_message_focus: false,
+            git_body: String::new(),
+            git_body_focus: false,
+            git_body_open: false,
             git_hits: Vec::new(),
             side_tabs: Vec::new(),
             content_tabs: Vec::new(),
@@ -645,6 +653,7 @@ impl App {
             return;
         }
         self.git_message_focus = false;
+        self.git_body_focus = false;
         self.git_open = changes;
         self.explorer_visible = true;
         self.focus = Focus::Explorer;
@@ -658,6 +667,7 @@ impl App {
         self.git_repo = false;
         self.git_open = false;
         self.git_message_focus = false;
+        self.git_body_focus = false;
         self.git_branch = None;
         self.git_ahead_behind = None;
         self.git_publish_armed = false;
@@ -708,9 +718,13 @@ impl App {
         self.git_write_running = false;
         if result.ok {
             if let Some(message) = &result.committed {
-                if self.git_message.trim() == message {
+                let sent_body = result.committed_body.as_deref().unwrap_or("");
+                if self.git_message.trim() == message && self.git_body.trim() == sent_body {
                     self.git_message.clear();
+                    self.git_body.clear();
                     self.git_message_focus = false;
+                    self.git_body_focus = false;
+                    self.git_body_open = false;
                 }
                 self.message = Some("Committed".into());
             } else if let Some(notice) = result.notice {
@@ -794,7 +808,10 @@ impl App {
             });
             return;
         }
-        self.enqueue_git_write(GitWrite::Commit(self.git_message.clone()));
+        self.enqueue_git_write(GitWrite::Commit {
+            message: self.git_message.clone(),
+            body: self.git_body.clone(),
+        });
     }
 
     pub fn pull_git(&mut self) {
@@ -956,6 +973,7 @@ impl App {
 
     pub fn open_git_entry(&mut self, path: PathBuf, _staged: bool) {
         self.git_message_focus = false;
+        self.git_body_focus = false;
         if path.is_file() {
             if let Some(id) = self.document_id(&path) {
                 self.absent.remove(&id);
@@ -1767,14 +1785,75 @@ pub fn click_was_double(last: Option<(Instant, u16, u16)>, x: u16, y: u16) -> bo
     last.is_some_and(|(t, lx, ly)| lx == x && ly == y && t.elapsed() < Duration::from_millis(400))
 }
 
-pub const GIT_FOOTER_ROWS: usize = 3;
+pub const GIT_BODY_LINES: usize = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GitFooterLayout {
+    pub rows: usize,
+    pub sync: bool,
+    pub rule: bool,
+    pub subject: bool,
+    pub body_gap: bool,
+    pub body_lines: usize,
+}
+
+/// Sync and the subject stay. The rule goes next. Body lines are the first to drop,
+/// down to one collapsed row, then none. A blank row between the subject and the
+/// body stays while any body line is shown and there is room for it. An open body
+/// can use three lines.
+pub fn git_footer_layout(inner_h: usize, body_open: bool) -> GitFooterLayout {
+    if inner_h == 0 {
+        return GitFooterLayout {
+            rows: 0,
+            sync: false,
+            rule: false,
+            subject: false,
+            body_gap: false,
+            body_lines: 0,
+        };
+    }
+    if inner_h == 1 {
+        return GitFooterLayout {
+            rows: 1,
+            sync: true,
+            rule: false,
+            subject: false,
+            body_gap: false,
+            body_lines: 0,
+        };
+    }
+    let mut rows = 2;
+    let mut spare = inner_h - 2;
+    let rule = spare > 0;
+    if rule {
+        rows += 1;
+        spare -= 1;
+    }
+    let max_body = if body_open { GIT_BODY_LINES } else { 1 };
+    let body_gap = spare >= 2;
+    if body_gap {
+        rows += 1;
+        spare -= 1;
+    }
+    let body_lines = spare.min(max_body);
+    rows += body_lines;
+    GitFooterLayout {
+        rows,
+        sync: true,
+        rule,
+        subject: true,
+        body_gap,
+        body_lines,
+    }
+}
 
 pub fn explorer_inner_rows(height: u16) -> usize {
     height.saturating_sub(2) as usize
 }
 
-pub fn git_list_rows(height: u16) -> usize {
-    explorer_inner_rows(height).saturating_sub(GIT_FOOTER_ROWS)
+pub fn git_list_rows(height: u16, body_open: bool) -> usize {
+    let inner = explorer_inner_rows(height);
+    inner.saturating_sub(git_footer_layout(inner, body_open).rows)
 }
 
 pub fn max_explorer_scroll(len: usize, inner: usize) -> usize {
@@ -2102,5 +2181,40 @@ mod tests {
         assert_eq!(explorer_index_at(5, 2, 10, 2, 20), None);
         assert_eq!(explorer_index_at(5, 2, 10, 11, 20), None);
         assert_eq!(explorer_index_at(5, 2, 10, 3, 5), None);
+    }
+
+    #[test]
+    fn git_footer_drops_body_lines_before_the_rule() {
+        let collapsed = git_footer_layout(20, false);
+        assert_eq!(collapsed.rows, 5);
+        assert!(collapsed.sync && collapsed.rule && collapsed.subject && collapsed.body_gap);
+        assert_eq!(collapsed.body_lines, 1);
+
+        let open = git_footer_layout(20, true);
+        assert_eq!(open.rows, 7);
+        assert!(open.body_gap);
+        assert_eq!(open.body_lines, GIT_BODY_LINES);
+
+        let one_body = git_footer_layout(4, true);
+        assert!(one_body.sync && one_body.rule && one_body.subject);
+        assert_eq!(one_body.body_lines, 1);
+        assert_eq!(one_body.rows, 4);
+
+        let rule = git_footer_layout(3, true);
+        assert!(rule.sync && rule.rule && rule.subject);
+        assert_eq!(rule.body_lines, 0);
+        assert_eq!(rule.rows, 3);
+
+        let pair = git_footer_layout(2, false);
+        assert!(pair.sync && pair.subject);
+        assert!(!pair.rule);
+        assert_eq!(pair.body_lines, 0);
+        assert_eq!(pair.rows, 2);
+
+        let sync = git_footer_layout(1, true);
+        assert!(sync.sync);
+        assert!(!sync.subject && !sync.rule);
+        assert_eq!(sync.rows, 1);
+        assert_eq!(git_footer_layout(0, true).rows, 0);
     }
 }

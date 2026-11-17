@@ -19,9 +19,9 @@ use crate::workspace::{
 };
 
 use super::state::{
-    App, ConfirmAction, Focus, GIT_FOOTER_ROWS, HScrollHit, MenuAction, MenuItem, Overlay,
-    PendingRename, PromptKind, SearchKind, clamp_explorer_scroll, decode_diagnostic_pos,
-    explorer_index_at, explorer_inner_rows, git_list_rows, is_ident_char, max_explorer_scroll,
+    App, ConfirmAction, Focus, HScrollHit, MenuAction, MenuItem, Overlay, PendingRename,
+    PromptKind, SearchKind, clamp_explorer_scroll, decode_diagnostic_pos, explorer_index_at,
+    explorer_inner_rows, git_list_rows, is_ident_char, max_explorer_scroll,
 };
 
 pub fn save_active(app: &mut App) {
@@ -1917,7 +1917,7 @@ pub fn scroll_editor(app: &mut App, delta: i32) {
 pub fn scroll_explorer(app: &mut App, delta: i32) {
     if app.git_open {
         let len = crate::workspace::git_panel_rows(&app.git_status).len();
-        let inner = git_list_rows(app.explorer_area.3);
+        let inner = git_list_rows(app.explorer_area.3, app.git_body_open);
         let max = max_explorer_scroll(len, inner);
         let next = app.git_scroll as i64 + i64::from(delta);
         app.git_scroll = next.clamp(0, max as i64) as usize;
@@ -2438,7 +2438,7 @@ pub fn move_git(app: &mut App, delta: i32) {
         (pos + 1).min(files.len() - 1)
     };
     app.git_selected = files[next];
-    let inner = git_list_rows(app.explorer_area.3);
+    let inner = git_list_rows(app.explorer_area.3, app.git_body_open);
     if app.git_selected < app.git_scroll {
         app.git_scroll = app.git_selected;
     } else if inner > 0 && app.git_selected >= app.git_scroll + inner {
@@ -2466,7 +2466,7 @@ pub fn toggle_selected_git(app: &mut App) {
 
 pub fn git_file_index_at(app: &App, y: u16) -> Option<usize> {
     let rows = crate::workspace::git_panel_rows(&app.git_status);
-    let inner = git_list_rows(app.explorer_area.3);
+    let inner = git_list_rows(app.explorer_area.3, app.git_body_open);
     if inner == 0 || y <= app.explorer_area.1 {
         return None;
     }
@@ -2491,7 +2491,21 @@ pub fn click_git(app: &mut App, x: u16, y: u16) {
         .map(|hit| hit.action.clone())
     {
         match action {
-            crate::app::state::GitClick::Message => app.git_message_focus = true,
+            crate::app::state::GitClick::Message => {
+                app.git_body_focus = false;
+                app.git_message_focus = true;
+            }
+            crate::app::state::GitClick::Body => {
+                app.git_message_focus = false;
+                app.git_body_focus = true;
+                app.git_body_open = true;
+            }
+            crate::app::state::GitClick::BodyFold => {
+                app.git_body_open = !app.git_body_open;
+                if !app.git_body_open {
+                    app.git_body_focus = false;
+                }
+            }
             crate::app::state::GitClick::Pull => app.pull_git(),
             crate::app::state::GitClick::Push => app.push_git(),
             crate::app::state::GitClick::Commit => app.commit_git(),
@@ -2518,12 +2532,10 @@ pub fn click_git(app: &mut App, x: u16, y: u16) {
         return;
     }
     app.git_message_focus = false;
+    app.git_body_focus = false;
     let top = app.explorer_area.1.saturating_add(1);
-    let bottom = app
-        .explorer_area
-        .1
-        .saturating_add(app.explorer_area.3.saturating_sub(1))
-        .saturating_sub(GIT_FOOTER_ROWS as u16);
+    let list_h = git_list_rows(app.explorer_area.3, app.git_body_open);
+    let bottom = top.saturating_add(list_h as u16);
     if y >= top && y < bottom {
         let index = app.git_scroll + usize::from(y - top);
         let len = crate::workspace::git_panel_rows(&app.git_status).len();

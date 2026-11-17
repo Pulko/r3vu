@@ -360,8 +360,8 @@ mod tests {
             matches!(action, crate::app::state::GitClick::Message)
         });
         let last_inner = app.explorer_area.1 + app.explorer_area.3 - 2;
-        assert_eq!(commit.y, last_inner);
-        assert_eq!(pull.y, last_inner - 2);
+        assert_eq!(commit.y, last_inner - 2);
+        assert_eq!(pull.y, last_inner - 4);
         assert_eq!(pull.y, push.y);
         assert_eq!(commit.y, message.y);
         assert!(pull.x < push.x);
@@ -397,6 +397,28 @@ mod tests {
         let commit_row = row_text(buffer, commit.y);
         assert!(commit_row.contains("Commit"));
         assert!(commit_row.contains("Keep the review"));
+        assert!(!commit_row.contains("body (optional)"));
+        let body = hit_for(&app, |action| {
+            matches!(action, crate::app::state::GitClick::Body)
+        });
+        let fold = hit_for(&app, |action| {
+            matches!(action, crate::app::state::GitClick::BodyFold)
+        });
+        assert_eq!(body.y, commit.y + 2);
+        assert_eq!(body.y, last_inner);
+        let body_gap = slice_text(
+            buffer,
+            app.explorer_area.0 + 1,
+            commit.y + 1,
+            app.explorer_area.2.saturating_sub(2),
+        );
+        assert!(body_gap.trim().is_empty());
+        assert_eq!(fold.y, body.y);
+        assert!(fold.x < body.x);
+        let body_row = row_text(buffer, body.y);
+        assert!(body_row.contains("▸"));
+        assert!(body_row.contains("body (optional)"));
+        assert_eq!(buffer[(body.x, body.y)].bg, theme.bg_status);
         let inner_right = app.explorer_area.0 + app.explorer_area.2 - 1;
         assert!(push.x + push.width <= inner_right);
         assert!(commit.x + commit.width <= inner_right);
@@ -417,6 +439,56 @@ mod tests {
             hit.action,
             crate::app::state::GitClick::Toggle { staged: false, .. }
         )));
+        app.git_body =
+            "Why it stays.\nThe review still holds.\nAnd one more line.\nPast the fold.".into();
+        app.git_body_open = true;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let commit = hit_for(&app, |action| {
+            matches!(action, crate::app::state::GitClick::Commit)
+        });
+        let fold = hit_for(&app, |action| {
+            matches!(action, crate::app::state::GitClick::BodyFold)
+        });
+        let body_hits: Vec<_> = app
+            .git_hits
+            .iter()
+            .filter(|hit| matches!(hit.action, crate::app::state::GitClick::Body))
+            .cloned()
+            .collect();
+        assert_eq!(body_hits.len(), 3);
+        assert_eq!(body_hits[0].y, commit.y + 2);
+        let open_gap = slice_text(
+            buffer,
+            app.explorer_area.0 + 1,
+            commit.y + 1,
+            app.explorer_area.2.saturating_sub(2),
+        );
+        assert!(open_gap.trim().is_empty());
+        assert_eq!(body_hits[1].y, body_hits[0].y + 1);
+        assert_eq!(body_hits[2].y, body_hits[1].y + 1);
+        assert_eq!(body_hits[2].y, last_inner);
+        assert_eq!(fold.y, body_hits[0].y);
+        assert!(fold.x < body_hits[0].x);
+        let first = row_text(buffer, body_hits[0].y);
+        let second = row_text(buffer, body_hits[1].y);
+        let third = row_text(buffer, body_hits[2].y);
+        assert!(first.contains("▾"));
+        assert!(first.contains("The review still holds."));
+        assert!(!first.contains("Why it stays."));
+        assert!(second.contains("And one more line."));
+        assert!(third.contains("Past the fold."));
+        assert!(!first.contains("body (optional)"));
+        assert_eq!(buffer[(body_hits[0].x, body_hits[0].y)].bg, theme.bg_status);
+        app.git_body_focus = true;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let focused = hit_for(&app, |action| {
+            matches!(action, crate::app::state::GitClick::Body)
+        });
+        assert_eq!(
+            terminal.backend().buffer()[(focused.x, focused.y)].bg,
+            theme.bg_selected
+        );
     }
 
     fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {

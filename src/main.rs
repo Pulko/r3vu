@@ -146,6 +146,8 @@ async fn main() -> anyhow::Result<()> {
     app.search_tx = search_tx;
     let (git_status_tx, mut git_status_rx) = mpsc::unbounded_channel();
     app.git_status_tx = git_status_tx;
+    let (blame_tx, mut blame_rx) = mpsc::unbounded_channel();
+    app.blame_tx = blame_tx;
     let (diff_tx, mut diff_rx) = mpsc::unbounded_channel();
     app.diff_tx = diff_tx;
     let (git_write_tx, mut git_write_rx) = mpsc::unbounded_channel();
@@ -167,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
             .as_ref()
             .map(|dwell| HOVER_DWELL.saturating_sub(dwell.since.elapsed()));
         let git_delay = app.git_status_delay();
+        let blame_delay = app.blame_delay();
         tokio::select! {
             event = events.next() => {
                 if let Some(Ok(event)) = event {
@@ -188,6 +191,11 @@ async fn main() -> anyhow::Result<()> {
             statuses = git_status_rx.recv() => {
                 if let Some(statuses) = statuses {
                     app.receive_git_status(statuses);
+                }
+            }
+            blame = blame_rx.recv() => {
+                if let Some(blame) = blame {
+                    app.receive_line_blame(blame);
                 }
             }
             diff = diff_rx.recv() => {
@@ -220,6 +228,9 @@ async fn main() -> anyhow::Result<()> {
             }
             _ = ready_in(git_delay) => {
                 app.pump_git_status();
+            }
+            _ = ready_in(blame_delay) => {
+                app.pump_line_blame();
             }
         }
     }

@@ -88,6 +88,125 @@ pub fn parse_ahead_behind(output: &[u8]) -> Option<(u32, u32)> {
     Some((ahead, behind))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineBlame {
+    pub author: String,
+    pub summary: String,
+    pub time: i64,
+    pub hash: String,
+    pub uncommitted: bool,
+}
+
+pub struct BlameUpdate {
+    pub path: PathBuf,
+    pub line: usize,
+    pub text: String,
+    pub epoch: u64,
+    pub blame: Option<LineBlame>,
+}
+
+pub fn parse_line_blame(output: &str) -> Option<LineBlame> {
+    let mut lines = output.lines();
+    let header = lines.next()?;
+    let hash = header.split_whitespace().next()?.to_string();
+    if hash.len() < 4 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut author = None;
+    let mut summary = None;
+    let mut time = None;
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("author ") {
+            author = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("author-time ") {
+            time = rest.parse().ok();
+        } else if let Some(rest) = line.strip_prefix("summary ") {
+            summary = Some(rest.to_string());
+        } else if line == "summary" {
+            summary = Some(String::new());
+        } else if line.starts_with('\t') || line.starts_with("filename ") {
+            break;
+        }
+    }
+    let author = author?;
+    let uncommitted = hash.chars().all(|ch| ch == '0') || author == "Not Committed Yet";
+    Some(LineBlame {
+        author,
+        summary: summary.unwrap_or_default(),
+        time: time.unwrap_or(0),
+        hash,
+        uncommitted,
+    })
+}
+
+pub fn format_unix_time(secs: i64) -> String {
+    if secs < 0 {
+        return String::new();
+    }
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400) as u32;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let hour = tod / 3600;
+    let minute = (tod % 3600) / 60;
+    format!("{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}")
+}
+
+pub fn spawn_line_blame(
+    root: PathBuf,
+    path: PathBuf,
+    line: usize,
+    text: String,
+    contents: String,
+    epoch: u64,
+    tx: mpsc::UnboundedSender<BlameUpdate>,
+) {
+    tokio::spawn(async move {
+        let spec = format!("{},{}", line + 1, line + 1);
+        let blame = blame_worktree(&root, &path, &spec, &contents).await;
+        let _ = tx.send(BlameUpdate {
+            path,
+            line,
+            text,
+            epoch,
+            blame,
+        });
+    });
+}
+
+async fn blame_worktree(root: &Path, path: &Path, spec: &str, contents: &str) -> Option<LineBlame> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["blame", "-L", spec, "--porcelain", "--contents", "-", "--"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(contents.as_bytes()).await;
+    }
+    let output = child.wait_with_output().await.ok()?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr);
+        tracing::warn!("git blame exited {}: {}", output.status, message.trim());
+        return None;
+    }
+    parse_line_blame(&String::from_utf8_lossy(&output.stdout))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GitStatusError {
     NotARepository,
@@ -2794,5 +2913,50 @@ diff --git a/readme.md b/readme.md
             "path 'src/new.ts' exists on disk, but not in the index"
         ));
         assert!(!path_absent_from_head("not a git repository"));
+    }
+
+    #[test]
+    fn parses_committed_and_uncommitted_blame() {
+        let committed = "\
+f1d2d2f1d2d2f1d2d2f1d2d2f1d2d2f1d2d2f1 10 20 1
+author Ada Lovelace
+author-mail <ada@example.com>
+author-time 1700000000
+author-tz +0000
+committer Ada Lovelace
+committer-mail <ada@example.com>
+committer-time 1700000000
+committer-tz +0000
+summary First program
+previous abcdefabcdefabcdefabcdefabcdefabcdefabcd src/main.rs
+filename src/main.rs
+\tlet value = 1;
+";
+        let blame = parse_line_blame(committed).unwrap();
+        assert_eq!(blame.author, "Ada Lovelace");
+        assert_eq!(blame.summary, "First program");
+        assert_eq!(blame.time, 1_700_000_000);
+        assert!(!blame.uncommitted);
+        assert_eq!(format_unix_time(blame.time), "2023-11-14 22:13");
+
+        let uncommitted = "\
+0000000000000000000000000000000000000000 1 1 1
+author Not Committed Yet
+author-mail <not.committed.yet>
+author-time 1700000000
+author-tz +0000
+committer Not Committed Yet
+committer-mail <not.committed.yet>
+committer-time 1700000000
+committer-tz +0000
+summary
+filename src/main.rs
+\tlet value = 2;
+";
+        let blame = parse_line_blame(uncommitted).unwrap();
+        assert!(blame.uncommitted);
+        assert_eq!(blame.author, "Not Committed Yet");
+        assert!(parse_line_blame("not blame").is_none());
+        assert_eq!(format_unix_time(0), "1970-01-01 00:00");
     }
 }

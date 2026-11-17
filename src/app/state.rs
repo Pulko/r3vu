@@ -182,6 +182,14 @@ pub enum Overlay {
     },
     Help,
     TypesNote,
+    Blame {
+        author: String,
+        summary: String,
+        hash: String,
+        time: i64,
+        x: u16,
+        y: u16,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,6 +292,18 @@ pub struct ReviewPatches {
 
 pub const HOVER_DWELL: Duration = Duration::from_millis(400);
 const GIT_STATUS_DEBOUNCE: Duration = Duration::from_secs(1);
+const BLAME_DEBOUNCE: Duration = Duration::from_millis(120);
+
+#[derive(Clone, Debug)]
+pub struct BlameHit {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub author: String,
+    pub summary: String,
+    pub hash: String,
+    pub time: i64,
+}
 
 #[derive(Clone, Debug)]
 pub struct HoverDwell {
@@ -353,6 +373,15 @@ pub struct App {
     pub search_generation: u64,
     pub search_tx: mpsc::UnboundedSender<crate::workspace::WorkspaceSearch>,
     pub git_status_tx: mpsc::UnboundedSender<crate::workspace::GitStatusUpdate>,
+    pub blame_tx: mpsc::UnboundedSender<crate::workspace::BlameUpdate>,
+    blame_at: Option<Instant>,
+    blame_running: bool,
+    blame_again: bool,
+    blame_epoch: u64,
+    blame_wanted: Option<(PathBuf, usize, String)>,
+    blame_miss: Option<(PathBuf, usize, String)>,
+    pub blame_cache: HashMap<(PathBuf, usize, String), crate::workspace::LineBlame>,
+    pub blame_hit: Option<BlameHit>,
     pub diff_tx: mpsc::UnboundedSender<GitDiffResult>,
     pub git_status: HashMap<PathBuf, GitPathStatus>,
     git_status_running: bool,
@@ -413,6 +442,8 @@ impl App {
         drop(_search_rx);
         let (git_status_tx, git_status_rx) = mpsc::unbounded_channel();
         drop(git_status_rx);
+        let (blame_tx, blame_rx) = mpsc::unbounded_channel();
+        drop(blame_rx);
         let (diff_tx, diff_rx) = mpsc::unbounded_channel();
         drop(diff_rx);
         let (git_write_tx, git_write_rx) = mpsc::unbounded_channel();
@@ -471,6 +502,15 @@ impl App {
             search_generation: 0,
             search_tx,
             git_status_tx,
+            blame_tx,
+            blame_at: None,
+            blame_running: false,
+            blame_again: false,
+            blame_epoch: 0,
+            blame_wanted: None,
+            blame_miss: None,
+            blame_cache: HashMap::new(),
+            blame_hit: None,
             diff_tx,
             git_status: HashMap::new(),
             git_status_running: false,
@@ -578,6 +618,172 @@ impl App {
         crate::workspace::spawn_git_status(self.root.clone(), self.git_status_tx.clone());
     }
 
+    pub fn blame_delay(&self) -> Option<Duration> {
+        self.blame_at
+            .map(|at| at.saturating_duration_since(Instant::now()))
+    }
+
+    pub fn note_line_blame(&mut self) {
+        if self.markdown_preview_open() {
+            self.blame_at = None;
+            return;
+        }
+        let Some(target) = self.blame_target() else {
+            self.blame_at = None;
+            self.blame_wanted = None;
+            return;
+        };
+        if self.blame_cache.contains_key(&target) || self.blame_miss.as_ref() == Some(&target) {
+            self.blame_at = None;
+            return;
+        }
+        if self.blame_wanted.as_ref() == Some(&target)
+            && (self.blame_at.is_some() || self.blame_running)
+        {
+            return;
+        }
+        self.blame_wanted = Some(target);
+        self.blame_at = Some(Instant::now() + BLAME_DEBOUNCE);
+    }
+
+    pub fn pump_line_blame(&mut self) {
+        let due = self.blame_at.is_some_and(|at| at <= Instant::now());
+        if !due {
+            return;
+        }
+        let Some((path, line, text)) = self.blame_target() else {
+            self.blame_at = None;
+            return;
+        };
+        if self
+            .blame_cache
+            .contains_key(&(path.clone(), line, text.clone()))
+        {
+            self.blame_at = None;
+            return;
+        }
+        if self.blame_running {
+            self.blame_again = true;
+            self.blame_at = None;
+            return;
+        }
+        if self.whole_file_uncommitted(&path) {
+            self.blame_at = None;
+            self.blame_cache.insert(
+                (path, line, text),
+                crate::workspace::LineBlame {
+                    author: String::new(),
+                    summary: String::new(),
+                    time: 0,
+                    hash: "0".repeat(40),
+                    uncommitted: true,
+                },
+            );
+            return;
+        }
+        let Some(id) = self.active else {
+            self.blame_at = None;
+            return;
+        };
+        let Some(contents) = self
+            .documents
+            .get(&id)
+            .filter(|doc| doc.path.as_ref() == Some(&path))
+            .map(|doc| doc.text())
+        else {
+            self.blame_at = None;
+            return;
+        };
+        self.blame_at = None;
+        self.blame_running = true;
+        let epoch = self.blame_epoch;
+        crate::workspace::spawn_line_blame(
+            self.root.clone(),
+            path,
+            line,
+            text,
+            contents,
+            epoch,
+            self.blame_tx.clone(),
+        );
+    }
+
+    pub fn receive_line_blame(&mut self, update: crate::workspace::BlameUpdate) {
+        self.blame_running = false;
+        if update.epoch == self.blame_epoch {
+            let key = (update.path, update.line, update.text);
+            if let Some(blame) = update.blame {
+                if self.blame_miss.as_ref() == Some(&key) {
+                    self.blame_miss = None;
+                }
+                self.blame_cache.insert(key, blame);
+            } else {
+                self.blame_miss = Some(key);
+            }
+        }
+        if self.blame_again {
+            self.blame_again = false;
+            if self.blame_at.is_none() {
+                self.blame_at = Some(Instant::now());
+            }
+            self.pump_line_blame();
+        }
+    }
+
+    pub fn cached_line_blame(&self) -> Option<&crate::workspace::LineBlame> {
+        let (path, line, text) = self.blame_target()?;
+        self.blame_cache.get(&(path, line, text))
+    }
+
+    fn whole_file_uncommitted(&self, path: &Path) -> bool {
+        self.git_status.get(path).is_some_and(|status| {
+            matches!(
+                status.unstaged,
+                Some(
+                    crate::workspace::GitFileStatus::Untracked
+                        | crate::workspace::GitFileStatus::Added
+                )
+            ) || matches!(status.staged, Some(crate::workspace::GitFileStatus::Added))
+        })
+    }
+
+    fn blame_target(&self) -> Option<(PathBuf, usize, String)> {
+        if !self.git_repo {
+            return None;
+        }
+        let id = self.active?;
+        let doc = self.documents.get(&id)?;
+        let path = doc.path.clone()?;
+        if !path.starts_with(&self.root) {
+            return None;
+        }
+        let line = self.views.get(&id)?.cursor.line;
+        if line >= doc.rope.len_lines() {
+            return None;
+        }
+        Some((path, line, crate::editor::line_text(&doc.rope, line)))
+    }
+
+    fn forget_line_blame(&mut self, path: &Path) {
+        self.blame_epoch = self.blame_epoch.wrapping_add(1);
+        self.blame_cache.retain(|(cached, _, _), _| cached != path);
+        if self
+            .blame_miss
+            .as_ref()
+            .is_some_and(|(cached, _, _)| cached == path)
+        {
+            self.blame_miss = None;
+        }
+    }
+
+    fn clear_line_blame(&mut self) {
+        self.blame_epoch = self.blame_epoch.wrapping_add(1);
+        self.blame_cache.clear();
+        self.blame_miss = None;
+        self.blame_at = None;
+        self.blame_wanted = None;
+    }
+
     pub fn begin_turn(&mut self) {
         self.thread.touched.clear();
         self.turn_status_before = self.git_status.clone();
@@ -617,6 +823,9 @@ impl App {
         match result {
             Ok(snapshot) => {
                 self.git_repo = true;
+                let blame_stale = self.git_status != snapshot.files
+                    || self.git_branch != snapshot.branch
+                    || self.git_ahead_behind != snapshot.ahead_behind;
                 if self.git_status != snapshot.files {
                     self.git_status = snapshot.files;
                 }
@@ -626,6 +835,9 @@ impl App {
                 }
                 self.git_branch = snapshot.branch;
                 self.git_ahead_behind = snapshot.ahead_behind;
+                if blame_stale {
+                    self.clear_line_blame();
+                }
                 if self.git_ahead_behind.is_some() {
                     self.git_publish_armed = false;
                 }
@@ -693,6 +905,7 @@ impl App {
         self.git_publish_armed = false;
         self.git_status.clear();
         self.git_selected = 0;
+        self.clear_line_blame();
         self.inline_changes.clear();
         self.diff_baselines.clear();
         self.review_patches.clear();
@@ -1236,6 +1449,7 @@ impl App {
             view.selection = None;
         }
         self.request_inline_diff(id);
+        self.forget_line_blame(path);
     }
 
     pub fn active_doc(&self) -> Option<&Document> {
@@ -1335,6 +1549,13 @@ impl App {
         for document_id in edited {
             if seen.insert(document_id) {
                 self.recompute_inline(document_id);
+                if let Some(path) = self
+                    .documents
+                    .get(&document_id)
+                    .and_then(|doc| doc.path.clone())
+                {
+                    self.forget_line_blame(&path);
+                }
             }
         }
     }
@@ -2291,5 +2512,74 @@ mod tests {
         assert!(!sync.subject && !sync.rule);
         assert_eq!(sync.rows, 1);
         assert_eq!(git_footer_layout(0, true).rows, 0);
+    }
+
+    #[test]
+    fn line_blame_cache_is_keyed_by_text_and_cleared_on_status() {
+        with_runtime(|| {
+            let mut app = test_app();
+            app.root = PathBuf::from("/repo");
+            app.git_repo = true;
+            let path = PathBuf::from("/repo/src/main.rs");
+            open_saved(&mut app, path.clone());
+            let id = app.active.unwrap();
+            app.views.insert(id, crate::editor::EditorView::new(id));
+            let text = "fn main() {}".to_string();
+            app.blame_cache.insert(
+                (path.clone(), 0, text),
+                crate::workspace::LineBlame {
+                    author: "Ada".into(),
+                    summary: "Start".into(),
+                    time: 1_700_000_000,
+                    hash: "abc1234".into(),
+                    uncommitted: false,
+                },
+            );
+            app.blame_cache.insert(
+                (path, 0, "other".into()),
+                crate::workspace::LineBlame {
+                    author: "Grace".into(),
+                    summary: "Other".into(),
+                    time: 1,
+                    hash: "def5678".into(),
+                    uncommitted: false,
+                },
+            );
+            assert_eq!(
+                app.cached_line_blame().map(|blame| blame.author.as_str()),
+                Some("Ada")
+            );
+            app.receive_git_status(Ok(GitSnapshot {
+                files: HashMap::new(),
+                branch: Some("main".into()),
+                ahead_behind: None,
+            }));
+            assert!(app.cached_line_blame().is_none());
+        });
+    }
+
+    #[test]
+    fn untracked_file_blame_is_uncommitted() {
+        with_runtime(|| {
+            let mut app = test_app();
+            app.root = PathBuf::from("/repo");
+            app.git_repo = true;
+            let path = PathBuf::from("/repo/src/main.rs");
+            open_saved(&mut app, path.clone());
+            let id = app.active.unwrap();
+            app.views.insert(id, crate::editor::EditorView::new(id));
+            app.git_status.insert(
+                path,
+                GitPathStatus {
+                    staged: None,
+                    unstaged: Some(GitFileStatus::Untracked),
+                },
+            );
+            app.blame_at = Some(Instant::now());
+            app.pump_line_blame();
+            let blame = app.cached_line_blame().unwrap();
+            assert!(blame.uncommitted);
+            assert!(!app.blame_running);
+        });
     }
 }

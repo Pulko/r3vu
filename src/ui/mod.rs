@@ -65,6 +65,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         thread::render(frame, areas.threads, app);
     }
     status_bar::render(frame, areas.status, app);
+    app.note_line_blame();
     popup::render(frame, app);
     context_menu::render(frame, app);
 }

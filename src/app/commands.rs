@@ -2042,6 +2042,21 @@ pub fn click_editor(app: &mut App, x: u16, y: u16, selecting: bool) {
         return;
     }
     if !selecting {
+        if let Some(hit) = app.blame_hit.clone()
+            && y == hit.y
+            && x >= hit.x
+            && x < hit.x.saturating_add(hit.width)
+        {
+            app.overlay = Overlay::Blame {
+                author: hit.author,
+                summary: hit.summary,
+                hash: hit.hash,
+                time: hit.time,
+                x: hit.x,
+                y: hit.y,
+            };
+            return;
+        }
         if let Some(hit) = app
             .diff_hits
             .iter()

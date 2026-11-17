@@ -8,9 +8,11 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
 use crate::app::state::{
-    DiffHit, Focus, HScrollHit, HunkAction, SearchKind, SearchScope, TabHitBox,
+    BlameHit, DiffHit, Focus, HScrollHit, HunkAction, SearchKind, SearchScope, TabHitBox,
 };
-use crate::editor::{Range, display_col, hscroll_bar, line_text, max_line_display_width};
+use crate::editor::{
+    Range, display_col, hscroll_bar, line_display_width, line_text, max_line_display_width,
+};
 use crate::syntax::HighlightKind;
 use crate::ui::theme::{Theme, highlight_color, highlight_modifier};
 use crate::workspace::{HunkBar, LineChanges, LineMark, VisualRow};
@@ -18,6 +20,7 @@ use crate::workspace::{HunkBar, LineChanges, LineMark, VisualRow};
 pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
     app.hscroll_hit = None;
     app.diff_hits.clear();
+    app.blame_hit = None;
     app.restore_hit = None;
     let theme = app.theme();
     render_tabs(frame, tabs, app, theme);
@@ -144,11 +147,30 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
             None => Span::raw(" "),
         });
         let current = view.cursor.line == line_idx;
+        let blame = current
+            .then(|| {
+                doc.path.as_ref().and_then(|path| {
+                    app.blame_cache
+                        .get(&(path.clone(), line_idx, text.clone()))
+                        .cloned()
+                })
+            })
+            .flatten();
+        let content_w = line_display_width(&text, tab_width)
+            .saturating_sub(view.viewport.left)
+            .min(inner_w);
+        let suffix = blame
+            .as_ref()
+            .and_then(|blame| blame_suffix(blame, inner_w.saturating_sub(content_w)));
+        let paint_w = suffix
+            .as_ref()
+            .map(|suffix| inner_w.saturating_sub(suffix.width))
+            .unwrap_or(inner_w);
         spans.extend(paint_line(
             &text,
             line_idx,
             view.viewport.left,
-            inner_w,
+            paint_w,
             tab_width,
             current,
             if current { None } else { wash },
@@ -158,6 +180,34 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
             search_matches.as_ref(),
             theme,
         ));
+        if let Some(suffix) = suffix {
+            let style = Style::default().fg(theme.fg_dim).bg(theme.bg_current);
+            spans.push(Span::styled(suffix.label, style));
+            if suffix.arrow {
+                spans.push(Span::styled(" ".to_string(), style));
+                let arrow_x = area
+                    .x
+                    .saturating_add(1)
+                    .saturating_add(gutter)
+                    .saturating_add(inner_w as u16)
+                    .saturating_sub(1);
+                if let Some(blame) = blame {
+                    app.blame_hit = Some(BlameHit {
+                        x: arrow_x,
+                        y,
+                        width: 1,
+                        author: blame.author,
+                        summary: blame.summary,
+                        hash: blame.hash,
+                        time: blame.time,
+                    });
+                }
+                spans.push(Span::styled(
+                    "↗".to_string(),
+                    Style::default().fg(theme.accent).bg(theme.bg_current),
+                ));
+            }
+        }
         lines.push(Line::from(spans));
     }
 
@@ -834,6 +884,39 @@ fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
+struct BlameSuffix {
+    label: String,
+    arrow: bool,
+    width: usize,
+}
+
+fn blame_suffix(blame: &crate::workspace::LineBlame, free: usize) -> Option<BlameSuffix> {
+    const MIN_GAP: usize = 2;
+    if free < MIN_GAP + 1 {
+        return None;
+    }
+    let name = if blame.uncommitted {
+        "Uncommitted"
+    } else {
+        blame.author.as_str()
+    };
+    let mut budget = free - MIN_GAP;
+    let arrow = !blame.uncommitted && budget >= 3;
+    if arrow {
+        budget -= 2;
+    }
+    let label = truncate_width(name, budget);
+    if label.is_empty() {
+        return None;
+    }
+    let width = display_width(&label) + usize::from(arrow) * 2;
+    (width + MIN_GAP <= free).then_some(BlameSuffix {
+        label,
+        arrow,
+        width,
+    })
+}
+
 fn truncate_width(text: &str, max_width: usize) -> String {
     let mut out = String::new();
     let mut width = 0;
@@ -1116,5 +1199,31 @@ mod tests {
         assert!(revealed.tabs.iter().any(|tab| tab.index == 4));
         assert!(revealed.scroll > 0);
         assert_strip_inside(&revealed, 12);
+    }
+
+    fn sample_blame(uncommitted: bool) -> crate::workspace::LineBlame {
+        crate::workspace::LineBlame {
+            author: "Ada Lovelace".into(),
+            summary: "Note".into(),
+            time: 1,
+            hash: "abcd".into(),
+            uncommitted,
+        }
+    }
+
+    #[test]
+    fn blame_suffix_keeps_the_name_and_arrow_in_free_space() {
+        let suffix = blame_suffix(&sample_blame(false), 16).unwrap();
+        assert_eq!(suffix.label, "Ada Lovelace");
+        assert!(suffix.arrow);
+        assert_eq!(suffix.width, 14);
+        assert!(blame_suffix(&sample_blame(false), 2).is_none());
+    }
+
+    #[test]
+    fn uncommitted_blame_has_no_arrow() {
+        let suffix = blame_suffix(&sample_blame(true), 40).unwrap();
+        assert_eq!(suffix.label, "Uncommitted");
+        assert!(!suffix.arrow);
     }
 }

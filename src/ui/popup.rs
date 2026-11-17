@@ -49,6 +49,21 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_types_note(frame, app, theme);
         return;
     }
+    let blame = match &app.overlay {
+        Overlay::Blame {
+            author,
+            summary,
+            hash,
+            time,
+            x,
+            y,
+        } => Some((author.clone(), summary.clone(), hash.clone(), *time, *x, *y)),
+        _ => None,
+    };
+    if let Some((author, summary, hash, time, x, y)) = blame {
+        render_blame(frame, app, theme, &author, &summary, &hash, time, x, y);
+        return;
+    }
     match &app.overlay {
         Overlay::Search {
             kind: SearchKind::Content,
@@ -230,6 +245,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Overlay::Themes { .. }
         | Overlay::Help
         | Overlay::TypesNote
+        | Overlay::Blame { .. }
         | Overlay::ContextMenu { .. }
         | Overlay::None => {}
     }
@@ -960,6 +976,83 @@ fn render_list(
         span: (list_area.width > 0).then_some((list_area.x, list_area.width)),
         hits,
     }
+}
+
+fn render_blame(
+    frame: &mut Frame,
+    app: &mut App,
+    theme: Theme,
+    author: &str,
+    summary: &str,
+    hash: &str,
+    time: i64,
+    x: u16,
+    y: u16,
+) {
+    let short: String = hash.chars().take(7).collect();
+    let summary = if summary.is_empty() {
+        "(no message)"
+    } else {
+        summary
+    };
+    let when = crate::workspace::format_unix_time(time);
+    let rows = [format!("{short}  {summary}"), author.to_string(), when];
+    let screen = frame.area();
+    let max_inner = screen.width.saturating_sub(4).max(8) as usize;
+    let rows: Vec<String> = rows
+        .into_iter()
+        .map(|row| fit_width(&row, max_inner))
+        .collect();
+    let inner = rows
+        .iter()
+        .map(|row| UnicodeWidthStr::width(row.as_str()))
+        .max()
+        .unwrap_or(8);
+    let width = (inner as u16 + 2).clamp(12, screen.width.saturating_sub(1).max(12));
+    let height = 5u16.min(screen.height.max(3));
+    let x = x.min(screen.right().saturating_sub(width));
+    let y = if y >= height {
+        y - height
+    } else {
+        y.saturating_add(1)
+            .min(screen.bottom().saturating_sub(height))
+    };
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    app.overlay_area = Some((area.x, area.y, area.width, area.height));
+    frame.render_widget(Clear, area);
+    let lines: Vec<Line> = rows
+        .into_iter()
+        .map(|row| Line::from(Span::styled(row, Style::default().fg(theme.fg))))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(theme.text())
+            .block(theme.panel(" Commit ", false)),
+        area,
+    );
+}
+
+fn fit_width(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut width = 0;
+    for ch in text.chars() {
+        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width + 1 > max_width {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out.push('…');
+    out
 }
 
 fn center(area: Rect, height: u16, width: u16) -> Rect {

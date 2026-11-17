@@ -362,6 +362,18 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         }
         MouseEventKind::Down(MouseButton::Left) => {
             commands::cancel_hover(app);
+            if matches!(app.overlay, Overlay::Blame { .. }) {
+                let inside = app.overlay_area.is_some_and(|(ax, ay, width, height)| {
+                    x >= ax
+                        && x < ax.saturating_add(width)
+                        && y >= ay
+                        && y < ay.saturating_add(height)
+                });
+                if inside {
+                    return;
+                }
+                commands::dismiss_overlay(app);
+            }
             if let Some(scope) = app
                 .search_scope_hits
                 .iter()

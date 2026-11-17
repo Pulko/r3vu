@@ -89,10 +89,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('c') | KeyCode::Char('C') => return commands::copy(app),
             KeyCode::Char('x') | KeyCode::Char('X') => return commands::cut(app),
             KeyCode::Char('v') | KeyCode::Char('V') => {
-                if matches!(
-                    app.overlay,
-                    Overlay::Search { .. } | Overlay::SearchFile { .. } | Overlay::Prompt { .. }
-                ) {
+                if matches!(app.overlay, Overlay::Search { .. } | Overlay::Prompt { .. }) {
                     let text = app.clipboard.paste();
                     commands::overlay_insert(app, &text);
                 } else {
@@ -142,6 +139,18 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 if matches!(app.overlay, Overlay::Prompt { .. }) =>
             {
                 commands::move_prompt_cursor(app, key.code);
+                return;
+            }
+            KeyCode::Tab
+                if matches!(
+                    app.overlay,
+                    Overlay::Search {
+                        kind: SearchKind::Content,
+                        ..
+                    }
+                ) =>
+            {
+                commands::toggle_search_scope(app);
                 return;
             }
             KeyCode::Up => return commands::move_sel(app, Movement::Up, false),
@@ -353,6 +362,25 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         }
         MouseEventKind::Down(MouseButton::Left) => {
             commands::cancel_hover(app);
+            if let Some(scope) = app
+                .search_scope_hits
+                .iter()
+                .find(|hit| y == hit.y && x >= hit.x && x < hit.x.saturating_add(hit.width))
+                .map(|hit| hit.scope)
+            {
+                commands::set_search_scope(app, scope);
+                return;
+            }
+            if let Some(open) = commands::click_search_row(app, x, y) {
+                let _ = events::note_click(app, x, y);
+                if open {
+                    commands::overlay_submit(app);
+                }
+                return;
+            }
+            if matches!(app.overlay, Overlay::Search { .. }) && in_rect(app.overlay_area, x, y) {
+                return;
+            }
             if matches!(app.overlay, Overlay::Prompt { .. }) {
                 if !commands::click_prompt(app, x, y) {
                     commands::dismiss_overlay(app);
@@ -473,19 +501,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                                 commands::open_search(app);
                             }
                         }
-                        HeaderAction::Search => {
-                            if matches!(
-                                app.overlay,
-                                Overlay::Search {
-                                    kind: SearchKind::Content,
-                                    ..
-                                }
-                            ) {
-                                commands::dismiss_overlay(app);
-                            } else {
-                                commands::open_content_search(app);
-                            }
-                        }
+                        HeaderAction::Search => commands::open_content_search(app),
                     }
                 }
             } else if in_explorer {
@@ -704,8 +720,9 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::app::commands;
-    use crate::app::state::{App, HeaderAction, HeaderHit, Overlay, SearchKind};
+    use crate::app::state::{App, HeaderAction, HeaderHit, Overlay, SearchKind, SearchScope};
     use crate::language::LanguageClient;
+    use crate::workspace::SearchMatch;
 
     use super::handle_event;
 
@@ -765,7 +782,7 @@ mod tests {
 
     fn overlay_query(app: &App) -> String {
         match &app.overlay {
-            Overlay::Search { query, .. } | Overlay::SearchFile { query, .. } => query.clone(),
+            Overlay::Search { query, .. } => query.clone(),
             other => panic!("expected a search query, got {other:?}"),
         }
     }
@@ -816,9 +833,11 @@ mod tests {
         app.overlay_area = Some((0, 0, 40, 18));
         app.overlay = Overlay::Search {
             kind: SearchKind::Find,
+            scope: SearchScope::Global,
             query: String::new(),
             files: (0..40).map(|index| format!("file-{index:02}")).collect(),
             matches: Vec::new(),
+            file_matches: Vec::new(),
             selected: 0,
             scroll: 0,
             searching: false,
@@ -910,6 +929,74 @@ mod tests {
             assert_eq!(overlay_query(&app), "search-query");
 
             assert_eq!(editor_text(&app), before);
+        });
+    }
+
+    #[test]
+    fn double_clicking_a_search_row_opens_it() {
+        with_runtime(|| {
+            let dir = std::env::temp_dir().join(format!("p0-click-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("a.txt"), "alpha\n").unwrap();
+            std::fs::write(dir.join("b.txt"), "beta\nsecond\n").unwrap();
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut app = App::new(dir.clone(), LanguageClient { tx });
+            app.overlay = Overlay::Search {
+                kind: SearchKind::Find,
+                scope: SearchScope::Global,
+                query: String::new(),
+                files: vec!["a.txt".into(), "b.txt".into()],
+                matches: Vec::new(),
+                file_matches: Vec::new(),
+                selected: 0,
+                scroll: 0,
+                searching: false,
+            };
+            app.overlay_area = Some((2, 4, 40, 12));
+            app.search_row_span = Some((4, 20));
+            app.search_rows = vec![(0, 8), (1, 9)];
+
+            handle_event(&mut app, left_click(3, 9));
+            assert!(matches!(app.overlay, Overlay::Search { selected: 0, .. }));
+
+            handle_event(&mut app, left_click(6, 9));
+            assert!(matches!(app.overlay, Overlay::Search { selected: 1, .. }));
+            assert!(app.active_doc().is_none());
+
+            handle_event(&mut app, left_click(10, 9));
+            assert!(matches!(app.overlay, Overlay::None));
+            assert!(
+                app.active_doc()
+                    .and_then(|doc| doc.path.as_ref())
+                    .is_some_and(|path| path.ends_with("b.txt"))
+            );
+
+            app.overlay = Overlay::Search {
+                kind: SearchKind::Content,
+                scope: SearchScope::Global,
+                query: "second".into(),
+                files: Vec::new(),
+                matches: vec![SearchMatch {
+                    path: dir.join("b.txt"),
+                    line: 1,
+                    column: 0,
+                    text: "second".into(),
+                }],
+                file_matches: Vec::new(),
+                selected: 0,
+                scroll: 0,
+                searching: false,
+            };
+            app.search_row_span = Some((4, 20));
+            app.search_rows = vec![(0, 7)];
+            handle_event(&mut app, left_click(8, 7));
+            assert!(matches!(app.overlay, Overlay::Search { selected: 0, .. }));
+            assert_eq!(app.active_view().unwrap().cursor.line, 0);
+            handle_event(&mut app, left_click(12, 7));
+            assert!(matches!(app.overlay, Overlay::None));
+            assert_eq!(app.active_view().unwrap().cursor.line, 1);
+            let _ = std::fs::remove_dir_all(&dir);
         });
     }
 

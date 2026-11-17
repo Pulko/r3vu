@@ -8,13 +8,16 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
 use crate::app::commands::TYPES_INSTALL;
-use crate::app::state::Overlay;
+use crate::app::state::{Overlay, ScopeHit, SearchKind, SearchScope};
 use crate::ui::theme::Theme;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let theme = app.theme();
     app.types_copy = None;
     app.prompt_caret = None;
+    app.search_scope_hits.clear();
+    app.search_rows.clear();
+    app.search_row_span = None;
     if !matches!(
         app.overlay,
         Overlay::Themes { .. } | Overlay::Help | Overlay::TypesNote
@@ -48,6 +51,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
     match &app.overlay {
         Overlay::Search {
+            kind: SearchKind::Content,
+            ..
+        } => render_content_search(frame, app, theme),
+        Overlay::Search {
             kind,
             query,
             files,
@@ -55,6 +62,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             selected,
             scroll,
             searching,
+            ..
         } => {
             let mut items = files.clone();
             items.extend(matches.iter().map(|m| {
@@ -65,18 +73,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                     m.text
                 )
             }));
-            if matches!(kind, crate::app::state::SearchKind::Content)
-                && !*searching
-                && matches.is_empty()
-                && !query.trim().is_empty()
-            {
-                items.push("No matches".to_string());
-            }
-            let title = match (kind, *searching) {
-                (crate::app::state::SearchKind::Find, true) => " Find (searching) ",
-                (crate::app::state::SearchKind::Find, false) => " Find ",
-                (crate::app::state::SearchKind::Content, true) => " Search (searching) ",
-                (crate::app::state::SearchKind::Content, false) => " Search ",
+            let title = match (*kind, *searching) {
+                (SearchKind::Find, true) => " Find (searching) ",
+                _ => " Find ",
             };
             let list_area = render_list(
                 frame,
@@ -86,30 +85,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 &items,
                 *selected,
                 *scroll,
+                true,
                 theme,
             );
+            app.search_rows = list_area.hits;
+            app.search_row_span = list_area.span;
             app.overlay_area = Some((list_area.x, list_area.y, list_area.width, list_area.height));
             app.search_list_rows = list_area.rows;
-        }
-        Overlay::SearchFile {
-            query,
-            matches,
-            current,
-        } => {
-            let info = format!(
-                " {}  {}/{} ",
-                query,
-                if matches.is_empty() { 0 } else { current + 1 },
-                matches.len()
-            );
-            let area = top_box(frame.area(), 3, 40);
-            frame.render_widget(Clear, area);
-            frame.render_widget(
-                Paragraph::new(info)
-                    .style(theme.text())
-                    .block(theme.panel(" Find ", false)),
-                area,
-            );
         }
         Overlay::Completion { .. } => {}
         Overlay::Hover {
@@ -201,6 +183,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 &list,
                 *selected,
                 0,
+                false,
                 theme,
             );
         }
@@ -480,8 +463,9 @@ pub(crate) fn shortcut_rows(git: bool) -> Vec<(&'static str, &'static str)> {
         ("Ctrl+/", "Show this list"),
         ("Ctrl+S", "Save"),
         ("Ctrl+P", "Find file from selection"),
-        ("Click Search", "Search text in the repo"),
-        ("Ctrl+F", "Search selection in file"),
+        ("Click Search", "Search the repo"),
+        ("Ctrl+F", "Search this file"),
+        ("Click File / Global", "Switch search scope"),
         ("Ctrl+Enter", "Go to definition"),
         ("Option+T", "Ask Claude about the selection"),
         ("Option+E", "Edit the selection with Claude"),
@@ -681,6 +665,233 @@ struct ListArea {
     width: u16,
     height: u16,
     rows: usize,
+    hits: Vec<(usize, u16)>,
+    span: Option<(u16, u16)>,
+}
+
+fn render_content_search(frame: &mut Frame, app: &mut App, theme: Theme) {
+    let (scope, query, matches, file_matches, selected, scroll, searching) = match &app.overlay {
+        Overlay::Search {
+            scope,
+            query,
+            matches,
+            file_matches,
+            selected,
+            scroll,
+            searching,
+            ..
+        } => (
+            *scope,
+            query.clone(),
+            matches.clone(),
+            file_matches.clone(),
+            *selected,
+            *scroll,
+            *searching,
+        ),
+        _ => return,
+    };
+    let global = scope == SearchScope::Global;
+    let height = if global { 16 } else { 3 };
+    let area = top_box(frame.area(), height, 70);
+    frame.render_widget(Clear, area);
+    frame.render_widget(theme.panel(" Search ", false), area);
+    draw_scope_chips(frame, app, area, scope, theme);
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    if inner.width == 0 || inner.height == 0 {
+        app.overlay_area = Some((area.x, area.y, area.width, area.height));
+        app.search_list_rows = 0;
+        return;
+    }
+    let query_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: 1,
+    };
+    let count = if global {
+        if searching {
+            "searching ".to_string()
+        } else {
+            String::new()
+        }
+    } else {
+        format!(
+            "{}/{} ",
+            if file_matches.is_empty() {
+                0
+            } else {
+                selected + 1
+            },
+            file_matches.len()
+        )
+    };
+    let count_w = UnicodeWidthStr::width(count.as_str()) as u16;
+    let query_w = query_area.width.saturating_sub(count_w);
+    frame.render_widget(
+        Paragraph::new(format!(" {query}")).style(theme.text()),
+        Rect {
+            x: query_area.x,
+            y: query_area.y,
+            width: query_w,
+            height: 1,
+        },
+    );
+    if count_w > 0 && query_w < query_area.width {
+        frame.render_widget(
+            Paragraph::new(count)
+                .style(Style::default().fg(theme.fg_muted).bg(theme.bg))
+                .alignment(ratatui::layout::Alignment::Right),
+            Rect {
+                x: query_area.x.saturating_add(query_w),
+                y: query_area.y,
+                width: query_area.width.saturating_sub(query_w),
+                height: 1,
+            },
+        );
+    }
+    let ruled = global && inner.height >= 3;
+    if ruled {
+        draw_rule(frame, area, inner.y.saturating_add(1), theme);
+    }
+    let list_h = inner.height.saturating_sub(1 + u16::from(ruled));
+    app.search_list_rows = if global { list_h as usize } else { 0 };
+    if global && list_h > 0 {
+        let mut items: Vec<String> = matches
+            .iter()
+            .map(|item| {
+                format!(
+                    "{}:{}  {}",
+                    crate::app::App::relative_static(app, &item.path),
+                    item.line + 1,
+                    item.text
+                )
+            })
+            .collect();
+        if !searching && items.is_empty() && !query.trim().is_empty() {
+            items.push("No matches".to_string());
+        }
+        let list_area = Rect {
+            x: inner.x,
+            y: inner.y.saturating_add(if ruled { 2 } else { 1 }),
+            width: inner.width,
+            height: list_h,
+        };
+        let height = list_area.height as usize;
+        let start = scroll.min(items.len().saturating_sub(height));
+        let end = (start + height).min(items.len());
+        let list_items: Vec<ListItem> = items[start..end]
+            .iter()
+            .enumerate()
+            .map(|(offset, item)| {
+                let mut style = Style::default().fg(theme.fg);
+                if !matches.is_empty() && start + offset == selected {
+                    style = style.bg(theme.bg_selected);
+                }
+                ListItem::new(Span::styled(item.clone(), style))
+            })
+            .collect();
+        if list_area.width > 0 {
+            app.search_row_span = Some((list_area.x, list_area.width));
+            for offset in 0..(end - start) {
+                let index = start + offset;
+                if index < matches.len() {
+                    app.search_rows
+                        .push((index, list_area.y.saturating_add(offset as u16)));
+                }
+            }
+        }
+        frame.render_widget(List::new(list_items), list_area);
+    }
+    app.overlay_area = Some((area.x, area.y, area.width, area.height));
+}
+
+fn draw_scope_chips(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    scope: SearchScope,
+    theme: Theme,
+) {
+    let file_label = " File ";
+    let global_label = " Global ";
+    let file_w = UnicodeWidthStr::width(file_label) as u16;
+    let global_w = UnicodeWidthStr::width(global_label) as u16;
+    let global_x = area.right().saturating_sub(1 + global_w);
+    let file_x = global_x.saturating_sub(1 + file_w);
+    let title_w = UnicodeWidthStr::width(" Search ") as u16;
+    if file_x <= area.x.saturating_add(title_w) || global_x <= file_x {
+        return;
+    }
+    let file_enabled = app.active.is_some();
+    let chip = |on: bool, enabled: bool| {
+        if !enabled {
+            Style::default().fg(theme.fg_dim).bg(theme.bg)
+        } else if on {
+            Style::default()
+                .fg(theme.on_accent)
+                .bg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.accent).bg(theme.bg)
+        }
+    };
+    let y = area.y;
+    frame.render_widget(
+        Paragraph::new(file_label).style(chip(scope == SearchScope::File, file_enabled)),
+        Rect {
+            x: file_x,
+            y,
+            width: file_w,
+            height: 1,
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(global_label).style(chip(scope == SearchScope::Global, true)),
+        Rect {
+            x: global_x,
+            y,
+            width: global_w,
+            height: 1,
+        },
+    );
+    if file_enabled {
+        app.search_scope_hits.push(ScopeHit {
+            scope: SearchScope::File,
+            x: file_x,
+            y,
+            width: file_w,
+        });
+    }
+    app.search_scope_hits.push(ScopeHit {
+        scope: SearchScope::Global,
+        x: global_x,
+        y,
+        width: global_w,
+    });
+}
+
+fn draw_rule(frame: &mut Frame, area: Rect, y: u16, theme: Theme) {
+    if area.width < 2 || y < area.y || y >= area.bottom() {
+        return;
+    }
+    let line = ratatui::symbols::line::NORMAL;
+    let text = format!(
+        "{}{}{}",
+        line.vertical_right,
+        line.horizontal
+            .repeat(area.width.saturating_sub(2) as usize),
+        line.vertical_left
+    );
+    frame.render_widget(
+        Paragraph::new(text).style(Style::default().fg(theme.border).bg(theme.bg)),
+        Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: 1,
+        },
+    );
 }
 
 fn render_list(
@@ -691,42 +902,45 @@ fn render_list(
     items: &[String],
     selected: usize,
     scroll: usize,
+    rule: bool,
     theme: Theme,
 ) -> ListArea {
-    let area = center(full, 18, 70);
+    let area = center(full, if rule { 19 } else { 18 }, 70);
     frame.render_widget(Clear, area);
-    let chunks = ratatui::layout::Layout::default()
-        .direction(ratatui::layout::Direction::Vertical)
-        .constraints([
-            ratatui::layout::Constraint::Length(1),
-            ratatui::layout::Constraint::Min(1),
-        ])
-        .split(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .inner(area),
-        );
     frame.render_widget(theme.panel(title, false), area);
     let inner = Block::default().borders(Borders::ALL).inner(area);
-    let rows = ratatui::layout::Layout::default()
-        .direction(ratatui::layout::Direction::Vertical)
-        .constraints([
-            ratatui::layout::Constraint::Length(1),
-            ratatui::layout::Constraint::Min(1),
-        ])
-        .split(inner);
-    frame.render_widget(
-        Paragraph::new(query.to_string()).style(theme.text()),
-        rows[0],
-    );
-    let height = rows[1].height as usize;
+    let ruled = rule && inner.height >= 3;
+    if inner.width > 0 && inner.height > 0 {
+        frame.render_widget(
+            Paragraph::new(query.to_string()).style(theme.text()),
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+    if ruled {
+        draw_rule(frame, area, inner.y.saturating_add(1), theme);
+    }
+    let list_area = Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(if ruled { 2 } else { 1 }),
+        width: inner.width,
+        height: inner.height.saturating_sub(if ruled { 2 } else { 1 }),
+    };
+    let height = list_area.height as usize;
     let start = scroll.min(items.len().saturating_sub(height));
     let end = (start + height).min(items.len());
+    let mut hits = Vec::new();
     let list_items: Vec<ListItem> = items[start..end]
         .iter()
         .enumerate()
         .map(|(offset, item)| {
+            if list_area.width > 0 {
+                hits.push((start + offset, list_area.y.saturating_add(offset as u16)));
+            }
             let mut style = Style::default().fg(theme.fg);
             if start + offset == selected {
                 style = style.bg(theme.bg_selected);
@@ -734,14 +948,17 @@ fn render_list(
             ListItem::new(Span::styled(item.clone(), style))
         })
         .collect();
-    frame.render_widget(List::new(list_items), rows[1]);
-    let _ = chunks;
+    if list_area.width > 0 && list_area.height > 0 {
+        frame.render_widget(List::new(list_items), list_area);
+    }
     ListArea {
         x: area.x,
         y: area.y,
         width: area.width,
         height: area.height,
         rows: height,
+        span: (list_area.width > 0).then_some((list_area.x, list_area.width)),
+        hits,
     }
 }
 

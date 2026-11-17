@@ -20,8 +20,8 @@ use crate::workspace::{
 
 use super::state::{
     App, ConfirmAction, Focus, HScrollHit, MenuAction, MenuItem, Overlay, PendingRename,
-    PromptKind, SearchKind, clamp_explorer_scroll, decode_diagnostic_pos, explorer_index_at,
-    explorer_inner_rows, git_list_rows, is_ident_char, max_explorer_scroll,
+    PromptKind, SearchKind, SearchScope, clamp_explorer_scroll, decode_diagnostic_pos,
+    explorer_index_at, explorer_inner_rows, git_list_rows, is_ident_char, max_explorer_scroll,
 };
 
 pub fn save_active(app: &mut App) {
@@ -377,9 +377,11 @@ pub fn open_search(app: &mut App) {
     app.file_finder.set_files(&app.workspace_files);
     app.overlay = Overlay::Search {
         kind: SearchKind::Find,
+        scope: SearchScope::Global,
         query: editor_search_seed(app),
         files: Vec::new(),
         matches: Vec::new(),
+        file_matches: Vec::new(),
         selected: 0,
         scroll: 0,
         searching: false,
@@ -388,31 +390,128 @@ pub fn open_search(app: &mut App) {
 }
 
 pub fn open_content_search(app: &mut App) {
-    app.overlay = Overlay::Search {
+    if let Overlay::Search {
         kind: SearchKind::Content,
-        query: String::new(),
-        files: Vec::new(),
-        matches: Vec::new(),
-        selected: 0,
-        scroll: 0,
-        searching: false,
-    };
+        scope,
+        ..
+    } = &app.overlay
+    {
+        if *scope == SearchScope::Global {
+            app.overlay = Overlay::None;
+            return;
+        }
+        set_search_scope(app, SearchScope::Global);
+        return;
+    }
+    begin_content_search(app, SearchScope::Global, String::new());
 }
 
 pub fn open_search_file(app: &mut App) {
-    let query = editor_search_seed(app);
-    let origin = search_origin(app);
-    let matches = app
-        .active_doc()
-        .map(|doc| find_in_document(&doc.text(), &query, true))
-        .unwrap_or_default();
-    let current = origin.map(|pos| match_index_at(pos, &matches)).unwrap_or(0);
-    app.overlay = Overlay::SearchFile {
-        query,
-        matches,
-        current,
+    let scope = if app.active_doc().is_some() {
+        SearchScope::File
+    } else {
+        SearchScope::Global
     };
-    jump_search(app);
+    if let Overlay::Search {
+        kind: SearchKind::Content,
+        scope: current,
+        ..
+    } = &app.overlay
+    {
+        if *current == scope {
+            app.overlay = Overlay::None;
+            return;
+        }
+        set_search_scope(app, scope);
+        return;
+    }
+    begin_content_search(app, scope, editor_search_seed(app));
+}
+
+fn begin_content_search(app: &mut App, mut scope: SearchScope, query: String) {
+    if scope == SearchScope::File && app.active_doc().is_none() {
+        scope = SearchScope::Global;
+    }
+    let selected = if scope == SearchScope::File {
+        let matches = file_match_list(app, &query);
+        search_origin(app)
+            .map(|pos| match_index_at(pos, &matches))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    app.overlay = Overlay::Search {
+        kind: SearchKind::Content,
+        scope,
+        query,
+        files: Vec::new(),
+        matches: Vec::new(),
+        file_matches: Vec::new(),
+        selected,
+        scroll: 0,
+        searching: false,
+    };
+    refresh_overlay_query(app);
+}
+
+fn file_match_list(app: &App, query: &str) -> Vec<(Position, Position)> {
+    app.active_doc()
+        .map(|doc| find_in_document(&doc.text(), query, true))
+        .unwrap_or_default()
+}
+
+pub fn set_search_scope(app: &mut App, scope: SearchScope) {
+    let Overlay::Search {
+        kind: SearchKind::Content,
+        scope: current,
+        ..
+    } = &app.overlay
+    else {
+        return;
+    };
+    if *current == scope || (scope == SearchScope::File && app.active_doc().is_none()) {
+        return;
+    }
+    let Overlay::Search { query, .. } = &app.overlay else {
+        return;
+    };
+    let query = query.clone();
+    let selected = if scope == SearchScope::File {
+        let matches = file_match_list(app, &query);
+        search_origin(app)
+            .map(|pos| match_index_at(pos, &matches))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    app.overlay = Overlay::Search {
+        kind: SearchKind::Content,
+        scope,
+        query,
+        files: Vec::new(),
+        matches: Vec::new(),
+        file_matches: Vec::new(),
+        selected,
+        scroll: 0,
+        searching: false,
+    };
+    refresh_overlay_query(app);
+}
+
+pub fn toggle_search_scope(app: &mut App) {
+    let Overlay::Search {
+        kind: SearchKind::Content,
+        scope,
+        ..
+    } = app.overlay
+    else {
+        return;
+    };
+    let next = match scope {
+        SearchScope::File => SearchScope::Global,
+        SearchScope::Global => SearchScope::File,
+    };
+    set_search_scope(app, next);
 }
 
 fn lsp_target(app: &App) -> Option<(PathBuf, Position)> {
@@ -993,7 +1092,7 @@ pub fn overlay_char(app: &mut App, ch: char) {
         return;
     }
     match &mut app.overlay {
-        Overlay::Search { query, .. } | Overlay::SearchFile { query, .. } => {
+        Overlay::Search { query, .. } => {
             query.push(ch);
         }
         _ => {}
@@ -1002,10 +1101,7 @@ pub fn overlay_char(app: &mut App, ch: char) {
 }
 
 pub fn overlay_insert(app: &mut App, text: &str) -> bool {
-    if !matches!(
-        app.overlay,
-        Overlay::Search { .. } | Overlay::SearchFile { .. } | Overlay::Prompt { .. }
-    ) {
+    if !matches!(app.overlay, Overlay::Search { .. } | Overlay::Prompt { .. }) {
         return false;
     }
     let text = sanitize_overlay_paste(text);
@@ -1016,7 +1112,7 @@ pub fn overlay_insert(app: &mut App, text: &str) -> bool {
         return true;
     }
     match &mut app.overlay {
-        Overlay::Search { query, .. } | Overlay::SearchFile { query, .. } => {
+        Overlay::Search { query, .. } => {
             query.push_str(&text);
         }
         _ => return true,
@@ -1040,7 +1136,7 @@ fn overlay_backspace(app: &mut App) -> bool {
         return true;
     }
     let handled = match &mut app.overlay {
-        Overlay::Search { query, .. } | Overlay::SearchFile { query, .. } => {
+        Overlay::Search { query, .. } => {
             query.pop();
             true
         }
@@ -1057,58 +1153,69 @@ fn overlay_backspace(app: &mut App) -> bool {
 }
 
 fn refresh_overlay_query(app: &mut App) {
-    match app.overlay.clone() {
-        Overlay::Search {
-            kind,
-            query,
-            selected,
-            scroll,
-            matches,
-            ..
-        } => {
-            let files = if kind == SearchKind::Find {
-                app.file_finder.query(&query)
-            } else {
-                Vec::new()
-            };
-            let searching = !query.trim().is_empty();
-            let matches = if searching { matches } else { Vec::new() };
+    let Overlay::Search {
+        kind,
+        mut scope,
+        query,
+        selected,
+        scroll,
+        matches,
+        ..
+    } = app.overlay.clone()
+    else {
+        return;
+    };
+    if kind == SearchKind::Content && scope == SearchScope::File {
+        if app.active_doc().is_none() {
+            scope = SearchScope::Global;
+        } else {
+            let file_matches = file_match_list(app, &query);
+            let selected = selected.min(file_matches.len().saturating_sub(1));
             app.search_generation = app.search_generation.wrapping_add(1);
-            if searching {
-                crate::workspace::spawn_workspace_search(
-                    app.root.clone(),
-                    query.clone(),
-                    app.search_generation,
-                    app.search_tx.clone(),
-                );
-            }
-            let len = files.len() + matches.len();
-            let (selected, scroll) =
-                fit_search_window(selected, scroll, len, app.search_list_rows, true);
             app.overlay = Overlay::Search {
                 kind,
+                scope,
                 query,
+                files: Vec::new(),
+                matches: Vec::new(),
+                file_matches,
                 selected,
-                scroll,
-                files,
-                matches,
-                searching,
-            };
-        }
-        Overlay::SearchFile { query, current, .. } => {
-            let matches = app
-                .active_doc()
-                .map(|d| find_in_document(&d.text(), &query, true))
-                .unwrap_or_default();
-            app.overlay = Overlay::SearchFile {
-                current: current.min(matches.len().saturating_sub(1)),
-                query,
-                matches,
+                scroll: 0,
+                searching: false,
             };
             jump_search(app);
+            return;
         }
-        _ => {}
     }
+    let files = if kind == SearchKind::Find {
+        app.file_finder.query(&query)
+    } else {
+        Vec::new()
+    };
+    let searching = !query.trim().is_empty();
+    let matches = if searching { matches } else { Vec::new() };
+    app.search_generation = app.search_generation.wrapping_add(1);
+    if searching {
+        crate::workspace::spawn_workspace_search(
+            app.root.clone(),
+            query.clone(),
+            app.search_generation,
+            app.search_tx.clone(),
+        );
+    }
+    let len = files.len() + matches.len();
+    let (selected, scroll) = fit_search_window(selected, scroll, len, app.search_list_rows, true);
+    app.overlay = Overlay::Search {
+        kind,
+        scope,
+        query,
+        selected,
+        scroll,
+        files,
+        matches,
+        file_matches: Vec::new(),
+        searching,
+    };
 }
 
 pub(crate) fn fit_search_window(
@@ -1149,12 +1256,28 @@ fn overlay_move(app: &mut App, movement: Movement) {
     let visible = app.search_list_rows;
     match &mut app.overlay {
         Overlay::Search {
+            kind,
+            scope,
             files,
             matches,
+            file_matches,
             selected,
             scroll,
             ..
         } => {
+            if *kind == SearchKind::Content && *scope == SearchScope::File {
+                if file_matches.is_empty() {
+                    return;
+                }
+                if down {
+                    *selected = (*selected + 1) % file_matches.len();
+                }
+                if up {
+                    *selected = selected.checked_sub(1).unwrap_or(file_matches.len() - 1);
+                }
+                jump_search(app);
+                return;
+            }
             if down {
                 *selected = selected.saturating_add(1);
             }
@@ -1194,27 +1317,38 @@ fn overlay_move(app: &mut App, movement: Movement) {
                 *selected = selected.saturating_sub(1);
             }
         }
-        Overlay::SearchFile {
-            matches, current, ..
-        } => {
-            if matches.is_empty() {
-                return;
-            }
-            if down {
-                *current = (*current + 1) % matches.len();
-            }
-            if up {
-                *current = current.checked_sub(1).unwrap_or(matches.len() - 1);
-            }
-            jump_search(app);
-        }
         _ => {}
     }
+}
+
+pub fn click_search_row(app: &mut App, x: u16, y: u16) -> Option<bool> {
+    let Some((row_x, width)) = app.search_row_span else {
+        return None;
+    };
+    if x < row_x || x >= row_x.saturating_add(width) {
+        return None;
+    }
+    let Some(&(index, _)) = app.search_rows.iter().find(|(_, row)| *row == y) else {
+        return None;
+    };
+    let open = app.last_click.is_some_and(|(t, lx, ly)| {
+        ly == y
+            && lx >= row_x
+            && lx < row_x.saturating_add(width)
+            && t.elapsed() < std::time::Duration::from_millis(400)
+    }) && matches!(&app.overlay, Overlay::Search { selected, .. } if *selected == index);
+    let Overlay::Search { selected, .. } = &mut app.overlay else {
+        return None;
+    };
+    *selected = index;
+    Some(open)
 }
 
 pub fn scroll_search(app: &mut App, delta: i32) {
     let visible = app.search_list_rows;
     let Overlay::Search {
+        kind,
+        scope,
         files,
         matches,
         selected,
@@ -1224,6 +1358,9 @@ pub fn scroll_search(app: &mut App, delta: i32) {
     else {
         return;
     };
+    if *kind == SearchKind::Content && *scope == SearchScope::File {
+        return;
+    }
     let len = files.len() + matches.len();
     let page = visible.max(1);
     let max_scroll = len.saturating_sub(page);
@@ -1235,6 +1372,11 @@ pub fn scroll_search(app: &mut App, delta: i32) {
 
 pub fn overlay_submit(app: &mut App) {
     match app.overlay.clone() {
+        Overlay::Search {
+            kind: SearchKind::Content,
+            scope: SearchScope::File,
+            ..
+        } => {}
         Overlay::Search {
             files,
             matches,
@@ -1284,7 +1426,7 @@ pub fn overlay_submit(app: &mut App) {
             }
             app.overlay = Overlay::None;
         }
-        Overlay::SearchFile { .. } | Overlay::Help => {}
+        Overlay::Help => {}
         Overlay::TypesNote => dismiss_types_note(app),
         _ => app.overlay = Overlay::None,
     }
@@ -1440,13 +1582,17 @@ fn place_and_reveal(
 }
 
 fn jump_search(app: &mut App) {
-    let Overlay::SearchFile {
-        matches, current, ..
+    let Overlay::Search {
+        kind: SearchKind::Content,
+        scope: SearchScope::File,
+        file_matches,
+        selected,
+        ..
     } = app.overlay.clone()
     else {
         return;
     };
-    let Some(&(start, end)) = matches.get(current) else {
+    let Some(&(start, end)) = file_matches.get(selected) else {
         return;
     };
     let Some(id) = app.active else { return };
@@ -2690,13 +2836,13 @@ mod tests {
 
     use ropey::Rope;
 
-    use crate::app::state::{App, ConfirmAction, Overlay, SearchKind};
+    use crate::app::state::{App, ConfirmAction, Overlay, SearchKind, SearchScope};
     use crate::editor::{DocumentId, Position, Selection};
     use crate::language::LanguageClient;
 
     use super::{
         MenuAction, WheelAction, WheelAxis, confirm_yes, editor_context_labels, editor_search_seed,
-        open_search, open_search_file, run_menu, search_seed, wheel_action,
+        open_search, open_search_file, run_menu, search_seed, set_search_scope, wheel_action,
     };
 
     fn with_runtime<T>(body: impl FnOnce() -> T) -> T {
@@ -2760,14 +2906,19 @@ mod tests {
         assert_eq!(editor_search_seed(&app), "widget");
         open_search_file(&mut app);
         match &app.overlay {
-            Overlay::SearchFile {
+            Overlay::Search {
+                kind,
+                scope,
                 query,
-                matches,
-                current,
+                file_matches,
+                selected,
+                ..
             } => {
+                assert_eq!(*kind, SearchKind::Content);
+                assert_eq!(*scope, SearchScope::File);
                 assert_eq!(query, "widget");
-                assert_eq!(matches.len(), 2);
-                assert_eq!(*current, 1);
+                assert_eq!(file_matches.len(), 2);
+                assert_eq!(*selected, 1);
             }
             other => panic!("expected file search, got {other:?}"),
         }
@@ -2779,6 +2930,61 @@ mod tests {
                 cursor: Position::new(2, 8),
             })
         );
+    }
+
+    #[test]
+    fn global_search_keeps_the_file_query() {
+        with_runtime(|| {
+            let (mut app, ids) = app_with_tabs(1);
+            let id = ids[0];
+            app.documents.get_mut(&id).unwrap().rope = Rope::from("widget here\n");
+            app.views.get_mut(&id).unwrap().selection = Some(Selection {
+                anchor: Position::new(0, 0),
+                cursor: Position::new(0, 6),
+            });
+            open_search_file(&mut app);
+            set_search_scope(&mut app, SearchScope::Global);
+            match &app.overlay {
+                Overlay::Search {
+                    scope,
+                    query,
+                    searching,
+                    file_matches,
+                    ..
+                } => {
+                    assert_eq!(*scope, SearchScope::Global);
+                    assert_eq!(query, "widget");
+                    assert!(*searching);
+                    assert!(file_matches.is_empty());
+                }
+                other => panic!("expected global search, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn file_scope_needs_an_open_buffer() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(PathBuf::from("."), LanguageClient { tx });
+        open_search_file(&mut app);
+        match &app.overlay {
+            Overlay::Search {
+                kind, scope, query, ..
+            } => {
+                assert_eq!(*kind, SearchKind::Content);
+                assert_eq!(*scope, SearchScope::Global);
+                assert!(query.is_empty());
+            }
+            other => panic!("expected global search, got {other:?}"),
+        }
+        set_search_scope(&mut app, SearchScope::File);
+        assert!(matches!(
+            app.overlay,
+            Overlay::Search {
+                scope: SearchScope::Global,
+                ..
+            }
+        ));
     }
 
     #[test]

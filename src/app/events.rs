@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 
 use crate::app::commands;
-use crate::app::state::{App, ConfirmAction, Focus, Overlay, click_was_double};
+use crate::app::state::{
+    App, ConfirmAction, Focus, Overlay, SearchKind, SearchScope, click_was_double,
+};
 use crate::language::{LspEvent, LspStatus};
 
 pub fn handle_lsp(app: &mut App, event: LspEvent) {
@@ -148,6 +150,8 @@ pub fn handle_search_results(app: &mut App, update: crate::workspace::WorkspaceS
     }
     let visible = app.search_list_rows;
     if let Overlay::Search {
+        kind,
+        scope,
         query,
         files,
         matches,
@@ -157,6 +161,9 @@ pub fn handle_search_results(app: &mut App, update: crate::workspace::WorkspaceS
         ..
     } = &mut app.overlay
     {
+        if *kind == SearchKind::Content && *scope != SearchScope::Global {
+            return;
+        }
         if query.trim().is_empty() {
             return;
         }

@@ -7,7 +7,9 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
-use crate::app::state::{DiffHit, Focus, HScrollHit, HunkAction, TabHitBox};
+use crate::app::state::{
+    DiffHit, Focus, HScrollHit, HunkAction, SearchKind, SearchScope, TabHitBox,
+};
 use crate::editor::{Range, display_col, hscroll_bar, line_text, max_line_display_width};
 use crate::syntax::HighlightKind;
 use crate::ui::theme::{Theme, highlight_color, highlight_modifier};
@@ -72,11 +74,15 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
         .and_then(|p| app.diagnostics.get(p))
         .cloned()
         .unwrap_or_default();
-    let search_matches = if let crate::app::state::Overlay::SearchFile {
-        matches, current, ..
+    let search_matches = if let crate::app::state::Overlay::Search {
+        kind: SearchKind::Content,
+        scope: SearchScope::File,
+        file_matches,
+        selected,
+        ..
     } = &app.overlay
     {
-        Some((matches.clone(), *current))
+        Some((file_matches.clone(), *selected))
     } else {
         None
     };

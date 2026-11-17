@@ -84,6 +84,12 @@ pub enum SearchKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchScope {
+    File,
+    Global,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeaderAction {
     Find,
     Search,
@@ -93,6 +99,14 @@ pub enum HeaderAction {
 pub struct HeaderHit {
     pub action: HeaderAction,
     pub x: u16,
+    pub width: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScopeHit {
+    pub scope: SearchScope,
+    pub x: u16,
+    pub y: u16,
     pub width: u16,
 }
 
@@ -116,17 +130,14 @@ pub enum Overlay {
     None,
     Search {
         kind: SearchKind,
+        scope: SearchScope,
         query: String,
         files: Vec<String>,
         matches: Vec<SearchMatch>,
+        file_matches: Vec<(Position, Position)>,
         selected: usize,
         scroll: usize,
         searching: bool,
-    },
-    SearchFile {
-        query: String,
-        matches: Vec<(Position, Position)>,
-        current: usize,
     },
     Completion {
         items: Vec<CompletionItem>,
@@ -314,6 +325,9 @@ pub struct App {
     pub status_area: (u16, u16, u16, u16),
     pub status_hits: Vec<StatusHit>,
     pub header_hits: Vec<HeaderHit>,
+    pub search_scope_hits: Vec<ScopeHit>,
+    pub search_rows: Vec<(usize, u16)>,
+    pub search_row_span: Option<(u16, u16)>,
     pub overlay_area: Option<(u16, u16, u16, u16)>,
     pub search_list_rows: usize,
     pub overlay_rows: Vec<(usize, u16)>,
@@ -429,6 +443,9 @@ impl App {
             status_area: (0, 0, 0, 0),
             status_hits: Vec::new(),
             header_hits: Vec::new(),
+            search_scope_hits: Vec::new(),
+            search_rows: Vec::new(),
+            search_row_span: None,
             overlay_area: None,
             search_list_rows: 0,
             overlay_rows: Vec::new(),
@@ -1359,6 +1376,61 @@ impl App {
         {
             self.markdown_preview = None;
         }
+        self.settle_file_search();
+    }
+
+    fn settle_file_search(&mut self) {
+        let (query, selected) = match &self.overlay {
+            Overlay::Search {
+                kind: SearchKind::Content,
+                scope: SearchScope::File,
+                query,
+                selected,
+                ..
+            } => (query.clone(), *selected),
+            _ => return,
+        };
+        if let Some(text) = self.active_doc().map(|doc| doc.text()) {
+            let file_matches = crate::workspace::find_in_document(&text, &query, true);
+            let selected = selected.min(file_matches.len().saturating_sub(1));
+            if let Overlay::Search {
+                file_matches: slot,
+                selected: selected_slot,
+                matches,
+                files,
+                searching,
+                ..
+            } = &mut self.overlay
+            {
+                *slot = file_matches;
+                *selected_slot = selected;
+                matches.clear();
+                files.clear();
+                *searching = false;
+            }
+            return;
+        }
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let searching = !query.trim().is_empty();
+        if searching {
+            crate::workspace::spawn_workspace_search(
+                self.root.clone(),
+                query.clone(),
+                self.search_generation,
+                self.search_tx.clone(),
+            );
+        }
+        self.overlay = Overlay::Search {
+            kind: SearchKind::Content,
+            scope: SearchScope::Global,
+            query,
+            files: Vec::new(),
+            matches: Vec::new(),
+            file_matches: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            searching,
+        };
     }
 
     pub fn close_document(&mut self, id: DocumentId, force: bool) {

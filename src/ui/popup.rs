@@ -479,9 +479,9 @@ pub(crate) fn shortcut_rows(git: bool) -> Vec<(&'static str, &'static str)> {
     let mut rows = vec![
         ("Ctrl+/", "Show this list"),
         ("Ctrl+S", "Save"),
-        ("Ctrl+P", "Find"),
+        ("Ctrl+P", "Find file from selection"),
         ("Click Search", "Search text in the repo"),
-        ("Ctrl+F", "Search in file"),
+        ("Ctrl+F", "Search selection in file"),
         ("Ctrl+Enter", "Go to definition"),
         ("Option+T", "Ask Claude about the selection"),
         ("Option+E", "Edit the selection with Claude"),

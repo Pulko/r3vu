@@ -334,19 +334,57 @@ pub fn paste(app: &mut App) {
     }
 }
 
+fn search_seed(text: &str) -> String {
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn editor_search_seed(app: &App) -> String {
+    let Some(id) = app.active else {
+        return String::new();
+    };
+    let (Some(doc), Some(view)) = (app.documents.get(&id), app.views.get(&id)) else {
+        return String::new();
+    };
+    if view.selection.is_none_or(|selection| selection.is_empty()) {
+        return String::new();
+    }
+    search_seed(&selected_text(doc, view))
+}
+
+fn search_origin(app: &App) -> Option<Position> {
+    let view = app.active_view()?;
+    Some(
+        view.selection
+            .filter(|selection| !selection.is_empty())
+            .map(|selection| selection.range().start)
+            .unwrap_or(view.cursor),
+    )
+}
+
+fn match_index_at(pos: Position, matches: &[(Position, Position)]) -> usize {
+    matches
+        .iter()
+        .position(|(start, end)| *start <= pos && pos < *end)
+        .or_else(|| matches.iter().position(|(start, _)| *start >= pos))
+        .unwrap_or(0)
+}
+
 pub fn open_search(app: &mut App) {
     app.workspace_files = crate::workspace::list_workspace_files(&app.root);
     app.file_finder.set_files(&app.workspace_files);
-    let files = app.file_finder.query("");
     app.overlay = Overlay::Search {
         kind: SearchKind::Find,
-        query: String::new(),
-        files,
+        query: editor_search_seed(app),
+        files: Vec::new(),
         matches: Vec::new(),
         selected: 0,
         scroll: 0,
         searching: false,
     };
+    refresh_overlay_query(app);
 }
 
 pub fn open_content_search(app: &mut App) {
@@ -362,11 +400,19 @@ pub fn open_content_search(app: &mut App) {
 }
 
 pub fn open_search_file(app: &mut App) {
+    let query = editor_search_seed(app);
+    let origin = search_origin(app);
+    let matches = app
+        .active_doc()
+        .map(|doc| find_in_document(&doc.text(), &query, true))
+        .unwrap_or_default();
+    let current = origin.map(|pos| match_index_at(pos, &matches)).unwrap_or(0);
     app.overlay = Overlay::SearchFile {
-        query: String::new(),
-        matches: Vec::new(),
-        current: 0,
+        query,
+        matches,
+        current,
     };
+    jump_search(app);
 }
 
 fn lsp_target(app: &App) -> Option<(PathBuf, Position)> {
@@ -2642,13 +2688,15 @@ mod tests {
 
     use tokio::sync::mpsc;
 
-    use crate::app::state::{App, ConfirmAction, Overlay};
-    use crate::editor::DocumentId;
+    use ropey::Rope;
+
+    use crate::app::state::{App, ConfirmAction, Overlay, SearchKind};
+    use crate::editor::{DocumentId, Position, Selection};
     use crate::language::LanguageClient;
 
     use super::{
-        MenuAction, WheelAction, WheelAxis, confirm_yes, editor_context_labels, run_menu,
-        wheel_action,
+        MenuAction, WheelAction, WheelAxis, confirm_yes, editor_context_labels, editor_search_seed,
+        open_search, open_search_file, run_menu, search_seed, wheel_action,
     };
 
     fn with_runtime<T>(body: impl FnOnce() -> T) -> T {
@@ -2689,6 +2737,75 @@ mod tests {
             editor_context_labels(),
             ["Go to Definition", "Find References", "Ask Claude"]
         );
+    }
+
+    #[test]
+    fn search_seed_uses_the_first_nonblank_line() {
+        assert_eq!(search_seed("  alpha  "), "alpha");
+        assert_eq!(search_seed("\n  keep me  \nsecond"), "keep me");
+        assert_eq!(search_seed("   \n\t"), "");
+        assert_eq!(search_seed(""), "");
+    }
+
+    #[test]
+    fn search_uses_the_selected_occurrence() {
+        let (mut app, ids) = app_with_tabs(1);
+        let id = ids[0];
+        app.documents.get_mut(&id).unwrap().rope = Rope::from("widget here\nnope\n  widget  \n");
+        assert_eq!(editor_search_seed(&app), "");
+        app.views.get_mut(&id).unwrap().selection = Some(Selection {
+            anchor: Position::new(2, 2),
+            cursor: Position::new(2, 8),
+        });
+        assert_eq!(editor_search_seed(&app), "widget");
+        open_search_file(&mut app);
+        match &app.overlay {
+            Overlay::SearchFile {
+                query,
+                matches,
+                current,
+            } => {
+                assert_eq!(query, "widget");
+                assert_eq!(matches.len(), 2);
+                assert_eq!(*current, 1);
+            }
+            other => panic!("expected file search, got {other:?}"),
+        }
+        let view = app.views.get(&id).unwrap();
+        assert_eq!(
+            view.selection,
+            Some(Selection {
+                anchor: Position::new(2, 2),
+                cursor: Position::new(2, 8),
+            })
+        );
+    }
+
+    #[test]
+    fn find_starts_from_the_selection() {
+        with_runtime(|| {
+            let (mut app, ids) = app_with_tabs(1);
+            let id = ids[0];
+            app.documents.get_mut(&id).unwrap().rope = Rope::from("commands.rs\n");
+            app.views.get_mut(&id).unwrap().selection = Some(Selection {
+                anchor: Position::new(0, 0),
+                cursor: Position::new(0, 11),
+            });
+            open_search(&mut app);
+            match &app.overlay {
+                Overlay::Search {
+                    kind,
+                    query,
+                    searching,
+                    ..
+                } => {
+                    assert_eq!(*kind, SearchKind::Find);
+                    assert_eq!(query, "commands.rs");
+                    assert!(*searching);
+                }
+                other => panic!("expected find, got {other:?}"),
+            }
+        });
     }
 
     #[test]

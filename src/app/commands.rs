@@ -10,15 +10,18 @@ use crate::editor::{
     normalize_line_breaks, select_word_at, selected_text, set_cursor, word_bounds,
 };
 use crate::language::{
-    CompletionItem, LspCmd, LspStatus, completion_prefix, filter_completions, strip_snippets,
-    utf16_position_to_doc,
+    CompletionItem, LspCmd, LspStatus, TextEdit, completion_prefix, filter_completions,
+    strip_snippets, utf16_position_to_doc,
 };
-use crate::workspace::{WatchEvent, create_path, delete_path, find_in_document, rename_path};
+use crate::workspace::{
+    GitWrite, WatchEvent, WholeFileAction, create_path, delete_path, find_in_document, rename_path,
+    whole_file_action,
+};
 
 use super::state::{
     App, ConfirmAction, Focus, GIT_FOOTER_ROWS, HScrollHit, MenuAction, MenuItem, Overlay,
-    PromptKind, SearchKind, clamp_explorer_scroll, decode_diagnostic_pos, explorer_index_at,
-    explorer_inner_rows, git_list_rows, is_ident_char, max_explorer_scroll,
+    PendingRename, PromptKind, SearchKind, clamp_explorer_scroll, decode_diagnostic_pos,
+    explorer_index_at, explorer_inner_rows, git_list_rows, is_ident_char, max_explorer_scroll,
 };
 
 pub fn save_active(app: &mut App) {
@@ -679,6 +682,8 @@ pub fn confirm_yes(app: &mut App) {
             }
         }
         ConfirmAction::DiscardHunk { patch, path } => app.discard_hunk(patch, path),
+        ConfirmAction::RestoreFile(path) => app.enqueue_git_write(GitWrite::Restore(path)),
+        ConfirmAction::DiscardAdded(path) => app.enqueue_git_write(GitWrite::Remove(path)),
         ConfirmAction::DeletePath(path) => {
             if let Err(err) = delete_path(&path) {
                 app.message = Some(format!("delete failed: {err}"));
@@ -759,21 +764,22 @@ pub fn submit_prompt(app: &mut App) {
             }
         }
         PromptKind::RenameFile => {
-            if let Some(entry) = app.explorer_entries.get(app.explorer_selected) {
+            if let Some(entry) = app.explorer_entries.get(app.explorer_selected).cloned() {
                 let to = entry.path.parent().unwrap_or(&app.root).join(&input);
-                let from = entry.path.clone();
-                if let Err(err) = rename_path(&from, &to) {
-                    app.message = Some(format!("rename failed: {err}"));
+                let from = entry.path;
+                if to == from {
+                    return;
+                }
+                if matches!(app.lsp_status, LspStatus::Ready) {
+                    let token = app.next_token();
+                    let _ = app.lsp.tx.send(LspCmd::WillRename {
+                        token,
+                        from: from.clone(),
+                        to: to.clone(),
+                    });
+                    app.pending_rename = Some(PendingRename { token, from, to });
                 } else {
-                    if let Some(doc) = app
-                        .documents
-                        .values_mut()
-                        .find(|d| d.path.as_ref() == Some(&from))
-                    {
-                        doc.path = Some(to.clone());
-                    }
-                    app.refresh_explorer();
-                    app.refresh_git_status();
+                    rename_without_imports(app, from, to);
                 }
             }
         }
@@ -1317,6 +1323,190 @@ pub fn show_explorer_menu(app: &mut App, x: u16, y: u16) {
     };
 }
 
+pub fn show_git_menu(app: &mut App, x: u16, y: u16) {
+    let rows = crate::workspace::git_panel_rows(&app.git_status);
+    let Some(crate::workspace::GitPanelRow::File { path, .. }) = rows.get(app.git_selected) else {
+        return;
+    };
+    let Some(status) = app.git_status.get(path).copied() else {
+        return;
+    };
+    if whole_file_action(status).is_none() {
+        app.message = Some("A rename stays as it is".into());
+        return;
+    }
+    let restore = matches!(whole_file_action(status), Some(WholeFileAction::Restore));
+    app.overlay = Overlay::ContextMenu {
+        x,
+        y,
+        selected: 0,
+        show_type: false,
+        type_text: String::new(),
+        hover_token: 0,
+        items: vec![MenuItem {
+            label: if restore { "Restore" } else { "Discard" }.into(),
+            action: if restore {
+                MenuAction::RestoreFile
+            } else {
+                MenuAction::DiscardFile
+            },
+            enabled: true,
+        }],
+    };
+}
+
+fn confirm_selected_git_file(app: &mut App) {
+    let rows = crate::workspace::git_panel_rows(&app.git_status);
+    let Some(crate::workspace::GitPanelRow::File { path, .. }) = rows.get(app.git_selected) else {
+        return;
+    };
+    let path = path.clone();
+    let Some(status) = app.git_status.get(&path).copied() else {
+        return;
+    };
+    let name = app.relative(&path);
+    let (message, action) = match whole_file_action(status) {
+        Some(WholeFileAction::Restore) => {
+            (format!("Restore {name}?"), ConfirmAction::RestoreFile(path))
+        }
+        Some(WholeFileAction::Remove) => (
+            format!("Discard {name}?"),
+            ConfirmAction::DiscardAdded(path),
+        ),
+        Some(WholeFileAction::Delete) => {
+            (format!("Delete {name}?"), ConfirmAction::DeletePath(path))
+        }
+        None => return,
+    };
+    app.overlay = Overlay::Confirm { message, action };
+}
+
+pub fn confirm_restore_active(app: &mut App) {
+    let Some(id) = app.active else {
+        return;
+    };
+    if !app.absent.contains(&id) {
+        return;
+    }
+    let Some(path) = app.documents.get(&id).and_then(|doc| doc.path.clone()) else {
+        return;
+    };
+    let name = app.relative(&path);
+    app.overlay = Overlay::Confirm {
+        message: format!("Restore {name}?"),
+        action: ConfirmAction::RestoreFile(path),
+    };
+}
+
+pub fn complete_file_rename(app: &mut App, token: u64, items: Vec<TextEdit>, failed: bool) {
+    let Some(pending) = app.pending_rename.clone() else {
+        return;
+    };
+    if pending.token != token {
+        return;
+    }
+    app.pending_rename = None;
+    apply_and_rename(app, &pending.from, &pending.to, &items, failed);
+}
+
+pub fn abandon_file_rename(app: &mut App) {
+    let Some(pending) = app.pending_rename.take() else {
+        return;
+    };
+    apply_and_rename(app, &pending.from, &pending.to, &[], true);
+}
+
+fn rename_without_imports(app: &mut App, from: PathBuf, to: PathBuf) {
+    apply_and_rename(app, &from, &to, &[], true);
+}
+
+fn apply_and_rename(
+    app: &mut App,
+    from: &std::path::Path,
+    to: &std::path::Path,
+    items: &[TextEdit],
+    failed: bool,
+) {
+    if !failed && !items.is_empty() {
+        let paths: Vec<_> = items.iter().map(|edit| edit.path.clone()).collect();
+        app.apply_edits(items.to_vec());
+        save_paths(app, &paths);
+    }
+    if let Err(err) = rename_path(from, to) {
+        app.message = Some(format!("rename failed: {err}"));
+        return;
+    }
+    retarget_documents(app, from, to);
+    app.refresh_explorer();
+    app.refresh_git_status();
+    app.message = Some(if failed {
+        "Renamed. Imports were not updated.".into()
+    } else {
+        "Renamed".into()
+    });
+}
+
+fn save_paths(app: &mut App, paths: &[PathBuf]) {
+    let mut seen = std::collections::HashSet::new();
+    for path in paths {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let Some(id) = app
+            .documents
+            .iter()
+            .find_map(|(id, doc)| (doc.path.as_deref() == Some(path.as_path())).then_some(*id))
+        else {
+            continue;
+        };
+        if let Some(doc) = app.documents.get_mut(&id)
+            && doc.is_dirty()
+            && let Err(err) = doc.save()
+        {
+            app.message = Some(format!("save failed: {err}"));
+        }
+    }
+}
+
+fn retarget_documents(app: &mut App, from: &std::path::Path, to: &std::path::Path) {
+    let ids: Vec<DocumentId> = app
+        .documents
+        .iter()
+        .filter_map(|(id, doc)| {
+            let path = doc.path.as_ref()?;
+            (path == from || path.starts_with(from)).then_some(*id)
+        })
+        .collect();
+    for id in ids {
+        let Some(old) = app.documents.get(&id).and_then(|doc| doc.path.clone()) else {
+            continue;
+        };
+        let new_path = if old == from {
+            to.to_path_buf()
+        } else {
+            to.join(old.strip_prefix(from).unwrap_or(std::path::Path::new("")))
+        };
+        let language = crate::editor::LanguageId::from_path(&new_path);
+        let (text, revision, rope) = {
+            let Some(doc) = app.documents.get_mut(&id) else {
+                continue;
+            };
+            doc.path = Some(new_path.clone());
+            doc.language = language;
+            (doc.text(), doc.revision, doc.rope.clone())
+        };
+        app.syntax.close(id);
+        app.syntax.open(id, language, &rope);
+        let _ = app.lsp.tx.send(LspCmd::DidClose { path: old });
+        let _ = app.lsp.tx.send(LspCmd::DidOpen {
+            path: new_path,
+            language,
+            text,
+            version: revision as i64,
+        });
+    }
+}
+
 pub fn run_menu(app: &mut App, action: MenuAction) {
     match action {
         MenuAction::GoToDefinition => go_to_definition(app),
@@ -1367,6 +1557,8 @@ pub fn run_menu(app: &mut App, action: MenuAction) {
             app.close_documents(&ids, false);
         }
         MenuAction::AskClaude => start_thread(app),
+        MenuAction::DiscardFile => confirm_selected_git_file(app),
+        MenuAction::RestoreFile => confirm_selected_git_file(app),
         MenuAction::DeletePath => {
             if let Some(entry) = app.explorer_entries.get(app.explorer_selected) {
                 app.overlay = Overlay::Confirm {
@@ -1420,6 +1612,12 @@ pub fn handle_watch(app: &mut App, event: WatchEvent) {
         }
     }
     if app.thread.running {
+        match refresh_from_disk(app, id) {
+            DiskRefresh::Dirty(path) => {
+                app.message = Some(format!("file changed on disk: {}", path.display()));
+            }
+            DiskRefresh::Reloaded | DiskRefresh::Same | DiskRefresh::Skipped => {}
+        }
         return;
     }
     if dirty {
@@ -1803,6 +2001,7 @@ fn send_message(app: &mut App, message: String) {
         app.message = Some("Claude is still working".into());
         return;
     }
+    app.begin_turn();
     let replay = !app.thread.prior.is_empty() && !app.thread.live;
     let prompt = crate::agent::compose_prompt(
         app.thread.style,
@@ -1845,12 +2044,15 @@ pub fn handle_agent(app: &mut App, event: AgentEvent) {
     match event {
         AgentEvent::Session => app.thread.saw_session = true,
         AgentEvent::Text { text, block } => append_reply(app, &text, block),
-        AgentEvent::Tool { label } => {
+        AgentEvent::Tool { label, path } => {
             app.thread.reply_buf.clear();
             app.thread.lines.push(TranscriptLine {
                 kind: LineKind::Tool,
                 text: label,
             });
+            if let Some(path) = path {
+                app.note_turn_path(&path);
+            }
         }
         AgentEvent::Failure { text } => app.thread.failure = Some(text),
         AgentEvent::Result { text } => {
@@ -1913,6 +2115,7 @@ fn finish_turn(app: &mut App, success: bool, stderr: String) {
     }
     app.thread.reply_buf.clear();
     settle_agent_edits(app);
+    app.finish_turn_status();
 }
 
 pub fn settle_agent_edits(app: &mut App) {
@@ -2097,6 +2300,24 @@ pub fn toggle_selected_git(app: &mut App) {
     app.toggle_stage(path.clone(), *staged);
 }
 
+pub fn git_file_index_at(app: &App, y: u16) -> Option<usize> {
+    let rows = crate::workspace::git_panel_rows(&app.git_status);
+    let inner = git_list_rows(app.explorer_area.3);
+    if inner == 0 || y <= app.explorer_area.1 {
+        return None;
+    }
+    let rel = y.saturating_sub(app.explorer_area.1).saturating_sub(1) as usize;
+    if rel >= inner {
+        return None;
+    }
+    let index = app.git_scroll + rel;
+    matches!(
+        rows.get(index),
+        Some(crate::workspace::GitPanelRow::File { .. })
+    )
+    .then_some(index)
+}
+
 pub fn click_git(app: &mut App, x: u16, y: u16) {
     app.focus = Focus::Explorer;
     if let Some(action) = app
@@ -2150,11 +2371,23 @@ pub fn click_git(app: &mut App, x: u16, y: u16) {
 
 pub fn receive_git_write(app: &mut App, result: crate::workspace::GitWriteResult) {
     let reload = result.reload.clone();
+    let close_path = result.close_path.clone();
     let ok = result.ok;
     app.note_git_write(result);
     if ok {
         if let Some(path) = reload {
             app.reload_clean_document(&path);
+        }
+        if let Some(path) = close_path {
+            let ids: Vec<_> = app
+                .documents
+                .iter()
+                .filter(|(_, doc)| doc.path.as_deref() == Some(path.as_path()))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in ids {
+                app.close_document(id, true);
+            }
         }
         let open = app.order.clone();
         for id in open {
@@ -2319,7 +2552,7 @@ mod tests {
     }
 
     #[test]
-    fn a_running_turn_does_not_ask_to_reload() {
+    fn a_running_turn_reloads_a_clean_buffer_quietly() {
         let dir = std::env::temp_dir().join(format!("p0-watch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2342,7 +2575,13 @@ mod tests {
             },
         );
         assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(
+            app.documents.values().next().unwrap().text(),
+            "const a = 2;\n"
+        );
         app.thread.running = false;
+        app.documents.values_mut().next().unwrap().mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+        std::fs::write(&path, "const a = 3;\n").unwrap();
         super::handle_watch(
             &mut app,
             crate::workspace::WatchEvent {
@@ -2402,5 +2641,88 @@ mod tests {
                 .contains("changed on disk")
         );
         let _ = std::fs::remove_dir_all(app.root.clone());
+    }
+
+    #[test]
+    fn failed_import_request_still_renames_the_file() {
+        let dir = std::env::temp_dir().join(format!("r3vu-rename-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let from = dir.join("a.ts");
+        let to = dir.join("b.ts");
+        std::fs::write(&from, "export const a = 1;\n").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = with_runtime(|| {
+            let mut app = App::new(dir, LanguageClient { tx });
+            app.open_path(from.clone());
+            app
+        });
+        app.pending_rename = Some(crate::app::state::PendingRename {
+            token: 7,
+            from: from.clone(),
+            to: to.clone(),
+        });
+        with_runtime(|| super::complete_file_rename(&mut app, 7, Vec::new(), true));
+        assert!(to.is_file(), "rename still moves the file");
+        assert!(!from.exists());
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("Imports were not updated")
+        );
+        assert!(
+            app.documents
+                .values()
+                .any(|doc| doc.path.as_ref() == Some(&to))
+        );
+        let _ = std::fs::remove_dir_all(&app.root);
+    }
+
+    #[test]
+    fn rename_applies_an_import_edit_before_the_move() {
+        let dir = std::env::temp_dir().join(format!("r3vu-rename-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let from = dir.join("a.ts");
+        let to = dir.join("b.ts");
+        let importer = dir.join("use.ts");
+        let source = "import { a } from \"./a\";\n";
+        std::fs::write(&from, "export const a = 1;\n").unwrap();
+        std::fs::write(&importer, source).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = with_runtime(|| {
+            let mut app = App::new(dir, LanguageClient { tx });
+            app.open_path(from.clone());
+            app.open_path(importer.clone());
+            app
+        });
+        let start = source.find("\"./a\"").unwrap();
+        app.pending_rename = Some(crate::app::state::PendingRename {
+            token: 9,
+            from: from.clone(),
+            to: to.clone(),
+        });
+        with_runtime(|| {
+            super::complete_file_rename(
+                &mut app,
+                9,
+                vec![crate::language::TextEdit {
+                    path: importer.clone(),
+                    start: crate::editor::Position::new(0, start),
+                    end: crate::editor::Position::new(0, start + 5),
+                    new_text: "\"./b\"".into(),
+                }],
+                false,
+            );
+        });
+        assert_eq!(
+            std::fs::read_to_string(&importer).unwrap(),
+            "import { a } from \"./b\";\n"
+        );
+        assert!(to.is_file());
+        assert!(!from.exists());
+        assert_eq!(app.message.as_deref(), Some("Renamed"));
+        let _ = std::fs::remove_dir_all(&app.root);
     }
 }

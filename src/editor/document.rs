@@ -284,6 +284,17 @@ impl Document {
         Ok(())
     }
 
+    /// Show committed text for a file that is gone from the worktree. The buffer stays clean.
+    pub fn show_committed(&mut self, text: String) {
+        self.rope = Rope::from_str(&text);
+        self.line_ending = LineEnding::detect(&text);
+        self.revision = self.revision.saturating_add(1);
+        self.saved_revision = self.revision;
+        self.mtime = None;
+        self.undo = UndoHistory::default();
+        self.last_group = None;
+    }
+
     /// The file is gone. Leave an empty saved buffer so the discarded text is not still on screen.
     pub fn note_removed(&mut self) {
         self.rope = Rope::from_str("");

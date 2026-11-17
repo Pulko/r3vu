@@ -8,7 +8,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::agent::LineKind;
 use crate::app::App;
-use crate::app::state::Focus;
+use crate::app::state::{Focus, ThreadHit};
 use crate::ui::theme::Theme;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -47,7 +47,18 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     render_compose(frame, compose_row, app, theme, focused);
 }
 
-fn render_transcript(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
+fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App, theme: Theme) {
+    if area.height == 0 {
+        return;
+    }
+    app.thread_hits.clear();
+    let file_height = render_turn_files(frame, area, app, theme);
+    let area = Rect {
+        x: area.x,
+        y: area.y.saturating_add(file_height),
+        width: area.width,
+        height: area.height.saturating_sub(file_height),
+    };
     if area.height == 0 {
         return;
     }
@@ -84,6 +95,51 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let start = wrapped.len().saturating_sub(height + scroll);
     let visible: Vec<Line> = wrapped.into_iter().skip(start).take(height).collect();
     frame.render_widget(Paragraph::new(visible).style(theme.text()), area);
+}
+
+fn render_turn_files(frame: &mut Frame, area: Rect, app: &mut App, theme: Theme) -> u16 {
+    if app.thread.touched.is_empty() || area.height <= 1 || area.width == 0 {
+        return 0;
+    }
+    let width = area.width as usize;
+    let rows: Vec<(String, std::path::PathBuf)> = app
+        .thread
+        .touched
+        .iter()
+        .map(|path| (app.relative(path), path.clone()))
+        .collect();
+    let mut lines = vec![Line::from(Span::styled(
+        fit("This turn", width),
+        Style::default().fg(theme.fg_dim),
+    ))];
+    let limit = area.height.saturating_sub(1) as usize;
+    for (name, path) in rows {
+        if lines.len() >= limit {
+            break;
+        }
+        let y = area.y.saturating_add(lines.len() as u16);
+        app.thread_hits.push(ThreadHit {
+            x: area.x,
+            y,
+            width: area.width,
+            path,
+        });
+        lines.push(Line::from(Span::styled(
+            fit(&name, width),
+            Style::default().fg(theme.accent),
+        )));
+    }
+    let height = lines.len() as u16;
+    frame.render_widget(
+        Paragraph::new(lines).style(theme.text()),
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height,
+        },
+    );
+    height
 }
 
 fn render_compose(frame: &mut Frame, area: Rect, app: &mut App, theme: Theme, focused: bool) {

@@ -16,6 +16,7 @@ use crate::workspace::{HunkBar, LineChanges, LineMark, VisualRow};
 pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
     app.hscroll_hit = None;
     app.diff_hits.clear();
+    app.restore_hit = None;
     let theme = app.theme();
     render_tabs(frame, tabs, app, theme);
     let Some(id) = app.active else {
@@ -154,11 +155,17 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
         lines.push(Line::from(spans));
     }
 
+    let deleted = app.absent.contains(&id);
     let title = doc
         .path
         .as_ref()
         .map(|p| app.relative(p))
         .unwrap_or_else(|| "untitled".into());
+    let title = if deleted {
+        format!("Deleted {title}")
+    } else {
+        title
+    };
     let cursor = app.views.get(&id).and_then(|view| {
         let text = line_text(&doc.rope, view.cursor.line);
         let col = display_col(&text, view.cursor.column, tab_width);
@@ -175,12 +182,9 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
             })
     });
     app.diff_hits.extend(bar_hits);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(theme.text())
-            .block(content_block(area, app, &title)),
-        area,
-    );
+    let block = content_block(area, app, &title);
+    let block = restore_title(block, area, app, deleted);
+    frame.render_widget(Paragraph::new(lines).style(theme.text()).block(block), area);
     if let Some(cursor) = cursor
         && app.focus == Focus::Editor
         && matches!(
@@ -456,6 +460,27 @@ fn line_wash(changes: &LineChanges, line_idx: usize, theme: Theme) -> Option<Col
         LineMark::Modified => Some(theme.modified_bg),
         LineMark::Unchanged => None,
     }
+}
+
+fn restore_title(block: Block<'static>, area: Rect, app: &mut App, show: bool) -> Block<'static> {
+    if !show {
+        return block;
+    }
+    let label = " Restore ";
+    let width = UnicodeWidthStr::width(label) as u16;
+    if width.saturating_add(2) >= area.width {
+        return block;
+    }
+    let x = area
+        .x
+        .saturating_add(area.width)
+        .saturating_sub(width)
+        .saturating_sub(1);
+    let style = Style::default()
+        .fg(app.theme().accent)
+        .add_modifier(Modifier::BOLD);
+    app.restore_hit = Some((x, area.y, width));
+    block.title(Line::from(Span::styled(label, style)).alignment(Alignment::Right))
 }
 
 fn content_block(area: Rect, app: &mut App, title: &str) -> Block<'static> {

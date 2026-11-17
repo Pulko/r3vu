@@ -45,6 +45,8 @@ pub enum ConfirmAction {
     Close(DocumentId),
     CloseMany(Vec<DocumentId>),
     DiscardHunk { patch: String, path: PathBuf },
+    RestoreFile(PathBuf),
+    DiscardAdded(PathBuf),
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +73,8 @@ pub enum MenuAction {
     CloseOthers(DocumentId),
     CloseAll,
     AskClaude,
+    DiscardFile,
+    RestoreFile,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,6 +200,21 @@ pub enum GitClick {
     UnstageAll,
     Toggle { path: PathBuf, staged: bool },
     Open { path: PathBuf, staged: bool },
+}
+
+#[derive(Clone, Debug)]
+pub struct ThreadHit {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingRename {
+    pub token: u64,
+    pub from: PathBuf,
+    pub to: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -332,6 +351,13 @@ pub struct App {
     pub thread_visible: bool,
     pub thread_area: (u16, u16, u16, u16),
     pub thread_stop: Option<(u16, u16, u16)>,
+    pub thread_hits: Vec<ThreadHit>,
+    pub absent: HashSet<DocumentId>,
+    pub restore_hit: Option<(u16, u16, u16)>,
+    turn_status_before: HashMap<PathBuf, GitPathStatus>,
+    turn_status_wait: bool,
+    turn_status_skip: bool,
+    pub pending_rename: Option<PendingRename>,
     pub claude_installed: bool,
     pub agent_tx: mpsc::UnboundedSender<crate::agent::AgentEvent>,
     pub agent_run: Option<AgentRun>,
@@ -435,6 +461,13 @@ impl App {
             thread_visible: false,
             thread_area: (0, 0, 0, 0),
             thread_stop: None,
+            thread_hits: Vec::new(),
+            absent: HashSet::new(),
+            restore_hit: None,
+            turn_status_before: HashMap::new(),
+            turn_status_wait: false,
+            turn_status_skip: false,
+            pending_rename: None,
             claude_installed: which::which("claude").is_ok(),
             agent_tx,
             agent_run: None,
@@ -514,6 +547,40 @@ impl App {
         crate::workspace::spawn_git_status(self.root.clone(), self.git_status_tx.clone());
     }
 
+    pub fn begin_turn(&mut self) {
+        self.thread.touched.clear();
+        self.turn_status_before = self.git_status.clone();
+        self.turn_status_wait = false;
+        self.turn_status_skip = false;
+    }
+
+    pub fn note_turn_path(&mut self, raw: &str) {
+        if let Some(path) = crate::workspace::project_path(&self.root, raw) {
+            crate::workspace::remember_path(&mut self.thread.touched, path);
+        }
+    }
+
+    pub fn finish_turn_status(&mut self) {
+        self.turn_status_skip = self.git_status_running;
+        self.turn_status_wait = true;
+        self.refresh_git_status();
+    }
+
+    fn absorb_turn_status(&mut self, files: &HashMap<PathBuf, GitPathStatus>) {
+        if !self.turn_status_wait {
+            return;
+        }
+        if self.turn_status_skip {
+            self.turn_status_skip = false;
+            return;
+        }
+        for path in crate::workspace::status_delta(&self.turn_status_before, files) {
+            crate::workspace::remember_path(&mut self.thread.touched, path);
+        }
+        self.turn_status_wait = false;
+        self.open_turn_files();
+    }
+
     pub fn receive_git_status(&mut self, result: crate::workspace::GitStatusUpdate) {
         self.git_status_running = false;
         match result {
@@ -522,6 +589,7 @@ impl App {
                 if self.git_status != snapshot.files {
                     self.git_status = snapshot.files;
                 }
+                self.absorb_turn_status(&self.git_status.clone());
                 if self.git_branch != snapshot.branch {
                     self.git_publish_armed = false;
                 }
@@ -536,8 +604,13 @@ impl App {
                     self.request_review_patches(id);
                 }
             }
-            Err(crate::workspace::GitStatusError::NotARepository) => self.hide_git(),
-            Err(crate::workspace::GitStatusError::Unavailable) => {}
+            Err(crate::workspace::GitStatusError::NotARepository) => {
+                self.absorb_turn_status(&HashMap::new());
+                self.hide_git();
+            }
+            Err(crate::workspace::GitStatusError::Unavailable) => {
+                self.absorb_turn_status(&self.git_status.clone());
+            }
         }
         if self.git_status_again {
             self.git_status_again = false;
@@ -881,19 +954,114 @@ impl App {
     pub fn open_git_entry(&mut self, path: PathBuf, _staged: bool) {
         self.git_message_focus = false;
         if path.is_file() {
+            if let Some(id) = self.document_id(&path) {
+                self.absent.remove(&id);
+            }
             self.open_path(path.clone());
+        } else if self.path_deleted(&path) {
+            self.open_deleted(path.clone());
+        } else {
+            self.message = Some("File is missing".into());
+            return;
         }
         self.markdown_preview = None;
-        let Some(id) = self
-            .documents
-            .iter()
-            .find_map(|(id, doc)| (doc.path.as_ref() == Some(&path)).then_some(*id))
-        else {
+        let Some(id) = self.document_id(&path) else {
             return;
         };
+        if self.absent.contains(&id) {
+            return;
+        }
         self.reveal_change = Some(id);
         self.request_inline_diff(id);
         self.request_review_patches(id);
+        self.scroll_to_first_change(id);
+    }
+
+    fn document_id(&self, path: &Path) -> Option<DocumentId> {
+        self.documents
+            .iter()
+            .find_map(|(id, doc)| (doc.path.as_deref() == Some(path)).then_some(*id))
+    }
+
+    fn path_deleted(&self, path: &Path) -> bool {
+        self.git_status.get(path).is_some_and(|status| {
+            status.staged == Some(crate::workspace::GitFileStatus::Deleted)
+                || status.unstaged == Some(crate::workspace::GitFileStatus::Deleted)
+        })
+    }
+
+    pub fn open_deleted(&mut self, path: PathBuf) {
+        if let Some(id) = self.document_id(&path) {
+            let dirty = self.documents.get(&id).is_some_and(|doc| doc.is_dirty());
+            self.active = Some(id);
+            self.focus = Focus::Editor;
+            self.markdown_preview = None;
+            if !dirty {
+                self.mark_absent(id);
+            }
+            return;
+        }
+        let doc = Document::new(DocumentId(self.next_id), Some(path.clone()), String::new());
+        self.next_id += 1;
+        let id = doc.id;
+        self.syntax.open(id, doc.language, &doc.rope);
+        let _ = self.lsp.tx.send(LspCmd::DidOpen {
+            path,
+            language: doc.language,
+            text: doc.text(),
+            version: doc.revision as i64,
+        });
+        self.views.insert(id, EditorView::new(id));
+        self.order.push(id);
+        self.documents.insert(id, doc);
+        self.active = Some(id);
+        self.focus = Focus::Editor;
+        self.overlay = Overlay::None;
+        self.mark_absent(id);
+    }
+
+    fn mark_absent(&mut self, id: DocumentId) {
+        self.absent.insert(id);
+        self.inline_changes.remove(&id);
+        self.review_patches.remove(&id);
+        self.folded_hunks.retain(|(doc, _)| *doc != id);
+        self.request_inline_diff(id);
+    }
+
+    pub fn open_turn_files(&mut self) {
+        let paths = self.thread.touched.clone();
+        let mut opened = Vec::new();
+        for path in paths {
+            if let Some(id) = self.document_id(&path) {
+                if !path.is_file() && self.path_deleted(&path) {
+                    let dirty = self.documents.get(&id).is_some_and(|doc| doc.is_dirty());
+                    if !dirty {
+                        self.mark_absent(id);
+                    }
+                }
+                continue;
+            }
+            if path.is_file() {
+                self.open_path(path);
+                if let Some(id) = self.active {
+                    opened.push(id);
+                }
+            } else if self.path_deleted(&path) {
+                self.open_deleted(path);
+                if let Some(id) = self.active {
+                    opened.push(id);
+                }
+            }
+        }
+        let Some(id) = opened.first().copied() else {
+            return;
+        };
+        self.active = Some(id);
+        self.focus = Focus::Editor;
+        if self.absent.contains(&id) {
+            return;
+        }
+        self.reveal_change = Some(id);
         self.scroll_to_first_change(id);
     }
 
@@ -926,6 +1094,10 @@ impl App {
     }
 
     pub fn request_review_patches(&mut self, document_id: DocumentId) {
+        if self.absent.contains(&document_id) {
+            self.review_patches.remove(&document_id);
+            return;
+        }
         if !self.git_repo {
             return;
         }
@@ -991,6 +1163,7 @@ impl App {
         }) else {
             return;
         };
+        self.absent.remove(&id);
         let Some(doc) = self.documents.get_mut(&id) else {
             return;
         };
@@ -1150,6 +1323,7 @@ impl App {
         self.diff_baselines.remove(&id);
         self.review_patches.remove(&id);
         self.folded_hunks.retain(|(doc_id, _)| *doc_id != id);
+        self.absent.remove(&id);
         if self.reveal_change == Some(id) {
             self.reveal_change = None;
         }
@@ -1317,6 +1491,18 @@ impl App {
 
     pub fn receive_diff(&mut self, result: GitDiffResult) {
         let document_id = result.document_id;
+        if self.absent.contains(&document_id) {
+            if let Some(crate::workspace::DiffBaseline::Present(text)) = result.head {
+                self.fill_committed(document_id, text);
+            }
+            self.inline_changes.remove(&document_id);
+            self.diff_baselines.remove(&document_id);
+            self.folded_hunks.retain(|(id, _)| *id != document_id);
+            if self.reveal_change == Some(document_id) {
+                self.reveal_change = None;
+            }
+            return;
+        }
         match (result.head, result.index) {
             (Some(head), Some(index)) => {
                 self.diff_baselines
@@ -1331,6 +1517,43 @@ impl App {
                     self.reveal_change = None;
                 }
             }
+        }
+    }
+
+    fn fill_committed(&mut self, id: DocumentId, text: String) {
+        let Some(doc) = self.documents.get(&id) else {
+            return;
+        };
+        if doc.text() == text && !doc.is_dirty() {
+            return;
+        }
+        let Some(doc) = self.documents.get_mut(&id) else {
+            return;
+        };
+        doc.show_committed(text);
+        let language = doc.language;
+        let rope = doc.rope.clone();
+        let revision = doc.revision;
+        let path = doc.path.clone();
+        let full = doc.text();
+        self.syntax.close(id);
+        self.syntax.open(id, language, &rope);
+        if let Some(path) = path {
+            let _ = self.lsp.tx.send(LspCmd::DidChange {
+                path,
+                version: revision as i64,
+                change: clean_reload_change(id, revision, full.clone()),
+                full_text: full,
+                incremental: false,
+            });
+        }
+        if let Some(view) = self.views.get_mut(&id) {
+            let len = rope.len_lines().max(1);
+            if view.cursor.line >= len {
+                view.cursor.line = len - 1;
+                view.cursor.column = 0;
+            }
+            view.selection = None;
         }
     }
 
@@ -1713,6 +1936,37 @@ mod tests {
             assert!(app.review_patches.contains_key(&doc.id));
             assert!(app.markdown_preview.is_none());
             let _ = std::fs::remove_file(file);
+        });
+    }
+
+    #[test]
+    fn deleted_path_opens_committed_text_without_hunks() {
+        with_runtime(|| {
+            let mut app = test_app();
+            app.git_repo = true;
+            let path = std::env::temp_dir().join(format!("r3vu-gone-{}", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            app.git_status.insert(
+                path.clone(),
+                GitPathStatus {
+                    staged: None,
+                    unstaged: Some(GitFileStatus::Deleted),
+                },
+            );
+            app.open_git_entry(path.clone(), false);
+            let id = app.document_id(&path).expect("deleted path opens a buffer");
+            assert!(app.absent.contains(&id));
+            assert_eq!(app.active, Some(id));
+            app.receive_diff(crate::workspace::GitDiffResult {
+                document_id: id,
+                head: Some(DiffBaseline::Present("export const gone = true;\n".into())),
+                index: Some(DiffBaseline::Absent),
+            });
+            let doc = app.documents.get(&id).expect("buffer");
+            assert_eq!(doc.text(), "export const gone = true;\n");
+            assert!(!doc.is_dirty());
+            assert!(app.present_hunks(id).is_empty());
+            assert!(app.inline_changes.get(&id).is_none());
         });
     }
 

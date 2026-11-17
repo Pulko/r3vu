@@ -39,7 +39,7 @@ impl AgentRun {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentEvent {
     Text { text: String, block: bool },
-    Tool { label: String },
+    Tool { label: String, path: Option<String> },
     Session,
     Failure { text: String },
     Result { text: String },
@@ -90,6 +90,7 @@ pub struct Thread {
     pub prior: Vec<(String, String)>,
     pub pending_user: String,
     pub reply_buf: String,
+    pub touched: Vec<PathBuf>,
 }
 
 impl Thread {
@@ -109,6 +110,7 @@ impl Thread {
             prior: Vec::new(),
             pending_user: String::new(),
             reply_buf: String::new(),
+            touched: Vec::new(),
         }
     }
 }
@@ -193,7 +195,7 @@ pub fn compose_prompt(
 pub enum ClaudeLine {
     Session,
     Text { text: String, block: bool },
-    Tool { label: String },
+    Tool { label: String, path: Option<String> },
     Error { text: String },
     Result { text: String },
 }
@@ -240,6 +242,7 @@ pub fn parse_claude_line(line: &str) -> Vec<ClaudeLine> {
                             let input = block.get("input").cloned().unwrap_or(Value::Null);
                             out.push(ClaudeLine::Tool {
                                 label: tool_label(name, &input),
+                                path: tool_file(&input),
                             });
                         }
                         _ => {}
@@ -272,6 +275,20 @@ pub fn parse_claude_line(line: &str) -> Vec<ClaudeLine> {
         _ => {}
     }
     out
+}
+
+fn tool_file(input: &Value) -> Option<String> {
+    let object = input.as_object()?;
+    for key in ["file_path", "path"] {
+        if let Some(value) = object
+            .get(key)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
 }
 
 fn tool_label(name: &str, input: &Value) -> String {
@@ -393,7 +410,9 @@ async fn execute_turn(
                                 let outgoing = match event {
                                     ClaudeLine::Session => AgentEvent::Session,
                                     ClaudeLine::Text { text, block } => AgentEvent::Text { text, block },
-                                    ClaudeLine::Tool { label } => AgentEvent::Tool { label },
+                                    ClaudeLine::Tool { label, path } => {
+                                        AgentEvent::Tool { label, path }
+                                    }
                                     ClaudeLine::Error { text } => AgentEvent::Failure { text },
                                     ClaudeLine::Result { text } => AgentEvent::Result { text },
                                 };
@@ -500,7 +519,8 @@ mod tests {
                     block: true
                 },
                 ClaudeLine::Tool {
-                    label: "Edit src/main.rs".into()
+                    label: "Edit src/main.rs".into(),
+                    path: Some("src/main.rs".into()),
                 },
             ]
         );
@@ -516,7 +536,8 @@ mod tests {
                 r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"go test ./..."}}]}}"#
             ),
             vec![ClaudeLine::Tool {
-                label: "Bash go test ./...".into()
+                label: "Bash go test ./...".into(),
+                path: None,
             }]
         );
     }

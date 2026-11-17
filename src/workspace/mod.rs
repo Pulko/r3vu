@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use ignore::WalkBuilder;
@@ -34,6 +34,37 @@ impl GitPathStatus {
     pub fn summary(self) -> Option<GitFileStatus> {
         self.unstaged.or(self.staged)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WholeFileAction {
+    Restore,
+    Remove,
+    Delete,
+}
+
+pub fn whole_file_action(status: GitPathStatus) -> Option<WholeFileAction> {
+    if status.staged == Some(GitFileStatus::Renamed)
+        || status.unstaged == Some(GitFileStatus::Renamed)
+    {
+        return None;
+    }
+    if status.unstaged == Some(GitFileStatus::Untracked) {
+        return Some(WholeFileAction::Delete);
+    }
+    if status.staged == Some(GitFileStatus::Added) {
+        return Some(WholeFileAction::Remove);
+    }
+    if matches!(
+        status.staged,
+        Some(GitFileStatus::Modified | GitFileStatus::Deleted)
+    ) || matches!(
+        status.unstaged,
+        Some(GitFileStatus::Modified | GitFileStatus::Deleted)
+    ) {
+        return Some(WholeFileAction::Restore);
+    }
+    None
 }
 
 pub struct GitSnapshot {
@@ -616,6 +647,55 @@ fn column_status(byte: u8) -> Option<GitFileStatus> {
     }
 }
 
+pub fn project_path(root: &Path, raw: &str) -> Option<PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.contains('\0') {
+        return None;
+    }
+    let raw_path = Path::new(raw);
+    let joined = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        root.join(raw_path)
+    };
+    let mut normal = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::Prefix(prefix) => normal.push(prefix.as_os_str()),
+            Component::RootDir => normal.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normal.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => normal.push(part),
+        }
+    }
+    let relative = normal.strip_prefix(root).ok()?;
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    Some(normal)
+}
+
+pub fn remember_path(touched: &mut Vec<PathBuf>, path: PathBuf) {
+    if !touched.iter().any(|item| item == &path) {
+        touched.push(path);
+    }
+}
+
+pub fn status_delta(
+    before: &HashMap<PathBuf, GitPathStatus>,
+    after: &HashMap<PathBuf, GitPathStatus>,
+) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = before.keys().chain(after.keys()).cloned().collect();
+    paths.sort();
+    paths.dedup();
+    paths.retain(|path| before.get(path) != after.get(path));
+    paths
+}
+
 pub fn repo_relative(root: &Path, path: &Path) -> Option<String> {
     let relative = if path.is_absolute() {
         path.strip_prefix(root).ok()?
@@ -659,6 +739,8 @@ pub enum GitWrite {
     Pull,
     Push,
     Publish(String),
+    Restore(PathBuf),
+    Remove(PathBuf),
 }
 
 pub struct GitArgv {
@@ -741,6 +823,29 @@ pub fn prepare_git_write(root: &Path, write: &GitWrite) -> Result<GitArgv, Strin
                 stdin: None,
             })
         }
+        GitWrite::Restore(path) => {
+            let rel = repo_relative(root, path)
+                .ok_or_else(|| "Path is outside the project".to_string())?;
+            Ok(GitArgv {
+                args: vec![
+                    "restore".into(),
+                    "--source=HEAD".into(),
+                    "--staged".into(),
+                    "--worktree".into(),
+                    "--".into(),
+                    rel,
+                ],
+                stdin: None,
+            })
+        }
+        GitWrite::Remove(path) => {
+            let rel = repo_relative(root, path)
+                .ok_or_else(|| "Path is outside the project".to_string())?;
+            Ok(GitArgv {
+                args: vec!["rm".into(), "-f".into(), "--".into(), rel],
+                stdin: None,
+            })
+        }
     }
 }
 
@@ -756,6 +861,7 @@ pub struct GitWriteResult {
     pub ok: bool,
     pub message: String,
     pub reload: Option<PathBuf>,
+    pub close_path: Option<PathBuf>,
     pub committed: Option<String>,
     pub notice: Option<String>,
 }
@@ -769,6 +875,7 @@ pub fn spawn_git_write(root: PathBuf, write: GitWrite, tx: mpsc::UnboundedSender
                 ok: false,
                 message,
                 reload: None,
+                close_path: None,
                 committed: None,
                 notice: None,
             },
@@ -779,6 +886,8 @@ pub fn spawn_git_write(root: PathBuf, write: GitWrite, tx: mpsc::UnboundedSender
                 GitWrite::Pull => result.notice = Some("Pulled".into()),
                 GitWrite::Push | GitWrite::Publish(_) => result.notice = Some("Pushed".into()),
                 GitWrite::Apply { reload, .. } => result.reload = reload.clone(),
+                GitWrite::Restore(path) => result.reload = Some(path.clone()),
+                GitWrite::Remove(path) => result.close_path = Some(path.clone()),
                 _ => {}
             }
         }
@@ -825,6 +934,7 @@ fn git_finished(output: std::process::Output) -> GitWriteResult {
             ok: true,
             message: String::new(),
             reload: None,
+            close_path: None,
             committed: None,
             notice: None,
         }
@@ -845,6 +955,7 @@ fn git_failed(message: String) -> GitWriteResult {
         ok: false,
         message,
         reload: None,
+        close_path: None,
         committed: None,
         notice: None,
     }
@@ -2119,6 +2230,110 @@ diff --git a/readme.md b/readme.md
         assert_eq!(parse_ahead_behind(b"2\t1\n"), Some((2, 1)));
         assert_eq!(parse_ahead_behind(b"0 0\n"), Some((0, 0)));
         assert!(parse_ahead_behind(b"nope").is_none());
+    }
+
+    #[test]
+    fn restore_and_remove_stay_inside_the_project() {
+        let root = Path::new("/repo");
+        let restore =
+            prepare_git_write(root, &GitWrite::Restore(PathBuf::from("/repo/src/a.ts"))).unwrap();
+        assert_eq!(
+            restore.args,
+            [
+                "restore",
+                "--source=HEAD",
+                "--staged",
+                "--worktree",
+                "--",
+                "src/a.ts"
+            ]
+        );
+        let remove =
+            prepare_git_write(root, &GitWrite::Remove(PathBuf::from("/repo/src/a.ts"))).unwrap();
+        assert_eq!(remove.args, ["rm", "-f", "--", "src/a.ts"]);
+        assert!(
+            prepare_git_write(
+                root,
+                &GitWrite::Restore(PathBuf::from("/repo/../etc/passwd"))
+            )
+            .is_err()
+        );
+        assert!(
+            prepare_git_write(root, &GitWrite::Remove(PathBuf::from("../etc/passwd"))).is_err()
+        );
+        assert_eq!(
+            project_path(root, "src/main.rs").as_deref(),
+            Some(Path::new("/repo/src/main.rs"))
+        );
+        assert!(project_path(root, "../etc/passwd").is_none());
+        assert!(project_path(root, "/etc/passwd").is_none());
+        assert!(project_path(root, "src/../../etc/passwd").is_none());
+    }
+
+    #[test]
+    fn status_delta_notices_appeared_and_changed_paths() {
+        let before = HashMap::from([(
+            PathBuf::from("/repo/old.ts"),
+            GitPathStatus {
+                staged: None,
+                unstaged: Some(GitFileStatus::Modified),
+            },
+        )]);
+        let after = HashMap::from([
+            (
+                PathBuf::from("/repo/old.ts"),
+                GitPathStatus {
+                    staged: Some(GitFileStatus::Modified),
+                    unstaged: None,
+                },
+            ),
+            (
+                PathBuf::from("/repo/new.ts"),
+                GitPathStatus {
+                    staged: None,
+                    unstaged: Some(GitFileStatus::Untracked),
+                },
+            ),
+        ]);
+        assert_eq!(
+            status_delta(&before, &after),
+            vec![PathBuf::from("/repo/new.ts"), PathBuf::from("/repo/old.ts")]
+        );
+        assert_eq!(
+            whole_file_action(GitPathStatus {
+                staged: None,
+                unstaged: Some(GitFileStatus::Modified),
+            }),
+            Some(WholeFileAction::Restore)
+        );
+        assert_eq!(
+            whole_file_action(GitPathStatus {
+                staged: Some(GitFileStatus::Deleted),
+                unstaged: None,
+            }),
+            Some(WholeFileAction::Restore)
+        );
+        assert_eq!(
+            whole_file_action(GitPathStatus {
+                staged: Some(GitFileStatus::Added),
+                unstaged: None,
+            }),
+            Some(WholeFileAction::Remove)
+        );
+        assert_eq!(
+            whole_file_action(GitPathStatus {
+                staged: None,
+                unstaged: Some(GitFileStatus::Untracked),
+            }),
+            Some(WholeFileAction::Delete)
+        );
+        assert_eq!(
+            whole_file_action(GitPathStatus {
+                staged: Some(GitFileStatus::Renamed),
+                unstaged: None,
+            }),
+            None
+        );
     }
 
     #[test]

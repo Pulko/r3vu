@@ -153,6 +153,11 @@ pub enum LspCmd {
         position: Position,
         new_name: String,
     },
+    WillRename {
+        token: u64,
+        from: PathBuf,
+        to: PathBuf,
+    },
     Restart {
         root: PathBuf,
     },
@@ -186,6 +191,11 @@ pub enum LspEvent {
         token: u64,
         items: Vec<TextEdit>,
     },
+    FileRename {
+        token: u64,
+        items: Vec<TextEdit>,
+        failed: bool,
+    },
 }
 
 pub struct LanguageClient {
@@ -215,6 +225,7 @@ enum Pending {
     Definition(u64),
     References(u64),
     Rename(u64),
+    WillRename(u64),
     Initialize,
 }
 
@@ -357,7 +368,17 @@ async fn start_server(
                 "rootUri": uri,
                 "rootPath": root,
                 "capabilities": {
-                    "workspace": { "workspaceEdit": { "documentChanges": true } },
+                    "workspace": {
+                        "workspaceEdit": { "documentChanges": true },
+                        "fileOperations": {
+                            "willRename": {
+                                "filters": [{
+                                    "scheme": "file",
+                                    "pattern": { "glob": "**/*" }
+                                }]
+                            }
+                        }
+                    },
                     "textDocument": {
                         "synchronization": { "dynamicRegistration": false, "willSave": false, "didSave": true },
                         "completion": { "completionItem": { "snippetSupport": false } },
@@ -601,6 +622,20 @@ async fn handle_cmd(
             )
             .await
         }
+        LspCmd::WillRename { token, from, to } => {
+            request(
+                server,
+                "workspace/willRenameFiles",
+                json!({
+                    "files": [{
+                        "oldUri": path_to_uri(&from),
+                        "newUri": path_to_uri(&to)
+                    }]
+                }),
+                Pending::WillRename(token),
+            )
+            .await
+        }
         LspCmd::Initialize { .. } | LspCmd::Restart { .. } | LspCmd::Shutdown => Ok(()),
     }
 }
@@ -740,6 +775,22 @@ async fn dispatch_message(
         Pending::Rename(token) => {
             let items = parse_workspace_edit(msg.get("result"));
             let _ = events.send(LspEvent::Edits { token, items });
+        }
+        Pending::WillRename(token) => {
+            if msg.get("error").is_some() {
+                let _ = events.send(LspEvent::FileRename {
+                    token,
+                    items: Vec::new(),
+                    failed: true,
+                });
+            } else {
+                let items = parse_workspace_edit(msg.get("result"));
+                let _ = events.send(LspEvent::FileRename {
+                    token,
+                    items,
+                    failed: false,
+                });
+            }
         }
     }
 }
@@ -1211,5 +1262,32 @@ mod tests {
         assert_eq!(hit.message, "broken");
         assert_eq!(diagnostic_label(hit.severity), "Error");
         assert_eq!(diagnostic_status(&items[0]), "Warning careful");
+    }
+
+    #[test]
+    fn will_rename_keeps_text_edits_and_skips_the_file_rename() {
+        let value = json!({
+            "documentChanges": [
+                {
+                    "kind": "rename",
+                    "oldUri": "file:///repo/a.ts",
+                    "newUri": "file:///repo/b.ts"
+                },
+                {
+                    "textDocument": { "uri": "file:///repo/use.ts" },
+                    "edits": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 1 }
+                        },
+                        "newText": "x"
+                    }]
+                }
+            ]
+        });
+        let edits = parse_workspace_edit(Some(&value));
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "x");
+        assert_eq!(edits[0].path, PathBuf::from("/repo/use.ts"));
     }
 }

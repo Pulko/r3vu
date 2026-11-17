@@ -425,6 +425,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                     && x < hit_x.saturating_add(width)
                 {
                     commands::stop_agent(app);
+                } else if let Some(path) = app
+                    .thread_hits
+                    .iter()
+                    .find(|hit| y == hit.y && x >= hit.x && x < hit.x.saturating_add(hit.width))
+                    .map(|hit| hit.path.clone())
+                {
+                    app.open_git_entry(path, false);
                 } else {
                     app.focus = Focus::Thread;
                     app.overlay = Overlay::None;
@@ -433,6 +440,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                 app.git_message_focus = false;
                 app.focus = Focus::Editor;
                 if y == app.editor_area.1 {
+                    if let Some((hit_x, hit_y, width)) = app.restore_hit
+                        && y == hit_y
+                        && x >= hit_x
+                        && x < hit_x.saturating_add(width)
+                    {
+                        commands::confirm_restore_active(app);
+                    }
                     return;
                 }
                 if !commands::begin_hscroll_drag(app, x, y) {
@@ -482,6 +496,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                     .copied()
                 {
                     commands::show_tab_menu(app, tab.document_id, x, y);
+                }
+            } else if in_explorer && app.git_open && y != app.explorer_area.1 {
+                if let Some(index) = commands::git_file_index_at(app, y) {
+                    app.git_selected = index;
+                    app.focus = Focus::Explorer;
+                    commands::show_git_menu(app, x, y);
                 }
             } else if in_explorer && !app.git_open && y != app.explorer_area.1 {
                 app.focus = Focus::Explorer;

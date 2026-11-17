@@ -102,6 +102,13 @@ pub fn handle_lsp(app: &mut App, event: LspEvent) {
                 app.message = Some("renamed".into());
             }
         }
+        LspEvent::FileRename {
+            token,
+            items,
+            failed,
+        } => {
+            commands::complete_file_rename(app, token, items, failed);
+        }
     }
 }
 
@@ -109,6 +116,12 @@ pub fn apply_lsp_status(app: &mut App, status: LspStatus) {
     let missing = matches!(status, LspStatus::Unavailable(_));
     let ready = matches!(status, LspStatus::Ready);
     app.lsp_status = status;
+    if matches!(
+        app.lsp_status,
+        LspStatus::Unavailable(_) | LspStatus::Error(_)
+    ) {
+        commands::abandon_file_rename(app);
+    }
     if ready && matches!(app.overlay, Overlay::TypesNote) {
         app.overlay = Overlay::None;
         return;

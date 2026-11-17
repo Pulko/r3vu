@@ -8,7 +8,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
 use crate::app::state::Overlay;
-use crate::ui::popup::{HoverLineKind, parse_hover_content};
+use crate::ui::popup::{HoverLineKind, parse_hover_content, wrap_to_width};
 use crate::ui::theme::Theme;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -171,35 +171,6 @@ pub(crate) fn separator_rule(content_width: usize) -> String {
     "─".repeat(content_width)
 }
 
-fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
-    if width == 0 || text.is_empty() {
-        return vec![String::new()];
-    }
-    let mut rows = Vec::new();
-    let mut line = String::new();
-    let mut used = 0usize;
-    for grapheme in text.graphemes(true) {
-        let grapheme_width = UnicodeWidthStr::width(grapheme).max(1);
-        if used > 0 && used + grapheme_width > width {
-            rows.push(std::mem::take(&mut line));
-            used = 0;
-        }
-        line.push_str(grapheme);
-        used += grapheme_width;
-        if used >= width {
-            rows.push(std::mem::take(&mut line));
-            used = 0;
-        }
-    }
-    if !line.is_empty() {
-        rows.push(line);
-    }
-    if rows.is_empty() {
-        rows.push(String::new());
-    }
-    rows
-}
-
 fn fit_row(text: &str, content_width: usize) -> String {
     let fitted = truncate_width(text, content_width);
     let gap = content_width.saturating_sub(UnicodeWidthStr::width(fitted.as_str()));
@@ -264,6 +235,20 @@ mod tests {
             UnicodeWidthStr::width(separator_rule(layout.content_width).as_str())
                 <= layout.content_width
         );
+    }
+
+    #[test]
+    fn wrapped_indented_field_keeps_its_indent() {
+        let field = "    city: VeryLongCityNameThatExceedsTheMenuWidth";
+        let lines = vec![(field.to_string(), HoverLineKind::Signature)];
+        let actions = ["Go to Definition"];
+        let layout = layout_symbol_menu(&lines, &actions, 40, 24, true);
+        assert!(layout.type_rows.len() > 1);
+        for (row, kind) in &layout.type_rows {
+            assert_eq!(*kind, HoverLineKind::Signature);
+            assert!(row.starts_with("    "), "{row}");
+            assert!(UnicodeWidthStr::width(row.as_str()) <= layout.content_width);
+        }
     }
 
     #[test]

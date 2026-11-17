@@ -3,6 +3,8 @@ use ratatui::layout::{Position as TermPos, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
 use crate::app::commands::TYPES_INSTALL;
@@ -112,13 +114,22 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             let content = parse_hover_content(text);
             let width = content
                 .iter()
-                .map(|(line, _)| line.chars().count() as u16)
+                .map(|(line, _)| UnicodeWidthStr::width(line.as_str()) as u16)
                 .max()
                 .unwrap_or(20)
                 .saturating_add(4)
                 .clamp(24, 72)
                 .min(frame.area().width.saturating_sub(2));
-            let height = (content.len() as u16 + 2)
+            let inner_width = (width as usize).saturating_sub(2).max(1);
+            let wrapped: Vec<(String, HoverLineKind)> = content
+                .iter()
+                .flat_map(|(line, kind)| {
+                    wrap_to_width(line, inner_width)
+                        .into_iter()
+                        .map(|row| (row, *kind))
+                })
+                .collect();
+            let height = (wrapped.len() as u16 + 2)
                 .clamp(3, 14)
                 .min(frame.area().height.saturating_sub(2));
             let mut area = Rect {
@@ -134,7 +145,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 area.y = y.saturating_sub(height);
             }
             frame.render_widget(Clear, area);
-            let lines: Vec<Line> = content
+            let lines: Vec<Line> = wrapped
                 .into_iter()
                 .take(height.saturating_sub(2) as usize)
                 .map(|(line, kind)| {
@@ -152,7 +163,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             frame.render_widget(
                 Paragraph::new(lines)
                     .style(theme.text())
-                    .wrap(Wrap { trim: false })
                     .block(theme.panel(&heading, false)),
                 area,
             );
@@ -513,8 +523,9 @@ pub(crate) fn parse_hover_content(text: &str) -> Vec<(String, HoverLineKind)> {
             in_fence = !in_fence;
             continue;
         }
-        let clean = line.replace("**", "").replace('`', "").trim().to_string();
-        if clean.is_empty() {
+        let clean = line.replace("**", "").replace('`', "");
+        let clean = clean.trim_end();
+        if clean.trim().is_empty() {
             if result.last().is_some_and(|(line, _)| !line.is_empty()) {
                 result.push((String::new(), HoverLineKind::Doc));
             }
@@ -522,14 +533,81 @@ pub(crate) fn parse_hover_content(text: &str) -> Vec<(String, HoverLineKind)> {
         }
         let kind = if in_fence {
             HoverLineKind::Signature
-        } else if clean.starts_with('@') {
+        } else if clean.trim_start().starts_with('@') {
             HoverLineKind::Tag
         } else {
             HoverLineKind::Doc
         };
-        result.push((clean, kind));
+        result.push((clean.to_string(), kind));
     }
     result
+}
+
+pub(crate) fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
+    if width == 0 || text.is_empty() {
+        return vec![String::new()];
+    }
+    let indent = leading_indent(text, width);
+    let indent_width = UnicodeWidthStr::width(indent.as_str());
+    let mut rows = Vec::new();
+    let mut line = String::new();
+    let mut used = 0usize;
+    let mut continuation = false;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme).max(1);
+        if line.is_empty()
+            && continuation
+            && indent_width > 0
+            && indent_width + grapheme_width <= width
+        {
+            line.push_str(&indent);
+            used = indent_width;
+        }
+        if used > 0 && used + grapheme_width > width {
+            rows.push(std::mem::take(&mut line));
+            continuation = true;
+            used = 0;
+            if indent_width > 0 && indent_width + grapheme_width <= width {
+                line.push_str(&indent);
+                used = indent_width;
+            }
+        }
+        line.push_str(grapheme);
+        used += grapheme_width;
+        if used >= width {
+            rows.push(std::mem::take(&mut line));
+            used = 0;
+            continuation = true;
+        }
+    }
+    if !line.is_empty() {
+        rows.push(line);
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
+}
+
+fn leading_indent(text: &str, width: usize) -> String {
+    let cap = width.saturating_sub(1);
+    if cap == 0 {
+        return String::new();
+    }
+    let mut indent = String::new();
+    let mut used = 0usize;
+    for grapheme in text.graphemes(true) {
+        if !grapheme.chars().all(char::is_whitespace) {
+            break;
+        }
+        let grapheme_width = UnicodeWidthStr::width(grapheme).max(1);
+        if used + grapheme_width > cap {
+            break;
+        }
+        indent.push_str(grapheme);
+        used += grapheme_width;
+    }
+    indent
 }
 
 impl crate::app::App {
@@ -704,10 +782,18 @@ mod tests {
     #[test]
     fn splits_hover_signature_docs_and_tags() {
         let parsed = parse_hover_content(
-            "```typescript\ninterface User {\n  name: string\n}\n```\nA user record.\n@param name display name",
+            "```typescript\ninterface User {\n  name: string\n  address: {\n    city: string\n  }\n}\n```\nA user record.\n@param name display name",
         );
         assert!(parsed.iter().any(|(line, kind)| {
             line == "interface User {" && *kind == HoverLineKind::Signature
+        }));
+        assert!(
+            parsed.iter().any(|(line, kind)| {
+                line == "  address: {" && *kind == HoverLineKind::Signature
+            })
+        );
+        assert!(parsed.iter().any(|(line, kind)| {
+            line == "    city: string" && *kind == HoverLineKind::Signature
         }));
         assert!(
             parsed
@@ -719,5 +805,16 @@ mod tests {
                 .iter()
                 .any(|(line, kind)| { line.starts_with("@param") && *kind == HoverLineKind::Tag })
         );
+    }
+
+    #[test]
+    fn wrapped_signature_keeps_leading_indent() {
+        let rows = wrap_to_width("    city: VeryLongCityName", 16);
+        assert!(rows.len() > 1);
+        assert!(rows[0].starts_with("    "));
+        for row in &rows {
+            assert!(row.starts_with("    "), "{row}");
+            assert!(UnicodeWidthStr::width(row.as_str()) <= 16);
+        }
     }
 }

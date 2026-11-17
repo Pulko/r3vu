@@ -5,7 +5,7 @@ use crossterm::event::{
 use crate::app::App;
 use crate::app::commands::{self, WheelAction, WheelAxis};
 use crate::app::events;
-use crate::app::state::{Focus, HeaderAction, Overlay};
+use crate::app::state::{Focus, HeaderAction, Overlay, SearchKind};
 use crate::editor::Movement;
 
 pub fn handle_event(app: &mut App, event: Event) {
@@ -435,8 +435,32 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                     .map(|hit| hit.action)
                 {
                     match action {
-                        HeaderAction::Find => commands::open_search(app),
-                        HeaderAction::Search => commands::open_content_search(app),
+                        HeaderAction::Find => {
+                            if matches!(
+                                app.overlay,
+                                Overlay::Search {
+                                    kind: SearchKind::Find,
+                                    ..
+                                }
+                            ) {
+                                commands::dismiss_overlay(app);
+                            } else {
+                                commands::open_search(app);
+                            }
+                        }
+                        HeaderAction::Search => {
+                            if matches!(
+                                app.overlay,
+                                Overlay::Search {
+                                    kind: SearchKind::Content,
+                                    ..
+                                }
+                            ) {
+                                commands::dismiss_overlay(app);
+                            } else {
+                                commands::open_content_search(app);
+                            }
+                        }
                     }
                 }
             } else if in_explorer {
@@ -648,7 +672,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::app::commands;
-    use crate::app::state::{App, Overlay};
+    use crate::app::state::{App, HeaderAction, HeaderHit, Overlay, SearchKind};
     use crate::language::LanguageClient;
 
     use super::handle_event;
@@ -668,6 +692,15 @@ mod tests {
         app.open_untitled();
         app.editor_area = (0, 0, 80, 24);
         app
+    }
+
+    fn left_click(column: u16, row: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        })
     }
 
     fn right_click(column: u16, row: u16) -> Event {
@@ -711,6 +744,52 @@ mod tests {
 
     fn ctrl_v() -> Event {
         Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL))
+    }
+
+    fn arm_header(app: &mut App) {
+        app.explorer_visible = true;
+        app.search_area = (0, 0, 40, 1);
+        app.header_hits = vec![
+            HeaderHit {
+                action: HeaderAction::Find,
+                x: 0,
+                width: 6,
+            },
+            HeaderHit {
+                action: HeaderAction::Search,
+                x: 7,
+                width: 8,
+            },
+        ];
+    }
+
+    fn search_kind(app: &App) -> Option<SearchKind> {
+        match app.overlay {
+            Overlay::Search { kind, .. } => Some(kind),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn clicking_the_open_find_or_search_button_closes_it() {
+        with_runtime(|| {
+            let mut app = test_app();
+            arm_header(&mut app);
+
+            handle_event(&mut app, left_click(1, 0));
+            assert_eq!(search_kind(&app), Some(SearchKind::Find));
+            handle_event(&mut app, left_click(1, 0));
+            assert!(matches!(app.overlay, Overlay::None));
+
+            handle_event(&mut app, left_click(8, 0));
+            assert_eq!(search_kind(&app), Some(SearchKind::Content));
+            handle_event(&mut app, left_click(8, 0));
+            assert!(matches!(app.overlay, Overlay::None));
+
+            commands::open_search(&mut app);
+            handle_event(&mut app, left_click(8, 0));
+            assert_eq!(search_kind(&app), Some(SearchKind::Content));
+        });
     }
 
     #[test]

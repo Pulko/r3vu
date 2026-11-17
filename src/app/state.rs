@@ -120,6 +120,7 @@ pub enum Overlay {
         files: Vec<String>,
         matches: Vec<SearchMatch>,
         selected: usize,
+        scroll: usize,
         searching: bool,
     },
     SearchFile {
@@ -314,6 +315,7 @@ pub struct App {
     pub status_hits: Vec<StatusHit>,
     pub header_hits: Vec<HeaderHit>,
     pub overlay_area: Option<(u16, u16, u16, u16)>,
+    pub search_list_rows: usize,
     pub overlay_rows: Vec<(usize, u16)>,
     pub prompt_caret: Option<(u16, u16, usize)>,
     pub tab_hit_boxes: Vec<TabHitBox>,
@@ -428,6 +430,7 @@ impl App {
             status_hits: Vec::new(),
             header_hits: Vec::new(),
             overlay_area: None,
+            search_list_rows: 0,
             overlay_rows: Vec::new(),
             prompt_caret: None,
             tab_hit_boxes: Vec::new(),

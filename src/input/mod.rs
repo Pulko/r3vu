@@ -664,6 +664,12 @@ fn dispatch_wheel(
     axis: WheelAxis,
 ) {
     commands::cancel_hover(app);
+    if matches!(app.overlay, Overlay::Search { .. }) && in_rect(app.overlay_area, x, y) {
+        if let WheelAxis::Vertical(delta) = axis {
+            commands::scroll_search(app, delta);
+        }
+        return;
+    }
     let in_popup = in_rect(app.overlay_area, x, y) || in_rect(app.menu_area, x, y);
     let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
     match commands::wheel_action(in_popup, in_explorer, in_editor, in_thread, shift, axis) {
@@ -794,6 +800,67 @@ mod tests {
             Overlay::Search { kind, .. } => Some(kind),
             _ => None,
         }
+    }
+
+    fn search_window(app: &App) -> (usize, usize) {
+        match &app.overlay {
+            Overlay::Search {
+                selected, scroll, ..
+            } => (*selected, *scroll),
+            other => panic!("expected a search list, got {other:?}"),
+        }
+    }
+
+    fn long_find(app: &mut App) {
+        app.search_list_rows = 10;
+        app.overlay_area = Some((0, 0, 40, 18));
+        app.overlay = Overlay::Search {
+            kind: SearchKind::Find,
+            query: String::new(),
+            files: (0..40).map(|index| format!("file-{index:02}")).collect(),
+            matches: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            searching: false,
+        };
+    }
+
+    fn scroll_down(column: u16, row: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        })
+    }
+
+    #[test]
+    fn find_list_scrolls_with_arrows_and_the_wheel() {
+        with_runtime(|| {
+            let mut app = test_app();
+            long_find(&mut app);
+
+            for _ in 0..12 {
+                handle_event(
+                    &mut app,
+                    Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty())),
+                );
+            }
+            let (selected, scroll) = search_window(&app);
+            assert_eq!((selected, scroll), (12, 3));
+            assert!(selected >= scroll && selected < scroll + 10);
+
+            handle_event(&mut app, scroll_down(5, 5));
+            let (selected, scroll) = search_window(&app);
+            assert_eq!(scroll, 6);
+            assert!(selected >= scroll && selected < scroll + 10);
+
+            long_find(&mut app);
+            handle_event(&mut app, scroll_down(5, 5));
+            let (selected, scroll) = search_window(&app);
+            assert_eq!((selected, scroll), (3, 3));
+            assert!(selected >= scroll && selected < scroll + 10);
+        });
     }
 
     #[test]

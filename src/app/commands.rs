@@ -344,6 +344,7 @@ pub fn open_search(app: &mut App) {
         files,
         matches: Vec::new(),
         selected: 0,
+        scroll: 0,
         searching: false,
     };
 }
@@ -355,6 +356,7 @@ pub fn open_content_search(app: &mut App) {
         files: Vec::new(),
         matches: Vec::new(),
         selected: 0,
+        scroll: 0,
         searching: false,
     };
 }
@@ -1014,6 +1016,7 @@ fn refresh_overlay_query(app: &mut App) {
             kind,
             query,
             selected,
+            scroll,
             matches,
             ..
         } => {
@@ -1033,10 +1036,14 @@ fn refresh_overlay_query(app: &mut App) {
                     app.search_tx.clone(),
                 );
             }
+            let len = files.len() + matches.len();
+            let (selected, scroll) =
+                fit_search_window(selected, scroll, len, app.search_list_rows, true);
             app.overlay = Overlay::Search {
                 kind,
                 query,
-                selected: clamp_search_selected(selected, files.len(), matches.len()),
+                selected,
+                scroll,
                 files,
                 matches,
                 searching,
@@ -1058,26 +1065,61 @@ fn refresh_overlay_query(app: &mut App) {
     }
 }
 
-fn clamp_search_selected(selected: usize, files: usize, matches: usize) -> usize {
-    let total = files + matches;
-    if total == 0 {
-        0
+pub(crate) fn fit_search_window(
+    selected: usize,
+    scroll: usize,
+    len: usize,
+    visible: usize,
+    follow_selection: bool,
+) -> (usize, usize) {
+    let visible = visible.max(1);
+    if len == 0 {
+        return (0, 0);
+    }
+    let selected = selected.min(len - 1);
+    let max_scroll = len.saturating_sub(visible);
+    let scroll = scroll.min(max_scroll);
+    if follow_selection {
+        let scroll = if selected < scroll {
+            selected
+        } else if selected >= scroll + visible {
+            selected + 1 - visible
+        } else {
+            scroll
+        };
+        (selected, scroll.min(max_scroll))
+    } else if selected < scroll {
+        (scroll, scroll)
+    } else if selected >= scroll + visible {
+        ((scroll + visible - 1).min(len - 1), scroll)
     } else {
-        selected.min(total - 1)
+        (selected, scroll)
     }
 }
 
 fn overlay_move(app: &mut App, movement: Movement) {
     let down = matches!(movement, Movement::Down | Movement::Right);
     let up = matches!(movement, Movement::Up | Movement::Left);
+    let visible = app.search_list_rows;
     match &mut app.overlay {
-        Overlay::Search { selected, .. } => {
+        Overlay::Search {
+            files,
+            matches,
+            selected,
+            scroll,
+            ..
+        } => {
             if down {
                 *selected = selected.saturating_add(1);
             }
             if up {
                 *selected = selected.saturating_sub(1);
             }
+            let len = files.len() + matches.len();
+            let (next_selected, next_scroll) =
+                fit_search_window(*selected, *scroll, len, visible, true);
+            *selected = next_selected;
+            *scroll = next_scroll;
         }
         Overlay::References { items, selected } => {
             if down {
@@ -1122,18 +1164,27 @@ fn overlay_move(app: &mut App, movement: Movement) {
         }
         _ => {}
     }
-    if let Overlay::Search {
+}
+
+pub fn scroll_search(app: &mut App, delta: i32) {
+    let visible = app.search_list_rows;
+    let Overlay::Search {
         files,
         matches,
         selected,
+        scroll,
         ..
     } = &mut app.overlay
-    {
-        let total = files.len() + matches.len();
-        if total > 0 {
-            *selected = (*selected).min(total - 1);
-        }
-    }
+    else {
+        return;
+    };
+    let len = files.len() + matches.len();
+    let page = visible.max(1);
+    let max_scroll = len.saturating_sub(page);
+    let next = (*scroll as i64 + i64::from(delta)).clamp(0, max_scroll as i64) as usize;
+    let (next_selected, next_scroll) = fit_search_window(*selected, next, len, visible, false);
+    *selected = next_selected;
+    *scroll = next_scroll;
 }
 
 pub fn overlay_submit(app: &mut App) {

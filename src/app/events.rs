@@ -146,11 +146,13 @@ pub fn handle_search_results(app: &mut App, update: crate::workspace::WorkspaceS
     if let Some(message) = update.message {
         app.message = Some(message);
     }
+    let visible = app.search_list_rows;
     if let Overlay::Search {
         query,
         files,
         matches,
         selected,
+        scroll,
         searching,
         ..
     } = &mut app.overlay
@@ -160,12 +162,11 @@ pub fn handle_search_results(app: &mut App, update: crate::workspace::WorkspaceS
         }
         *matches = update.matches;
         *searching = false;
-        let total = files.len() + matches.len();
-        if total == 0 {
-            *selected = 0;
-        } else if *selected >= files.len() {
-            *selected = (*selected).min(total - 1);
-        }
+        let len = files.len() + matches.len();
+        let (next_selected, next_scroll) =
+            crate::app::commands::fit_search_window(*selected, *scroll, len, visible, true);
+        *selected = next_selected;
+        *scroll = next_scroll;
     }
 }
 

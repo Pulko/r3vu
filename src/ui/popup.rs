@@ -53,6 +53,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             files,
             matches,
             selected,
+            scroll,
             searching,
         } => {
             let mut items = files.clone();
@@ -77,15 +78,18 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 (crate::app::state::SearchKind::Content, true) => " Search (searching) ",
                 (crate::app::state::SearchKind::Content, false) => " Search ",
             };
-            render_list(
+            let list_area = render_list(
                 frame,
                 frame.area(),
                 title,
                 &format!(" {query} "),
                 &items,
                 *selected,
+                *scroll,
                 theme,
             );
+            app.overlay_area = Some((list_area.x, list_area.y, list_area.width, list_area.height));
+            app.search_list_rows = list_area.rows;
         }
         Overlay::SearchFile {
             query,
@@ -189,13 +193,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                     )
                 })
                 .collect();
-            render_list(
+            let _ = render_list(
                 frame,
                 frame.area(),
                 " References ",
                 "",
                 &list,
                 *selected,
+                0,
                 theme,
             );
         }
@@ -670,6 +675,14 @@ fn render_completions(frame: &mut Frame, app: &App, selected: usize, theme: Them
     );
 }
 
+struct ListArea {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    rows: usize,
+}
+
 fn render_list(
     frame: &mut Frame,
     full: Rect,
@@ -677,8 +690,9 @@ fn render_list(
     query: &str,
     items: &[String],
     selected: usize,
+    scroll: usize,
     theme: Theme,
-) {
+) -> ListArea {
     let area = center(full, 18, 70);
     frame.render_widget(Clear, area);
     let chunks = ratatui::layout::Layout::default()
@@ -706,12 +720,15 @@ fn render_list(
         Paragraph::new(query.to_string()).style(theme.text()),
         rows[0],
     );
-    let list_items: Vec<ListItem> = items
+    let height = rows[1].height as usize;
+    let start = scroll.min(items.len().saturating_sub(height));
+    let end = (start + height).min(items.len());
+    let list_items: Vec<ListItem> = items[start..end]
         .iter()
         .enumerate()
-        .map(|(i, item)| {
+        .map(|(offset, item)| {
             let mut style = Style::default().fg(theme.fg);
-            if i == selected {
+            if start + offset == selected {
                 style = style.bg(theme.bg_selected);
             }
             ListItem::new(Span::styled(item.clone(), style))
@@ -719,6 +736,13 @@ fn render_list(
         .collect();
     frame.render_widget(List::new(list_items), rows[1]);
     let _ = chunks;
+    ListArea {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height,
+        rows: height,
+    }
 }
 
 fn center(area: Rect, height: u16, width: u16) -> Rect {

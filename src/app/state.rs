@@ -158,6 +158,7 @@ pub enum Overlay {
     Prompt {
         title: String,
         input: String,
+        cursor: usize,
         kind: PromptKind,
     },
     References {
@@ -312,6 +313,7 @@ pub struct App {
     pub header_hits: Vec<HeaderHit>,
     pub overlay_area: Option<(u16, u16, u16, u16)>,
     pub overlay_rows: Vec<(usize, u16)>,
+    pub prompt_caret: Option<(u16, u16, usize)>,
     pub tab_hit_boxes: Vec<TabHitBox>,
     pub tab_scroll: usize,
     pub tab_revealed: Option<DocumentId>,
@@ -422,6 +424,7 @@ impl App {
             header_hits: Vec::new(),
             overlay_area: None,
             overlay_rows: Vec::new(),
+            prompt_caret: None,
             tab_hit_boxes: Vec::new(),
             tab_scroll: 0,
             tab_revealed: None,

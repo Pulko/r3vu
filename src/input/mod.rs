@@ -13,7 +13,9 @@ pub fn handle_event(app: &mut App, event: Event) {
         Event::Key(key) if key.kind != KeyEventKind::Release => handle_key(app, key),
         Event::Mouse(mouse) => handle_mouse(app, mouse),
         Event::Paste(text) => {
-            if app.git_message_focus && matches!(app.overlay, Overlay::None) {
+            if matches!(app.overlay, Overlay::Prompt { .. }) {
+                commands::insert_prompt(app, &text.replace(['\n', '\r'], ""));
+            } else if app.git_message_focus && matches!(app.overlay, Overlay::None) {
                 app.git_message.push_str(&text.replace(['\n', '\r'], " "));
             } else if app.focus == Focus::Thread && matches!(app.overlay, Overlay::None) {
                 app.thread
@@ -111,6 +113,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Up | KeyCode::Down if matches!(app.overlay, Overlay::TypesNote) => return,
             KeyCode::Backspace => {
                 commands::backspace(app);
+                return;
+            }
+            KeyCode::Delete if matches!(app.overlay, Overlay::Prompt { .. }) => {
+                commands::delete_prompt_forward(app);
+                return;
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End
+                if matches!(app.overlay, Overlay::Prompt { .. }) =>
+            {
+                commands::move_prompt_cursor(app, key.code);
                 return;
             }
             KeyCode::Up => return commands::move_sel(app, Movement::Up, false),
@@ -304,6 +316,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         }
         MouseEventKind::Down(MouseButton::Left) => {
             commands::cancel_hover(app);
+            if matches!(app.overlay, Overlay::Prompt { .. }) {
+                if !commands::click_prompt(app, x, y) {
+                    commands::dismiss_overlay(app);
+                }
+                return;
+            }
             if matches!(
                 app.overlay,
                 Overlay::Themes { .. } | Overlay::Help | Overlay::TypesNote

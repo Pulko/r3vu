@@ -42,11 +42,12 @@ pub fn save_active(app: &mut App) {
         sync_normalized_buffer(app, id, &before, true);
     }
     if needs_save_as {
-        app.overlay = Overlay::Prompt {
-            title: "Save as (relative path)".into(),
-            input: String::new(),
-            kind: PromptKind::SaveAs,
-        };
+        open_prompt(
+            app,
+            "Save as (relative path)",
+            String::new(),
+            PromptKind::SaveAs,
+        );
     } else {
         app.refresh_git_status();
     }
@@ -583,11 +584,12 @@ pub fn request_signature(app: &mut App) {
 }
 
 pub fn start_rename_symbol(app: &mut App) {
-    app.overlay = Overlay::Prompt {
-        title: "Rename symbol".into(),
-        input: String::new(),
-        kind: PromptKind::RenameSymbol,
-    };
+    open_prompt(
+        app,
+        "Rename symbol",
+        String::new(),
+        PromptKind::RenameSymbol,
+    );
 }
 
 pub fn visible_completions(app: &App) -> Vec<CompletionItem> {
@@ -811,11 +813,139 @@ pub fn submit_prompt(app: &mut App) {
     }
 }
 
+fn open_prompt(app: &mut App, title: &str, input: String, kind: PromptKind) {
+    let cursor = input.chars().count();
+    app.overlay = Overlay::Prompt {
+        title: title.into(),
+        input,
+        cursor,
+        kind,
+    };
+}
+
+pub fn insert_prompt(app: &mut App, text: &str) -> bool {
+    let Overlay::Prompt { input, cursor, .. } = &mut app.overlay else {
+        return false;
+    };
+    let mut chars: Vec<char> = input.chars().collect();
+    let at = (*cursor).min(chars.len());
+    let extra: Vec<char> = text
+        .chars()
+        .filter(|ch| *ch != '\n' && *ch != '\r')
+        .collect();
+    let added = extra.len();
+    chars.splice(at..at, extra);
+    *input = chars.into_iter().collect();
+    *cursor = at + added;
+    true
+}
+
+fn delete_prompt_before(app: &mut App) -> bool {
+    let Overlay::Prompt { input, cursor, .. } = &mut app.overlay else {
+        return false;
+    };
+    let mut chars: Vec<char> = input.chars().collect();
+    let at = (*cursor).min(chars.len());
+    if at == 0 {
+        return true;
+    }
+    chars.remove(at - 1);
+    *input = chars.into_iter().collect();
+    *cursor = at - 1;
+    true
+}
+
+pub fn delete_prompt_forward(app: &mut App) {
+    let Overlay::Prompt { input, cursor, .. } = &mut app.overlay else {
+        return;
+    };
+    let mut chars: Vec<char> = input.chars().collect();
+    let at = (*cursor).min(chars.len());
+    if at >= chars.len() {
+        return;
+    }
+    chars.remove(at);
+    *input = chars.into_iter().collect();
+}
+
+pub fn move_prompt_cursor(app: &mut App, code: crossterm::event::KeyCode) {
+    use crossterm::event::KeyCode;
+    let Overlay::Prompt { input, cursor, .. } = &mut app.overlay else {
+        return;
+    };
+    let len = input.chars().count();
+    let at = (*cursor).min(len);
+    *cursor = match code {
+        KeyCode::Left => at.saturating_sub(1),
+        KeyCode::Right => (at + 1).min(len),
+        KeyCode::Home => 0,
+        KeyCode::End => len,
+        _ => at,
+    };
+}
+
+pub fn click_prompt(app: &mut App, x: u16, y: u16) -> bool {
+    let inside = app.overlay_area.is_some_and(|(ax, ay, width, height)| {
+        x >= ax && x < ax.saturating_add(width) && y >= ay && y < ay.saturating_add(height)
+    });
+    if !inside {
+        return false;
+    }
+    if let Some((origin_x, origin_y, skip)) = app.prompt_caret
+        && y == origin_y
+        && let Overlay::Prompt { input, cursor, .. } = &mut app.overlay
+    {
+        let col = x.saturating_sub(origin_x) as usize;
+        let rest: String = input.chars().skip(skip).collect();
+        *cursor = skip + index_at_width(&rest, col);
+    }
+    true
+}
+
+pub(crate) fn prompt_window(input: &str, cursor: usize, room: usize) -> (String, usize, usize) {
+    if room == 0 {
+        return (String::new(), 0, 0);
+    }
+    let chars: Vec<char> = input.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let mut start = 0;
+    while start < cursor && display_width(&chars[start..cursor]) >= room {
+        start += 1;
+    }
+    let mut end = chars.len();
+    while end > start && display_width(&chars[start..end]) > room {
+        end -= 1;
+    }
+    let col = display_width(&chars[start..cursor]);
+    let visible: String = chars[start..end].iter().collect();
+    (visible, col, start)
+}
+
+pub(crate) fn index_at_width(text: &str, width: usize) -> usize {
+    let mut used = 0usize;
+    for (index, ch) in text.chars().enumerate() {
+        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width > width {
+            return index;
+        }
+        used += ch_width;
+    }
+    text.chars().count()
+}
+
+fn display_width(chars: &[char]) -> usize {
+    chars
+        .iter()
+        .map(|ch| unicode_width::UnicodeWidthChar::width(*ch).unwrap_or(0))
+        .sum()
+}
+
 pub fn overlay_char(app: &mut App, ch: char) {
+    if insert_prompt(app, &ch.to_string()) {
+        return;
+    }
     match &mut app.overlay {
-        Overlay::Search { query, .. }
-        | Overlay::SearchFile { query, .. }
-        | Overlay::Prompt { input: query, .. } => {
+        Overlay::Search { query, .. } | Overlay::SearchFile { query, .. } => {
             query.push(ch);
         }
         _ => {}
@@ -824,10 +954,11 @@ pub fn overlay_char(app: &mut App, ch: char) {
 }
 
 fn overlay_backspace(app: &mut App) -> bool {
+    if delete_prompt_before(app) {
+        return true;
+    }
     let handled = match &mut app.overlay {
-        Overlay::Search { query, .. }
-        | Overlay::SearchFile { query, .. }
-        | Overlay::Prompt { input: query, .. } => {
+        Overlay::Search { query, .. } | Overlay::SearchFile { query, .. } => {
             query.pop();
             true
         }
@@ -1517,18 +1648,20 @@ pub fn run_menu(app: &mut App, action: MenuAction) {
         MenuAction::Cut => cut(app),
         MenuAction::Paste => paste(app),
         MenuAction::NewFile => {
-            app.overlay = Overlay::Prompt {
-                title: "New file".into(),
-                input: String::new(),
-                kind: PromptKind::CreateFile { is_dir: false },
-            };
+            open_prompt(
+                app,
+                "New file",
+                String::new(),
+                PromptKind::CreateFile { is_dir: false },
+            );
         }
         MenuAction::NewFolder => {
-            app.overlay = Overlay::Prompt {
-                title: "New folder".into(),
-                input: String::new(),
-                kind: PromptKind::CreateFile { is_dir: true },
-            };
+            open_prompt(
+                app,
+                "New folder",
+                String::new(),
+                PromptKind::CreateFile { is_dir: true },
+            );
         }
         MenuAction::RenameFile => {
             let name = app
@@ -1536,11 +1669,7 @@ pub fn run_menu(app: &mut App, action: MenuAction) {
                 .get(app.explorer_selected)
                 .map(|e| e.name.clone())
                 .unwrap_or_default();
-            app.overlay = Overlay::Prompt {
-                title: "Rename".into(),
-                input: name,
-                kind: PromptKind::RenameFile,
-            };
+            open_prompt(app, "Rename", name, PromptKind::RenameFile);
         }
         MenuAction::CopyPath => copy_path(app),
         MenuAction::CloseOthers(id) => {
@@ -1960,11 +2089,12 @@ pub fn prompt_agent_edit(app: &mut App) {
         app.message = Some("Claude is still working".into());
         return;
     }
-    app.overlay = Overlay::Prompt {
-        title: "Edit with Claude".into(),
-        input: String::new(),
-        kind: PromptKind::AgentEdit,
-    };
+    open_prompt(
+        app,
+        "Edit with Claude",
+        String::new(),
+        PromptKind::AgentEdit,
+    );
 }
 
 pub fn send_thread(app: &mut App) {
@@ -2724,5 +2854,48 @@ mod tests {
         assert!(!from.exists());
         assert_eq!(app.message.as_deref(), Some("Renamed"));
         let _ = std::fs::remove_dir_all(&app.root);
+    }
+
+    #[test]
+    fn prompt_window_keeps_the_cursor_on_screen() {
+        let (visible, col, skip) = super::prompt_window("abcdefghij", 10, 4);
+        assert_eq!((visible.as_str(), col, skip), ("hij", 3, 7));
+        assert_eq!(super::index_at_width("reader.ts", 0), 0);
+        assert_eq!(super::index_at_width("reader.ts", 6), 6);
+        assert_eq!(super::index_at_width("あa", 0), 0);
+        assert_eq!(super::index_at_width("あa", 1), 0);
+        assert_eq!(super::index_at_width("あa", 2), 1);
+    }
+
+    #[test]
+    fn rename_prompt_keeps_a_cursor_inside_the_name() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(PathBuf::from("."), LanguageClient { tx });
+        app.explorer_entries = vec![crate::workspace::ExplorerEntry {
+            path: PathBuf::from("reader.ts"),
+            name: "reader.ts".into(),
+            is_dir: false,
+            depth: 0,
+            expanded: false,
+        }];
+        super::run_menu(&mut app, MenuAction::RenameFile);
+        let Overlay::Prompt { input, cursor, .. } = &app.overlay else {
+            panic!("rename opens a prompt");
+        };
+        assert_eq!(input, "reader.ts");
+        assert_eq!(*cursor, 9);
+        super::move_prompt_cursor(&mut app, crossterm::event::KeyCode::Left);
+        super::move_prompt_cursor(&mut app, crossterm::event::KeyCode::Left);
+        super::move_prompt_cursor(&mut app, crossterm::event::KeyCode::Left);
+        assert!(super::insert_prompt(&mut app, "2"));
+        app.overlay_area = Some((10, 5, 20, 5));
+        app.prompt_caret = Some((11, 6, 0));
+        assert!(super::click_prompt(&mut app, 14, 6));
+        let Overlay::Prompt { input, cursor, .. } = &app.overlay else {
+            panic!("prompt stays open");
+        };
+        assert_eq!(input, "reader2.ts");
+        assert_eq!(*cursor, 3);
+        assert!(!super::click_prompt(&mut app, 0, 0));
     }
 }

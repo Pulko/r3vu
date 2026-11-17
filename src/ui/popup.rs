@@ -1,5 +1,5 @@
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position as TermPos, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
@@ -12,6 +12,7 @@ use crate::ui::theme::Theme;
 pub fn render(frame: &mut Frame, app: &mut App) {
     let theme = app.theme();
     app.types_copy = None;
+    app.prompt_caret = None;
     if !matches!(
         app.overlay,
         Overlay::Themes { .. } | Overlay::Help | Overlay::TypesNote
@@ -198,16 +199,35 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 area,
             );
         }
-        Overlay::Prompt { title, input, .. } => {
+        Overlay::Prompt {
+            title,
+            input,
+            cursor,
+            ..
+        } => {
             let area = center(frame.area(), 5, 50);
+            app.overlay_area = Some((area.x, area.y, area.width, area.height));
             frame.render_widget(Clear, area);
             let prompt_title = format!(" {title} ");
+            let room = area.width.saturating_sub(2) as usize;
+            let (visible, col, skip) = crate::app::commands::prompt_window(input, *cursor, room);
+            let y = area.y.saturating_add(1);
+            let x = area.x.saturating_add(1);
+            app.prompt_caret = Some((x, y, skip));
+            let gap = room.saturating_sub(unicode_width::UnicodeWidthStr::width(visible.as_str()));
+            let shown = format!("{visible}{}", " ".repeat(gap));
             frame.render_widget(
-                Paragraph::new(format!(" {input} "))
+                Paragraph::new(shown)
                     .style(theme.text())
                     .block(theme.panel(&prompt_title, false)),
                 area,
             );
+            if col < room {
+                frame.set_cursor_position(TermPos {
+                    x: x.saturating_add(col as u16),
+                    y,
+                });
+            }
         }
         Overlay::Themes { .. }
         | Overlay::Help

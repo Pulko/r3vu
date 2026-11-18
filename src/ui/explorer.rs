@@ -38,15 +38,15 @@ pub fn render_search(frame: &mut Frame, area: Rect, app: &mut App) {
             Style::default().fg(theme.accent).bg(theme.bg)
         }
     };
-    let find = " Find ";
+    let open = " Open ";
     let search = " Search ";
-    let find_width = UnicodeWidthStr::width(find) as u16;
+    let open_width = UnicodeWidthStr::width(open) as u16;
     let search_width = UnicodeWidthStr::width(search) as u16;
-    let search_x = area.x.saturating_add(find_width).saturating_add(1);
+    let search_x = area.x.saturating_add(open_width).saturating_add(1);
     app.header_hits.push(HeaderHit {
         action: HeaderAction::Find,
         x: area.x,
-        width: find_width,
+        width: open_width,
     });
     app.header_hits.push(HeaderHit {
         action: HeaderAction::Search,
@@ -54,11 +54,11 @@ pub fn render_search(frame: &mut Frame, area: Rect, app: &mut App) {
         width: search_width,
     });
     let row_bg = Style::default().bg(theme.bg);
-    let used = find_width.saturating_add(search_width).saturating_add(1);
+    let used = open_width.saturating_add(search_width).saturating_add(1);
     let rest = " ".repeat(area.width.saturating_sub(used) as usize);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(find, tool(find_on)),
+            Span::styled(open, tool(find_on)),
             Span::styled(" ", row_bg),
             Span::styled(search, tool(search_on)),
             Span::styled(rest, row_bg),

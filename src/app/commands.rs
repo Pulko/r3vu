@@ -1105,13 +1105,20 @@ pub fn overlay_char(app: &mut App, ch: char) {
         Overlay::Search { query, .. } => {
             query.push(ch);
         }
+        Overlay::Branches { query, .. } => {
+            query.push(ch);
+        }
         _ => {}
     }
     refresh_overlay_query(app);
+    sync_branch_query(app);
 }
 
 pub fn overlay_insert(app: &mut App, text: &str) -> bool {
-    if !matches!(app.overlay, Overlay::Search { .. } | Overlay::Prompt { .. }) {
+    if !matches!(
+        app.overlay,
+        Overlay::Search { .. } | Overlay::Prompt { .. } | Overlay::Branches { .. }
+    ) {
         return false;
     }
     let text = sanitize_overlay_paste(text);
@@ -1125,9 +1132,13 @@ pub fn overlay_insert(app: &mut App, text: &str) -> bool {
         Overlay::Search { query, .. } => {
             query.push_str(&text);
         }
+        Overlay::Branches { query, .. } => {
+            query.push_str(&text);
+        }
         _ => return true,
     }
     refresh_overlay_query(app);
+    sync_branch_query(app);
     true
 }
 
@@ -1150,6 +1161,10 @@ fn overlay_backspace(app: &mut App) -> bool {
             query.pop();
             true
         }
+        Overlay::Branches { query, .. } => {
+            query.pop();
+            true
+        }
         Overlay::None
         | Overlay::Completion { .. }
         | Overlay::Hover { .. }
@@ -1158,8 +1173,49 @@ fn overlay_backspace(app: &mut App) -> bool {
     };
     if handled {
         refresh_overlay_query(app);
+        sync_branch_query(app);
     }
     handled
+}
+
+fn sync_branch_query(app: &mut App) {
+    let Overlay::Branches {
+        query,
+        branches,
+        loading,
+        ..
+    } = &app.overlay
+    else {
+        return;
+    };
+    let query = query.clone();
+    let branches = branches.clone();
+    let loading = *loading;
+    let len = crate::workspace::branch_choice_count(&branches, &query, loading);
+    let selected = if query.trim().is_empty() {
+        app.git_branch
+            .as_ref()
+            .and_then(|name| {
+                crate::workspace::filter_branches(&branches, &query)
+                    .iter()
+                    .position(|branch| branch == name)
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let selected = if len == 0 { 0 } else { selected.min(len - 1) };
+    if let Overlay::Branches {
+        selected: slot,
+        scroll,
+        error,
+        ..
+    } = &mut app.overlay
+    {
+        *slot = selected;
+        *scroll = 0;
+        *error = None;
+    }
 }
 
 fn refresh_overlay_query(app: &mut App) {
@@ -1327,6 +1383,29 @@ fn overlay_move(app: &mut App, movement: Movement) {
                 *selected = selected.saturating_sub(1);
             }
         }
+        Overlay::Branches {
+            branches,
+            query,
+            selected,
+            scroll,
+            loading,
+            ..
+        } => {
+            let len = crate::workspace::branch_choice_count(branches, query, *loading);
+            if len == 0 {
+                return;
+            }
+            if down {
+                *selected = selected.saturating_add(1);
+            }
+            if up {
+                *selected = selected.saturating_sub(1);
+            }
+            let (next_selected, next_scroll) =
+                fit_search_window(*selected, *scroll, len, visible, true);
+            *selected = next_selected;
+            *scroll = next_scroll;
+        }
         _ => {}
     }
 }
@@ -1378,6 +1457,55 @@ pub fn scroll_search(app: &mut App, delta: i32) {
     let (next_selected, next_scroll) = fit_search_window(*selected, next, len, visible, false);
     *selected = next_selected;
     *scroll = next_scroll;
+}
+
+pub fn click_branch_row(app: &mut App, x: u16, y: u16) -> bool {
+    if !matches!(app.overlay, Overlay::Branches { .. }) {
+        return false;
+    }
+    let Some((row_x, width)) = app.search_row_span else {
+        return false;
+    };
+    if x < row_x || x >= row_x.saturating_add(width) {
+        return false;
+    }
+    let Some(&(index, _)) = app.search_rows.iter().find(|(_, row)| *row == y) else {
+        return false;
+    };
+    if let Overlay::Branches { selected, .. } = &mut app.overlay {
+        *selected = index;
+    }
+    true
+}
+
+pub fn scroll_branches(app: &mut App, delta: i32) {
+    let visible = app.search_list_rows;
+    let (len, selected, scroll) = match &app.overlay {
+        Overlay::Branches {
+            branches,
+            query,
+            selected,
+            scroll,
+            loading,
+            ..
+        } => (
+            crate::workspace::branch_choice_count(branches, query, *loading),
+            *selected,
+            *scroll,
+        ),
+        _ => return,
+    };
+    let page = visible.max(1);
+    let max_scroll = len.saturating_sub(page);
+    let next = (scroll as i64 + i64::from(delta)).clamp(0, max_scroll as i64) as usize;
+    let (next_selected, next_scroll) = fit_search_window(selected, next, len, visible, false);
+    if let Overlay::Branches {
+        selected, scroll, ..
+    } = &mut app.overlay
+    {
+        *selected = next_selected;
+        *scroll = next_scroll;
+    }
 }
 
 pub fn overlay_submit(app: &mut App) {
@@ -1438,7 +1566,59 @@ pub fn overlay_submit(app: &mut App) {
         }
         Overlay::Help => {}
         Overlay::TypesNote => dismiss_types_note(app),
+        Overlay::Branches { .. } => submit_branches(app),
         _ => app.overlay = Overlay::None,
+    }
+}
+
+fn submit_branches(app: &mut App) {
+    if app.git_busy() {
+        return;
+    }
+    let Overlay::Branches {
+        query,
+        branches,
+        selected,
+        loading,
+        ..
+    } = app.overlay.clone()
+    else {
+        return;
+    };
+    if loading {
+        return;
+    }
+    let filtered = crate::workspace::filter_branches(&branches, &query);
+    if filtered.is_empty() {
+        let name = query.trim();
+        if name.is_empty() {
+            return;
+        }
+        if let Some(message) = crate::workspace::branch_name_error(name) {
+            set_branch_error(app, message);
+            return;
+        }
+        app.enqueue_git_write(GitWrite::CreateBranch(name.to_string()));
+        return;
+    }
+    let name = filtered
+        .get(selected)
+        .cloned()
+        .unwrap_or_else(|| filtered[0].clone());
+    if app.git_branch.as_deref() == Some(name.as_str()) {
+        app.overlay = Overlay::None;
+        return;
+    }
+    if let Some(message) = crate::workspace::branch_name_error(&name) {
+        set_branch_error(app, message);
+        return;
+    }
+    app.enqueue_git_write(GitWrite::Switch(name));
+}
+
+fn set_branch_error(app: &mut App, message: &str) {
+    if let Overlay::Branches { error, .. } = &mut app.overlay {
+        *error = Some(message.to_string());
     }
 }
 
@@ -2878,7 +3058,22 @@ pub fn receive_git_write(app: &mut App, result: crate::workspace::GitWriteResult
     let reload = result.reload.clone();
     let close_path = result.close_path.clone();
     let ok = result.ok;
+    let branch = result.branch;
+    let message = result.message.clone();
     app.note_git_write(result);
+    if branch {
+        if ok {
+            if matches!(app.overlay, Overlay::Branches { .. }) {
+                app.overlay = Overlay::None;
+            }
+        } else if let Overlay::Branches { error, .. } = &mut app.overlay {
+            *error = Some(if message.is_empty() {
+                "Branch change failed".into()
+            } else {
+                message
+            });
+        }
+    }
     if ok {
         if let Some(path) = reload {
             app.reload_clean_document(&path);
@@ -3443,5 +3638,138 @@ mod tests {
         assert_eq!(input, "reader2.ts");
         assert_eq!(*cursor, 3);
         assert!(!super::click_prompt(&mut app, 0, 0));
+    }
+
+    fn branch_overlay(query: &str, branches: &[&str], selected: usize) -> Overlay {
+        Overlay::Branches {
+            query: query.into(),
+            branches: branches.iter().map(|name| (*name).to_string()).collect(),
+            selected,
+            scroll: 0,
+            generation: 1,
+            loading: false,
+            error: Some("old".into()),
+        }
+    }
+
+    #[test]
+    fn invalid_branch_name_stays_in_the_modal() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(PathBuf::from("."), LanguageClient { tx });
+        app.overlay = branch_overlay("bad name", &[], 0);
+        super::overlay_submit(&mut app);
+        let Overlay::Branches {
+            error: Some(message),
+            ..
+        } = &app.overlay
+        else {
+            panic!("modal stays open");
+        };
+        assert_eq!(message, "Branch name is invalid");
+        assert!(!app.git_busy());
+    }
+
+    #[test]
+    fn switching_to_the_current_branch_closes() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(PathBuf::from("."), LanguageClient { tx });
+        app.git_branch = Some("main".into());
+        app.overlay = branch_overlay("", &["main", "topic"], 0);
+        super::overlay_submit(&mut app);
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(!app.git_busy());
+    }
+
+    #[test]
+    fn typing_clears_a_branch_error() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(PathBuf::from("."), LanguageClient { tx });
+        app.overlay = branch_overlay("bad", &[], 0);
+        super::overlay_char(&mut app, 'x');
+        let Overlay::Branches { query, error, .. } = &app.overlay else {
+            panic!("modal stays open");
+        };
+        assert_eq!(query, "badx");
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn branch_failure_stays_open_and_success_closes() {
+        with_runtime(|| {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut app = App::new(PathBuf::from("."), LanguageClient { tx });
+            app.overlay = branch_overlay("topic", &[], 0);
+            super::receive_git_write(
+                &mut app,
+                crate::workspace::GitWriteResult {
+                    ok: false,
+                    message: "a branch named 'topic' already exists".into(),
+                    reload: None,
+                    close_path: None,
+                    committed: None,
+                    committed_body: None,
+                    notice: None,
+                    branch: true,
+                },
+            );
+            let Overlay::Branches {
+                error: Some(message),
+                ..
+            } = &app.overlay
+            else {
+                panic!("failure keeps the modal");
+            };
+            assert_eq!(message, "a branch named 'topic' already exists");
+            assert_eq!(
+                app.message.as_deref(),
+                Some("a branch named 'topic' already exists")
+            );
+            app.overlay = Overlay::None;
+            super::receive_git_write(
+                &mut app,
+                crate::workspace::GitWriteResult {
+                    ok: false,
+                    message: "a branch named 'topic' already exists".into(),
+                    reload: None,
+                    close_path: None,
+                    committed: None,
+                    committed_body: None,
+                    notice: None,
+                    branch: true,
+                },
+            );
+            assert!(matches!(app.overlay, Overlay::None));
+            super::receive_git_write(
+                &mut app,
+                crate::workspace::GitWriteResult {
+                    ok: true,
+                    message: String::new(),
+                    reload: None,
+                    close_path: None,
+                    committed: None,
+                    committed_body: None,
+                    notice: Some("Created topic".into()),
+                    branch: true,
+                },
+            );
+            assert!(matches!(app.overlay, Overlay::None));
+            assert_eq!(app.message.as_deref(), Some("Created topic"));
+            app.overlay = branch_overlay("", &["main", "topic"], 1);
+            super::receive_git_write(
+                &mut app,
+                crate::workspace::GitWriteResult {
+                    ok: true,
+                    message: String::new(),
+                    reload: None,
+                    close_path: None,
+                    committed: None,
+                    committed_body: None,
+                    notice: Some("Switched to topic".into()),
+                    branch: true,
+                },
+            );
+            assert!(matches!(app.overlay, Overlay::None));
+            assert_eq!(app.message.as_deref(), Some("Switched to topic"));
+        });
     }
 }

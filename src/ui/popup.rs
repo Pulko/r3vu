@@ -49,6 +49,39 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_types_note(frame, app, theme);
         return;
     }
+    let branch_picker = match &app.overlay {
+        Overlay::Branches {
+            query,
+            branches,
+            selected,
+            scroll,
+            loading,
+            error,
+            ..
+        } => Some((
+            query.clone(),
+            branches.clone(),
+            *selected,
+            *scroll,
+            *loading,
+            error.clone(),
+        )),
+        _ => None,
+    };
+    if let Some((query, branches, selected, scroll, loading, error)) = branch_picker {
+        render_branches(
+            frame,
+            app,
+            theme,
+            &query,
+            &branches,
+            selected,
+            scroll,
+            loading,
+            error.as_deref(),
+        );
+        return;
+    }
     let blame = match &app.overlay {
         Overlay::Blame {
             author,
@@ -89,17 +122,19 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 )
             }));
             let title = match (*kind, *searching) {
-                (SearchKind::Find, true) => " Find (searching) ",
-                _ => " Find ",
+                (SearchKind::Find, true) => " Open (searching) ",
+                _ => " Open ",
             };
             let list_area = render_list(
                 frame,
                 frame.area(),
                 title,
-                &format!(" {query} "),
+                query,
                 &items,
                 *selected,
                 *scroll,
+                true,
+                true,
                 true,
                 theme,
             );
@@ -199,6 +234,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 *selected,
                 0,
                 false,
+                false,
+                false,
                 theme,
             );
         }
@@ -247,6 +284,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         | Overlay::TypesNote
         | Overlay::Blame { .. }
         | Overlay::ContextMenu { .. }
+        | Overlay::Branches { .. }
         | Overlay::None => {}
     }
 }
@@ -478,7 +516,7 @@ pub(crate) fn shortcut_rows(git: bool) -> Vec<(&'static str, &'static str)> {
     let mut rows = vec![
         ("Ctrl+/", "Show this list"),
         ("Ctrl+S", "Save"),
-        ("Ctrl+P", "Find file from selection"),
+        ("Ctrl+P", "Open file from selection"),
         ("Click Search", "Search the repo"),
         ("Ctrl+F", "Search this file"),
         ("Click File / Global", "Switch search scope"),
@@ -746,7 +784,7 @@ fn render_content_search(frame: &mut Frame, app: &mut App, theme: Theme) {
     let count_w = UnicodeWidthStr::width(count.as_str()) as u16;
     let query_w = query_area.width.saturating_sub(count_w);
     frame.render_widget(
-        Paragraph::new(format!(" {query}")).style(theme.text()),
+        Paragraph::new(search_query_line(&query, theme)).style(theme.text()),
         Rect {
             x: query_area.x,
             y: query_area.y,
@@ -911,6 +949,140 @@ fn draw_rule(frame: &mut Frame, area: Rect, y: u16, theme: Theme) {
     );
 }
 
+fn render_branches(
+    frame: &mut Frame,
+    app: &mut App,
+    theme: Theme,
+    query: &str,
+    branches: &[String],
+    selected: usize,
+    scroll: usize,
+    loading: bool,
+    error: Option<&str>,
+) {
+    let filtered = crate::workspace::filter_branches(branches, query);
+    let creating = !loading && filtered.is_empty() && !query.trim().is_empty();
+    let items: Vec<String> = if creating {
+        vec![format!("Create {}", query.trim())]
+    } else if loading {
+        Vec::new()
+    } else {
+        filtered
+    };
+    let anchor_x = app
+        .status_hits
+        .iter()
+        .find(|hit| hit.action == crate::app::state::StatusAction::Git)
+        .map(|hit| hit.x)
+        .unwrap_or(frame.area().x);
+    let area = above_status(
+        frame.area(),
+        anchor_x,
+        if error.is_some() { 20 } else { 19 },
+        70,
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(theme.panel(" Branch ", false), area);
+    app.overlay_area = Some((area.x, area.y, area.width, area.height));
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let mut row_y = inner.y;
+    if inner.width > 0 && inner.height > 0 {
+        frame.render_widget(
+            Paragraph::new(search_query_line(query, theme)).style(theme.text()),
+            Rect {
+                x: inner.x,
+                y: row_y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+        row_y = row_y.saturating_add(1);
+    }
+    if let Some(error) = error
+        && inner.width > 0
+        && row_y < inner.bottom()
+    {
+        let text = fit_width(&error.replace('\n', " "), inner.width as usize);
+        frame.render_widget(
+            Paragraph::new(text).style(Style::default().fg(theme.deleted)),
+            Rect {
+                x: inner.x,
+                y: row_y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+        row_y = row_y.saturating_add(1);
+    }
+    let show_rule = inner.bottom().saturating_sub(row_y) >= 2;
+    if show_rule {
+        draw_rule(frame, area, row_y, theme);
+        row_y = row_y.saturating_add(1);
+    }
+    let list_area = Rect {
+        x: inner.x,
+        y: row_y,
+        width: inner.width,
+        height: inner.bottom().saturating_sub(row_y),
+    };
+    let height = list_area.height as usize;
+    app.search_list_rows = height;
+    let start = scroll.min(items.len().saturating_sub(height.max(1)));
+    let end = (start + height).min(items.len());
+    let mut hits = Vec::new();
+    if loading && list_area.width > 0 && list_area.height > 0 {
+        frame.render_widget(
+            Paragraph::new(" Loading").style(Style::default().fg(theme.fg_muted)),
+            list_area,
+        );
+    }
+    let list_items: Vec<ListItem> = items[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, item)| {
+            if list_area.width > 0 {
+                hits.push((start + offset, list_area.y.saturating_add(offset as u16)));
+            }
+            let on = start + offset == selected;
+            let style = if creating {
+                Style::default()
+                    .fg(theme.on_accent)
+                    .bg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else if on {
+                Style::default().fg(theme.fg).bg(theme.bg_selected)
+            } else {
+                Style::default().fg(theme.fg)
+            };
+            let shown = if creating {
+                let width = list_area.width as usize;
+                let text_width = UnicodeWidthStr::width(item.as_str());
+                if width == 0 || text_width >= width {
+                    fit_width(item, width)
+                } else {
+                    format!("{item}{}", " ".repeat(width - text_width))
+                }
+            } else {
+                item.clone()
+            };
+            ListItem::new(Span::styled(shown, style))
+        })
+        .collect();
+    if !loading && list_area.width > 0 && list_area.height > 0 {
+        frame.render_widget(List::new(list_items), list_area);
+    }
+    app.search_rows = hits;
+    app.search_row_span = (list_area.width > 0).then_some((list_area.x, list_area.width));
+}
+
+fn search_query_line(query: &str, theme: Theme) -> Line<'static> {
+    let text = theme.text();
+    Line::from(vec![
+        Span::styled(" ⌕ ", text.fg(theme.fg_muted)),
+        Span::styled(query.to_string(), text),
+    ])
+}
+
 fn render_list(
     frame: &mut Frame,
     full: Rect,
@@ -920,16 +1092,27 @@ fn render_list(
     selected: usize,
     scroll: usize,
     rule: bool,
+    search: bool,
+    at_top: bool,
     theme: Theme,
 ) -> ListArea {
-    let area = center(full, if rule { 19 } else { 18 }, 70);
+    let area = if at_top {
+        top_box(full, 16, 70)
+    } else {
+        center(full, if rule { 19 } else { 18 }, 70)
+    };
     frame.render_widget(Clear, area);
     frame.render_widget(theme.panel(title, false), area);
     let inner = Block::default().borders(Borders::ALL).inner(area);
     let ruled = rule && inner.height >= 3;
     if inner.width > 0 && inner.height > 0 {
+        let line = if search {
+            search_query_line(query, theme)
+        } else {
+            Line::from(Span::styled(query.to_string(), theme.text()))
+        };
         frame.render_widget(
-            Paragraph::new(query.to_string()).style(theme.text()),
+            Paragraph::new(line).style(theme.text()),
             Rect {
                 x: inner.x,
                 y: inner.y,
@@ -1054,6 +1237,20 @@ fn fit_width(text: &str, max_width: usize) -> String {
     }
     out.push('…');
     out
+}
+
+fn above_status(area: Rect, anchor_x: u16, height: u16, width: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(2)).max(10);
+    let height = height.min(area.height.saturating_sub(2)).max(3);
+    Rect {
+        x: anchor_x.min(area.right().saturating_sub(width)),
+        y: area
+            .bottom()
+            .saturating_sub(height.saturating_add(1))
+            .max(area.y),
+        width,
+        height,
+    }
 }
 
 fn center(area: Rect, height: u16, width: u16) -> Rect {

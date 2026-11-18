@@ -144,6 +144,8 @@ async fn main() -> anyhow::Result<()> {
     let mut app = App::new(root, lsp);
     let (search_tx, mut search_rx) = mpsc::unbounded_channel();
     app.search_tx = search_tx;
+    let (branch_tx, mut branch_rx) = mpsc::unbounded_channel();
+    app.branch_tx = branch_tx;
     let (git_status_tx, mut git_status_rx) = mpsc::unbounded_channel();
     app.git_status_tx = git_status_tx;
     let (blame_tx, mut blame_rx) = mpsc::unbounded_channel();
@@ -186,6 +188,11 @@ async fn main() -> anyhow::Result<()> {
             results = search_rx.recv() => {
                 if let Some(results) = results {
                     app::events::handle_search_results(&mut app, results);
+                }
+            }
+            branches = branch_rx.recv() => {
+                if let Some(branches) = branches {
+                    app.receive_branches(branches);
                 }
             }
             statuses = git_status_rx.recv() => {

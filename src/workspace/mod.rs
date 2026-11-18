@@ -1128,6 +1128,8 @@ pub enum GitWrite {
     Pull,
     Push,
     Publish(String),
+    Switch(String),
+    CreateBranch(String),
     Restore(PathBuf),
     Remove(PathBuf),
 }
@@ -1215,6 +1217,24 @@ pub fn prepare_git_write(root: &Path, write: &GitWrite) -> Result<GitArgv, Strin
                 stdin: None,
             })
         }
+        GitWrite::Switch(branch) => {
+            if let Some(message) = branch_name_error(branch) {
+                return Err(message.into());
+            }
+            Ok(GitArgv {
+                args: vec!["switch".into(), branch.clone()],
+                stdin: None,
+            })
+        }
+        GitWrite::CreateBranch(branch) => {
+            if let Some(message) = branch_name_error(branch) {
+                return Err(message.into());
+            }
+            Ok(GitArgv {
+                args: vec!["switch".into(), "-c".into(), branch.clone()],
+                stdin: None,
+            })
+        }
         GitWrite::Restore(path) => {
             let rel = repo_relative(root, path)
                 .ok_or_else(|| "Path is outside the project".to_string())?;
@@ -1248,6 +1268,72 @@ fn publishable_branch(branch: &str) -> bool {
         && !branch.contains("..")
 }
 
+pub fn branch_name_error(branch: &str) -> Option<&'static str> {
+    if publishable_branch(branch) {
+        None
+    } else {
+        Some("Branch name is invalid")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BranchList {
+    pub generation: u64,
+    pub names: Vec<String>,
+}
+
+pub fn parse_local_branches(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn filter_branches(names: &[String], query: &str) -> Vec<String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return names.to_vec();
+    }
+    let needle = query.to_lowercase();
+    names
+        .iter()
+        .filter(|name| name.to_lowercase().contains(&needle))
+        .cloned()
+        .collect()
+}
+
+pub fn branch_choice_count(names: &[String], query: &str, loading: bool) -> usize {
+    if loading {
+        return 0;
+    }
+    let matches = filter_branches(names, query).len();
+    if matches > 0 {
+        matches
+    } else if query.trim().is_empty() {
+        0
+    } else {
+        1
+    }
+}
+
+pub fn spawn_local_branches(root: PathBuf, generation: u64, tx: mpsc::UnboundedSender<BranchList>) {
+    tokio::spawn(async move {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+            .output()
+            .await;
+        let names = match output {
+            Ok(output) if output.status.success() => parse_local_branches(&output.stdout),
+            _ => Vec::new(),
+        };
+        let _ = tx.send(BranchList { generation, names });
+    });
+}
+
 #[derive(Clone, Debug)]
 pub struct GitWriteResult {
     pub ok: bool,
@@ -1257,6 +1343,7 @@ pub struct GitWriteResult {
     pub committed: Option<String>,
     pub committed_body: Option<String>,
     pub notice: Option<String>,
+    pub branch: bool,
 }
 
 pub fn spawn_git_write(root: PathBuf, write: GitWrite, tx: mpsc::UnboundedSender<GitWriteResult>) {
@@ -1272,8 +1359,10 @@ pub fn spawn_git_write(root: PathBuf, write: GitWrite, tx: mpsc::UnboundedSender
                 committed: None,
                 committed_body: None,
                 notice: None,
+                branch: false,
             },
         };
+        result.branch = matches!(write, GitWrite::Switch(_) | GitWrite::CreateBranch(_));
         if result.ok {
             match &write {
                 GitWrite::Commit { message, body } => {
@@ -1282,6 +1371,8 @@ pub fn spawn_git_write(root: PathBuf, write: GitWrite, tx: mpsc::UnboundedSender
                 }
                 GitWrite::Pull => result.notice = Some("Pulled".into()),
                 GitWrite::Push | GitWrite::Publish(_) => result.notice = Some("Pushed".into()),
+                GitWrite::Switch(name) => result.notice = Some(format!("Switched to {name}")),
+                GitWrite::CreateBranch(name) => result.notice = Some(format!("Created {name}")),
                 GitWrite::Apply { reload, .. } => result.reload = reload.clone(),
                 GitWrite::Restore(path) => result.reload = Some(path.clone()),
                 GitWrite::Remove(path) => result.close_path = Some(path.clone()),
@@ -1335,6 +1426,7 @@ fn git_finished(output: std::process::Output) -> GitWriteResult {
             committed: None,
             committed_body: None,
             notice: None,
+            branch: false,
         }
     } else {
         let message = String::from_utf8_lossy(&output.stderr)
@@ -1357,6 +1449,7 @@ fn git_failed(message: String) -> GitWriteResult {
         committed: None,
         committed_body: None,
         notice: None,
+        branch: false,
     }
 }
 
@@ -2683,6 +2776,25 @@ diff --git a/readme.md b/readme.md
         assert_eq!(publish.args, ["push", "-u", "origin", "main"]);
         assert!(prepare_git_write(root, &GitWrite::Publish(String::new())).is_err());
         assert!(prepare_git_write(root, &GitWrite::Publish("--force".into())).is_err());
+        let switch = prepare_git_write(root, &GitWrite::Switch("topic".into())).unwrap();
+        assert_eq!(switch.args, ["switch", "topic"]);
+        let create = prepare_git_write(root, &GitWrite::CreateBranch("topic".into())).unwrap();
+        assert_eq!(create.args, ["switch", "-c", "topic"]);
+        assert!(prepare_git_write(root, &GitWrite::Switch("--force".into())).is_err());
+        assert!(prepare_git_write(root, &GitWrite::CreateBranch("bad name".into())).is_err());
+        assert!(prepare_git_write(root, &GitWrite::CreateBranch("a..b".into())).is_err());
+        let names = vec!["main".to_string(), "feature".to_string()];
+        assert_eq!(filter_branches(&names, ""), names);
+        assert_eq!(filter_branches(&names, "FEA"), vec!["feature".to_string()]);
+        assert!(filter_branches(&names, "zzz").is_empty());
+        assert_eq!(branch_choice_count(&names, "zzz", false), 1);
+        assert_eq!(branch_choice_count(&names, "zzz", true), 0);
+        assert_eq!(branch_choice_count(&names, "", false), 2);
+        assert_eq!(branch_choice_count(&names, "   ", false), 2);
+        assert_eq!(
+            parse_local_branches(b"main\nfeature/one\n\n"),
+            vec!["main".to_string(), "feature/one".to_string()]
+        );
         assert_eq!(branch_chip("main", Some((2, 1))), "main ↑2 ↓1");
         assert_eq!(branch_chip("main", None), "main");
         assert_eq!(parse_ahead_behind(b"2\t1\n"), Some((2, 1)));

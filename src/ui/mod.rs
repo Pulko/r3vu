@@ -79,11 +79,44 @@ mod tests {
     use ratatui::style::Color;
     use tokio::sync::mpsc;
 
-    use crate::app::state::{App, Focus, Overlay};
+    use crate::app::state::{App, Focus, Overlay, SearchKind, SearchScope};
     use crate::language::LanguageClient;
     use crate::workspace::{ConflictKind, GitFileStatus, GitPathStatus};
 
     use super::draw;
+
+    #[test]
+    fn open_popup_shares_the_search_popup_place() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(PathBuf::from("."), LanguageClient { tx });
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        app.overlay = Overlay::Search {
+            kind: SearchKind::Content,
+            scope: SearchScope::Global,
+            query: String::new(),
+            files: Vec::new(),
+            matches: Vec::new(),
+            file_matches: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            searching: false,
+        };
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let search = app.overlay_area.expect("search popup");
+        app.overlay = Overlay::Search {
+            kind: SearchKind::Find,
+            scope: SearchScope::Global,
+            query: String::new(),
+            files: Vec::new(),
+            matches: Vec::new(),
+            file_matches: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            searching: false,
+        };
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.overlay_area.expect("open popup"), search);
+    }
 
     #[test]
     fn focused_thread_pane_uses_the_accent_border() {
@@ -133,6 +166,35 @@ mod tests {
         let (x, y, _) = app.pane_mark.expect("pane mark");
         assert_eq!((x, y), (0, 0));
         assert_eq!(terminal.backend().buffer()[(x, y)].symbol(), "◧");
+    }
+
+    #[test]
+    fn branch_picker_sits_on_the_branch_name() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(PathBuf::from("."), LanguageClient { tx });
+        app.git_repo = true;
+        app.git_branch = Some("main".into());
+        app.overlay = Overlay::Branches {
+            query: String::new(),
+            branches: vec!["main".into()],
+            selected: 0,
+            scroll: 0,
+            generation: 1,
+            loading: false,
+            error: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let (x, y, _, height) = app.overlay_area.expect("branch picker");
+        let chip = app
+            .status_hits
+            .iter()
+            .find(|hit| hit.action == crate::app::state::StatusAction::Git)
+            .expect("branch chip");
+        assert_eq!(x, chip.x);
+        assert_eq!(y + height, app.status_area.1);
+        assert!(buffer_text(terminal.backend().buffer()).contains("Branch"));
+        assert!(buffer_text(terminal.backend().buffer()).contains("⌕"));
     }
 
     #[test]

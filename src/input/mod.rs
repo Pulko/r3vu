@@ -89,7 +89,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('c') | KeyCode::Char('C') => return commands::copy(app),
             KeyCode::Char('x') | KeyCode::Char('X') => return commands::cut(app),
             KeyCode::Char('v') | KeyCode::Char('V') => {
-                if matches!(app.overlay, Overlay::Search { .. } | Overlay::Prompt { .. }) {
+                if matches!(
+                    app.overlay,
+                    Overlay::Search { .. } | Overlay::Prompt { .. } | Overlay::Branches { .. }
+                ) {
                     let text = app.clipboard.paste();
                     commands::overlay_insert(app, &text);
                 } else {
@@ -374,6 +377,21 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                 }
                 commands::dismiss_overlay(app);
             }
+            if matches!(app.overlay, Overlay::Branches { .. }) {
+                if commands::click_branch_row(app, x, y) {
+                    commands::overlay_submit(app);
+                    return;
+                }
+                if in_rect(app.overlay_area, x, y) {
+                    return;
+                }
+                commands::dismiss_overlay(app);
+                if let Some(Some(action)) = status_hit
+                    && action == crate::app::state::StatusAction::Git
+                {
+                    return;
+                }
+            }
             if let Some(scope) = app
                 .search_scope_hits
                 .iter()
@@ -457,7 +475,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                     crate::app::state::StatusAction::Theme => commands::open_themes(app),
                     crate::app::state::StatusAction::Help => commands::open_help(app),
                     crate::app::state::StatusAction::Types => commands::click_types_status(app),
-                    crate::app::state::StatusAction::Git => app.toggle_git(),
+                    crate::app::state::StatusAction::Git => app.open_branch_picker(),
                     crate::app::state::StatusAction::Agent => {
                         if commands::claude_ready(app) {
                             if app.thread.running {
@@ -695,6 +713,12 @@ fn dispatch_wheel(
     if matches!(app.overlay, Overlay::Search { .. }) && in_rect(app.overlay_area, x, y) {
         if let WheelAxis::Vertical(delta) = axis {
             commands::scroll_search(app, delta);
+        }
+        return;
+    }
+    if matches!(app.overlay, Overlay::Branches { .. }) && in_rect(app.overlay_area, x, y) {
+        if let WheelAxis::Vertical(delta) = axis {
+            commands::scroll_branches(app, delta);
         }
         return;
     }

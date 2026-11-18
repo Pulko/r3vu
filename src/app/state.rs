@@ -191,6 +191,15 @@ pub enum Overlay {
         x: u16,
         y: u16,
     },
+    Branches {
+        query: String,
+        branches: Vec<String>,
+        selected: usize,
+        scroll: usize,
+        generation: u64,
+        loading: bool,
+        error: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -379,6 +388,8 @@ pub struct App {
     pub hover_anchor: Option<(u64, u16, u16, Position)>,
     pub search_generation: u64,
     pub search_tx: mpsc::UnboundedSender<crate::workspace::WorkspaceSearch>,
+    pub branch_tx: mpsc::UnboundedSender<crate::workspace::BranchList>,
+    branch_generation: u64,
     pub git_status_tx: mpsc::UnboundedSender<crate::workspace::GitStatusUpdate>,
     pub blame_tx: mpsc::UnboundedSender<crate::workspace::BlameUpdate>,
     blame_at: Option<Instant>,
@@ -447,6 +458,8 @@ impl App {
         expanded.insert(root.clone());
         let (search_tx, _search_rx) = mpsc::unbounded_channel();
         drop(_search_rx);
+        let (branch_tx, branch_rx) = mpsc::unbounded_channel();
+        drop(branch_rx);
         let (git_status_tx, git_status_rx) = mpsc::unbounded_channel();
         drop(git_status_rx);
         let (blame_tx, blame_rx) = mpsc::unbounded_channel();
@@ -508,6 +521,8 @@ impl App {
             hover_anchor: None,
             search_generation: 0,
             search_tx,
+            branch_tx,
+            branch_generation: 0,
             git_status_tx,
             blame_tx,
             blame_at: None,
@@ -823,6 +838,68 @@ impl App {
         }
         self.turn_status_wait = false;
         self.open_turn_files();
+    }
+
+    pub fn open_branch_picker(&mut self) {
+        if matches!(self.overlay, Overlay::Branches { .. }) {
+            self.overlay = Overlay::None;
+            return;
+        }
+        self.branch_generation = self.branch_generation.wrapping_add(1);
+        let generation = self.branch_generation;
+        self.overlay = Overlay::Branches {
+            query: String::new(),
+            branches: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            generation,
+            loading: true,
+            error: None,
+        };
+        crate::workspace::spawn_local_branches(
+            self.root.clone(),
+            generation,
+            self.branch_tx.clone(),
+        );
+    }
+
+    pub fn receive_branches(&mut self, update: crate::workspace::BranchList) {
+        let Overlay::Branches {
+            generation,
+            query,
+            scroll,
+            error,
+            ..
+        } = &self.overlay
+        else {
+            return;
+        };
+        if *generation != update.generation {
+            return;
+        }
+        let query = query.clone();
+        let error = error.clone();
+        let scroll = *scroll;
+        let names = update.names;
+        let selected = if query.trim().is_empty() {
+            self.git_branch
+                .as_ref()
+                .and_then(|name| names.iter().position(|branch| branch == name))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let len = crate::workspace::branch_choice_count(&names, &query, false);
+        let selected = if len == 0 { 0 } else { selected.min(len - 1) };
+        self.overlay = Overlay::Branches {
+            query,
+            branches: names,
+            selected,
+            scroll,
+            generation: update.generation,
+            loading: false,
+            error,
+        };
     }
 
     pub fn receive_git_status(&mut self, result: crate::workspace::GitStatusUpdate) {
@@ -2916,5 +2993,64 @@ mod tests {
             assert!(blame.uncommitted);
             assert!(!app.blame_running);
         });
+    }
+
+    #[test]
+    fn branch_list_selects_the_current_branch_and_ignores_stale_results() {
+        let mut app = test_app();
+        app.git_branch = Some("topic".into());
+        app.overlay = Overlay::Branches {
+            query: String::new(),
+            branches: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            generation: 3,
+            loading: true,
+            error: None,
+        };
+        app.receive_branches(crate::workspace::BranchList {
+            generation: 2,
+            names: vec!["other".into()],
+        });
+        assert!(matches!(
+            app.overlay,
+            Overlay::Branches { loading: true, .. }
+        ));
+        app.receive_branches(crate::workspace::BranchList {
+            generation: 3,
+            names: vec!["main".into(), "topic".into()],
+        });
+        match app.overlay {
+            Overlay::Branches {
+                selected,
+                loading,
+                branches,
+                ..
+            } => {
+                assert!(!loading);
+                assert_eq!(selected, 1);
+                assert_eq!(branches, vec!["main".to_string(), "topic".to_string()]);
+            }
+            _ => panic!("branch list should replace the loading modal"),
+        }
+    }
+
+    #[test]
+    fn branch_submit_waits_until_git_is_free() {
+        let mut app = test_app();
+        app.git_write_running = true;
+        app.git_branch = Some("main".into());
+        app.overlay = Overlay::Branches {
+            query: String::new(),
+            branches: vec!["main".into(), "topic".into()],
+            selected: 1,
+            scroll: 0,
+            generation: 1,
+            loading: false,
+            error: None,
+        };
+        crate::app::commands::overlay_submit(&mut app);
+        assert!(matches!(app.overlay, Overlay::Branches { selected: 1, .. }));
+        assert!(app.git_write_queue.is_empty());
     }
 }

@@ -18,7 +18,7 @@ Click to place the cursor. Type to insert. There are no modes.
 | Action | Shortcut |
 | --- | --- |
 | Save | Ctrl+S |
-| Find | Ctrl+P |
+| Open | Ctrl+P |
 | Search in file | Ctrl+F |
 | Go to definition | Ctrl+Enter or Ctrl+Click |
 | Ask Claude | Option+T |
@@ -36,7 +36,7 @@ Click to place the cursor. Type to insert. There are no modes.
 | Shortcuts | Ctrl+/ |
 | Close a popup | Esc |
 
-Click **Find** above the explorer, or press Ctrl+P, to find a file by name and then matching text. Click **Search** there to search text across the repo. That skips `node_modules`, `.git`, and gitignored paths. Click **Help** in the status bar for the shortcut list. Click the theme name there to choose `p0`, `light`, `contrast`, `ocean`, or `ember`.
+Click **Open** above the explorer, or press Ctrl+P, to open a file by name and then matching text. Click **Search** there to search text across the repo. That skips `node_modules`, `.git`, and gitignored paths. Click **Help** in the status bar for the shortcut list. Click the theme name there to choose `p0`, `light`, `contrast`, `ocean`, or `ember`.
 
 Claude is off until you turn it on. Open **Help** and click the Claude row. After that, click **Claude** in the status bar to show or hide the thread pane. Option+T anchors a conversation to the selection, or to the cursor line, and waits for Enter. Option+E asks for one edit instruction. A running turn can be stopped from that status segment or from **Stop** in the pane. Claude has to be installed and logged in; the editor does not start a turn until you ask.
 

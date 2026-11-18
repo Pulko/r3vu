@@ -114,7 +114,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             .git_status
             .values()
             .any(|status| status.conflict.is_some());
-        let branch_style = if conflicted {
+        let branch_style = if matches!(app.overlay, Overlay::Branches { .. }) {
+            Style::default()
+                .fg(theme.on_accent)
+                .bg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else if conflicted {
             Style::default()
                 .fg(theme.deleted)
                 .add_modifier(Modifier::BOLD)

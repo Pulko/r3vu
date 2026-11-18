@@ -497,6 +497,7 @@ pub(crate) fn shortcut_rows(git: bool) -> Vec<(&'static str, &'static str)> {
             ("Space", "Stage or unstage the file"),
             ("Click ▾", "Fold or unfold a change"),
             ("Click Stage", "Stage, unstage, discard, or revert a hunk"),
+            ("Click Current", "Keep a side, then save and stage the file"),
         ]);
     }
     rows.extend([

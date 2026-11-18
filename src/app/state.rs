@@ -15,8 +15,8 @@ use crate::language::{
 };
 use crate::syntax::SyntaxService;
 use crate::workspace::{
-    ExplorerEntry, FileBaselines, FileDiffResult, FileFinder, GitDiffResult, GitPathStatus,
-    GitWrite, GitWriteResult, LineChanges, ParsedGitDiff, SearchMatch,
+    ExplorerEntry, FileBaselines, FileDiffResult, FileFinder, GitDiffResult, GitFileStatus,
+    GitPathStatus, GitWrite, GitWriteResult, LineChanges, ParsedGitDiff, SearchMatch,
 };
 
 use super::config::Config;
@@ -47,6 +47,7 @@ pub enum ConfirmAction {
     DiscardHunk { patch: String, path: PathBuf },
     RestoreFile(PathBuf),
     DiscardAdded(PathBuf),
+    ResolveDelete(PathBuf),
 }
 
 #[derive(Clone, Debug)]
@@ -209,6 +210,11 @@ pub enum HunkAction {
     Discard,
     Revert,
     Fold,
+    Current,
+    Incoming,
+    Both,
+    KeepFile,
+    DeleteFile,
 }
 
 #[derive(Clone, Debug)]
@@ -223,6 +229,7 @@ pub enum GitClick {
     UnstageAll,
     Toggle { path: PathBuf, staged: bool },
     Open { path: PathBuf, staged: bool },
+    DeleteConflict { path: PathBuf },
 }
 
 #[derive(Clone, Debug)]
@@ -862,7 +869,7 @@ impl App {
             }
             self.pump_git_status();
         }
-        let rows = crate::workspace::git_panel_rows(&self.git_status);
+        let rows = self.git_rows();
         if !rows
             .get(self.git_selected)
             .is_some_and(|row| matches!(row, crate::workspace::GitPanelRow::File { .. }))
@@ -973,9 +980,20 @@ impl App {
 
     pub fn stage_path(&mut self, path: PathBuf) {
         self.git_publish_armed = false;
+        if self.conflict_blocks(&path) {
+            self.message = Some("Resolve the conflicts first".into());
+            return;
+        }
         if self.buffer_dirty(&path) {
             self.message = Some("Save first".into());
             return;
+        }
+        let finishing = self
+            .git_status
+            .get(&path)
+            .is_some_and(|status| status.conflict.is_some());
+        if finishing {
+            self.message = Some("Staged. Commit to finish the conflict.".into());
         }
         self.enqueue_git_write(GitWrite::Stage(path));
     }
@@ -1001,6 +1019,36 @@ impl App {
         self.git_publish_armed = false;
         if self.dirty_change() {
             self.message = Some("Save first".into());
+            return;
+        }
+        let blocked = self
+            .git_status
+            .keys()
+            .any(|path| self.conflict_blocks(path));
+        if blocked {
+            let paths: Vec<_> = self
+                .git_status
+                .iter()
+                .filter_map(|(path, status)| {
+                    if self.conflict_blocks(path) {
+                        return None;
+                    }
+                    if status.unstaged.is_some()
+                        || status.conflict == Some(crate::workspace::ConflictKind::Both)
+                    {
+                        Some(path.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if paths.is_empty() {
+                self.message = Some("Resolve the conflicts first".into());
+                return;
+            }
+            for path in paths {
+                self.enqueue_git_write(GitWrite::Stage(path));
+            }
             return;
         }
         if !self
@@ -1033,6 +1081,25 @@ impl App {
 
     pub fn commit_git(&mut self) {
         self.git_publish_armed = false;
+        if self
+            .git_status
+            .values()
+            .any(|status| status.conflict.is_some())
+        {
+            let unresolved = self
+                .git_status
+                .keys()
+                .any(|path| self.conflict_blocks(path));
+            self.message = Some(
+                if unresolved {
+                    "Resolve the conflicts first"
+                } else {
+                    "Stage the resolved files"
+                }
+                .into(),
+            );
+            return;
+        }
         if !crate::workspace::can_commit(&self.git_message, &self.git_status) {
             self.message = Some(if self.git_message.trim().is_empty() {
                 "Write a commit message".into()
@@ -1089,6 +1156,18 @@ impl App {
             self.revert_hunk_at_line(id, anchor);
             return;
         }
+        if let Some(choice) = conflict_choice(action) {
+            self.resolve_conflict(anchor, choice);
+            return;
+        }
+        if action == HunkAction::KeepFile {
+            self.keep_conflict_file();
+            return;
+        }
+        if action == HunkAction::DeleteFile {
+            self.confirm_delete_conflict();
+            return;
+        }
         let Some(path) = self.documents.get(&id).and_then(|doc| doc.path.clone()) else {
             self.message = Some("Git diff requires a saved file".into());
             return;
@@ -1130,7 +1209,13 @@ impl App {
                     .as_ref()
                     .and_then(|diff| crate::workspace::patch_touching(diff, start, end))
             }
-            HunkAction::Revert | HunkAction::Fold => None,
+            HunkAction::Revert
+            | HunkAction::Fold
+            | HunkAction::Current
+            | HunkAction::Incoming
+            | HunkAction::Both
+            | HunkAction::KeepFile
+            | HunkAction::DeleteFile => None,
         };
         let Some(patch) = patch else {
             self.git_publish_armed = false;
@@ -1157,7 +1242,13 @@ impl App {
                     action: ConfirmAction::DiscardHunk { patch, path },
                 };
             }
-            HunkAction::Revert | HunkAction::Fold => {}
+            HunkAction::Revert
+            | HunkAction::Fold
+            | HunkAction::Current
+            | HunkAction::Incoming
+            | HunkAction::Both
+            | HunkAction::KeepFile
+            | HunkAction::DeleteFile => {}
         }
     }
 
@@ -1874,6 +1965,214 @@ impl App {
         }
     }
 
+    pub fn git_rows(&self) -> Vec<crate::workspace::GitPanelRow> {
+        crate::workspace::git_panel_rows(&self.presented_git_status())
+    }
+
+    fn presented_git_status(&self) -> HashMap<PathBuf, GitPathStatus> {
+        let mut files = self.git_status.clone();
+        let resolved: Vec<PathBuf> = files
+            .iter()
+            .filter(|(path, status)| {
+                status.conflict == Some(crate::workspace::ConflictKind::Both)
+                    && !self.path_has_conflict_markers(path)
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in resolved {
+            files.insert(
+                path,
+                GitPathStatus {
+                    staged: None,
+                    unstaged: Some(GitFileStatus::Modified),
+                    conflict: None,
+                },
+            );
+        }
+        files
+    }
+
+    pub fn conflict_blocks(&self, path: &Path) -> bool {
+        let Some(status) = self.git_status.get(path) else {
+            return false;
+        };
+        match status.conflict {
+            None => false,
+            Some(crate::workspace::ConflictKind::Both) => self.path_has_conflict_markers(path),
+            Some(_) => true,
+        }
+    }
+
+    fn path_has_conflict_markers(&self, path: &Path) -> bool {
+        let lines = if let Some(doc) = self
+            .documents
+            .values()
+            .find(|doc| doc.path.as_deref() == Some(path))
+        {
+            rope_lines(&doc.rope)
+        } else {
+            let Ok(bytes) = std::fs::read(path) else {
+                return true;
+            };
+            if bytes.contains(&0) {
+                return true;
+            }
+            let Ok(text) = String::from_utf8(bytes) else {
+                return true;
+            };
+            crate::editor::editor_lines(&text)
+        };
+        !crate::workspace::conflict_regions(&lines).is_empty()
+    }
+
+    pub fn conflict_view(
+        &self,
+        document_id: DocumentId,
+    ) -> (Vec<crate::workspace::ConflictRegion>, bool) {
+        let Some(doc) = self.documents.get(&document_id) else {
+            return (Vec::new(), false);
+        };
+        let Some(path) = doc.path.as_ref() else {
+            return (Vec::new(), false);
+        };
+        let Some(kind) = self.git_status.get(path).and_then(|status| status.conflict) else {
+            return (Vec::new(), false);
+        };
+        let regions = crate::workspace::conflict_regions(&rope_lines(&doc.rope));
+        match kind {
+            crate::workspace::ConflictKind::Both => (regions, false),
+            crate::workspace::ConflictKind::KeepOrDelete if regions.is_empty() => {
+                (Vec::new(), true)
+            }
+            crate::workspace::ConflictKind::KeepOrDelete => (regions, false),
+            crate::workspace::ConflictKind::Deleted => (Vec::new(), false),
+        }
+    }
+
+    pub fn resolve_conflict(&mut self, anchor: usize, choice: crate::workspace::ConflictChoice) {
+        let Some(id) = self.active else {
+            return;
+        };
+        let Some(doc) = self.documents.get(&id) else {
+            return;
+        };
+        let lines = rope_lines(&doc.rope);
+        let Some(region) = crate::workspace::conflict_regions(&lines)
+            .into_iter()
+            .find(|region| region.start == anchor)
+        else {
+            return;
+        };
+        let len = doc.rope.len_lines();
+        let trailing = if region.end < len {
+            true
+        } else if region.end_marker < len {
+            let raw = doc.rope.line(region.end_marker).to_string();
+            raw.ends_with('\n') || raw.ends_with('\r')
+        } else {
+            false
+        };
+        let text = crate::workspace::conflict_replacement(&lines, &region, choice, trailing);
+        let end = if region.end >= len {
+            document_end(&doc.rope)
+        } else {
+            Position::new(region.end, 0)
+        };
+        let Some(doc) = self.documents.get_mut(&id) else {
+            return;
+        };
+        let change = doc.apply_replace(
+            Range::new(Position::new(region.start, 0), end),
+            &text,
+            false,
+        );
+        if let Some(view) = self.views.get_mut(&id) {
+            view.cursor = Position::new(region.start, 0);
+            view.selection = None;
+            view.preferred_column = None;
+        }
+        self.apply_changes(vec![change]);
+        let left = self
+            .documents
+            .get(&id)
+            .map(|doc| crate::workspace::conflict_regions(&rope_lines(&doc.rope)).len())
+            .unwrap_or(0);
+        self.message = Some(if left == 0 {
+            "Save, then stage the file to finish the conflict.".into()
+        } else if left == 1 {
+            "1 conflict left".into()
+        } else {
+            format!("{left} conflicts left")
+        });
+    }
+
+    pub fn keep_conflict_file(&mut self) {
+        let Some(path) = self.active_doc().and_then(|doc| doc.path.clone()) else {
+            return;
+        };
+        if self.buffer_dirty(&path) {
+            self.message = Some("Save first".into());
+            return;
+        }
+        self.git_publish_armed = false;
+        self.enqueue_git_write(GitWrite::Stage(path));
+    }
+
+    pub fn confirm_delete_conflict(&mut self) {
+        let Some(path) = self.active_doc().and_then(|doc| doc.path.clone()) else {
+            return;
+        };
+        let name = self.relative(&path);
+        self.overlay = Overlay::Confirm {
+            message: format!("Delete {name}?"),
+            action: ConfirmAction::ResolveDelete(path),
+        };
+    }
+
+    pub fn settle_conflict_cursor(&mut self) {
+        let Some(id) = self.active else {
+            return;
+        };
+        let (conflicts, _) = self.conflict_view(id);
+        if conflicts.is_empty() {
+            return;
+        }
+        let folded: Vec<usize> = self
+            .folded_hunks
+            .iter()
+            .filter(|(doc_id, _)| *doc_id == id)
+            .map(|(_, start)| *start)
+            .collect();
+        let line = self
+            .views
+            .get(&id)
+            .map(|view| view.cursor.line)
+            .unwrap_or(0);
+        let hidden = |line: usize| {
+            conflicts
+                .iter()
+                .any(|region| region.hides(line, folded.contains(&region.start)))
+        };
+        if !hidden(line) {
+            return;
+        }
+        let count = self
+            .documents
+            .get(&id)
+            .map(|doc| doc.rope.len_lines())
+            .unwrap_or(0);
+        let next = (line..count)
+            .find(|line| !hidden(*line))
+            .or_else(|| (0..line).rev().find(|line| !hidden(*line)));
+        if let Some(line) = next
+            && let Some(view) = self.views.get_mut(&id)
+        {
+            view.cursor.line = line;
+            view.cursor.column = 0;
+            view.preferred_column = None;
+        }
+    }
+
     pub fn present_hunks(&self, document_id: DocumentId) -> Vec<crate::workspace::Hunk> {
         let Some(changes) = self.inline_changes.get(&document_id) else {
             return Vec::new();
@@ -1895,14 +2194,23 @@ impl App {
             .get(&document_id)
             .map(|doc| doc.rope.len_lines())
             .unwrap_or(0);
-        let hunks = self.present_hunks(document_id);
         let folded: Vec<usize> = self
             .folded_hunks
             .iter()
             .filter(|(id, _)| *id == document_id)
             .map(|(_, start)| *start)
             .collect();
-        crate::workspace::visual_rows(line_count, &hunks, &folded)
+        let (conflicts, keep_delete) = self.conflict_view(document_id);
+        if conflicts.is_empty() && !keep_delete {
+            let hunks = self.present_hunks(document_id);
+            return crate::workspace::visual_rows(line_count, &hunks, &folded);
+        }
+        let hunks = if keep_delete {
+            Vec::new()
+        } else {
+            self.present_hunks(document_id)
+        };
+        crate::workspace::conflict_view_rows(line_count, &hunks, &folded, &conflicts, keep_delete)
     }
 
     pub fn scroll_to_first_change(&mut self, document_id: DocumentId) {
@@ -2034,6 +2342,29 @@ impl App {
             }
             self.apply_changes(changes);
         }
+    }
+}
+
+fn rope_lines(rope: &ropey::Rope) -> Vec<String> {
+    (0..rope.len_lines())
+        .map(|line| crate::editor::line_text(rope, line))
+        .collect()
+}
+
+fn document_end(rope: &ropey::Rope) -> Position {
+    if rope.len_chars() == 0 {
+        return Position::default();
+    }
+    let line = rope.len_lines() - 1;
+    Position::new(line, crate::editor::line_visible_chars(rope, line))
+}
+
+fn conflict_choice(action: HunkAction) -> Option<crate::workspace::ConflictChoice> {
+    match action {
+        HunkAction::Current => Some(crate::workspace::ConflictChoice::Current),
+        HunkAction::Incoming => Some(crate::workspace::ConflictChoice::Incoming),
+        HunkAction::Both => Some(crate::workspace::ConflictChoice::Both),
+        _ => None,
     }
 }
 
@@ -2302,6 +2633,7 @@ mod tests {
                 GitPathStatus {
                     staged: Some(GitFileStatus::Modified),
                     unstaged: None,
+                    conflict: None,
                 },
             );
             app.open_git_entry(file.clone(), true);
@@ -2329,6 +2661,7 @@ mod tests {
                 GitPathStatus {
                     staged: None,
                     unstaged: Some(GitFileStatus::Deleted),
+                    conflict: None,
                 },
             );
             app.open_git_entry(path.clone(), false);
@@ -2364,6 +2697,7 @@ mod tests {
                 GitPathStatus {
                     staged: None,
                     unstaged: Some(GitFileStatus::Untracked),
+                    conflict: None,
                 },
             );
             app.open_git_entry(path.clone(), false);
@@ -2573,6 +2907,7 @@ mod tests {
                 GitPathStatus {
                     staged: None,
                     unstaged: Some(GitFileStatus::Untracked),
+                    conflict: None,
                 },
             );
             app.blame_at = Some(Instant::now());

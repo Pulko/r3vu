@@ -22,16 +22,32 @@ pub enum GitFileStatus {
     Deleted,
     Untracked,
     Renamed,
+    Conflict,
+}
+
+/// Why a path is unmerged. Porcelain pairs are not ordinary staged or unstaged edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictKind {
+    /// Both sides changed the file. Markers in the worktree name the sides.
+    Both,
+    /// One side kept the file and the other deleted or added it.
+    KeepOrDelete,
+    /// Both sides deleted the file.
+    Deleted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct GitPathStatus {
     pub staged: Option<GitFileStatus>,
     pub unstaged: Option<GitFileStatus>,
+    pub conflict: Option<ConflictKind>,
 }
 
 impl GitPathStatus {
     pub fn summary(self) -> Option<GitFileStatus> {
+        if self.conflict.is_some() {
+            return Some(GitFileStatus::Conflict);
+        }
         self.unstaged.or(self.staged)
     }
 }
@@ -277,6 +293,8 @@ pub enum HunkBar {
     StageUnstageDiscard,
     Revert,
     Renamed,
+    Conflict,
+    KeepOrDelete,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -320,6 +338,226 @@ pub enum VisualRow {
     Bar { anchor: usize },
     Line(usize),
     Removed { text: String, anchor: usize },
+}
+
+/// Anchor for the keep-or-delete bar. It is not a buffer line.
+pub const KEEP_DELETE_ANCHOR: usize = usize::MAX;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictChoice {
+    Current,
+    Incoming,
+    Both,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictSide {
+    Current,
+    Incoming,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConflictRegion {
+    pub start: usize,
+    pub current: (usize, usize),
+    pub base: Option<(usize, usize)>,
+    pub separator: usize,
+    pub incoming: (usize, usize),
+    pub end_marker: usize,
+    pub end: usize,
+}
+
+impl ConflictRegion {
+    pub fn hides(self, line: usize, folded: bool) -> bool {
+        if line == self.start || line == self.separator || line == self.end_marker {
+            return true;
+        }
+        if let Some((start, end)) = self.base {
+            if line == start.saturating_sub(1) || (line >= start && line < end) {
+                return true;
+            }
+        }
+        if folded {
+            let in_current = line >= self.current.0 && line < self.current.1;
+            let in_incoming = line >= self.incoming.0 && line < self.incoming.1;
+            if in_current || in_incoming {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn side(self, line: usize) -> Option<ConflictSide> {
+        if line >= self.current.0 && line < self.current.1 {
+            Some(ConflictSide::Current)
+        } else if line >= self.incoming.0 && line < self.incoming.1 {
+            Some(ConflictSide::Incoming)
+        } else {
+            None
+        }
+    }
+}
+
+pub fn conflict_regions(lines: &[String]) -> Vec<ConflictRegion> {
+    let mut regions = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if marker_kind(&lines[index]) != Some(b'<') {
+            index += 1;
+            continue;
+        }
+        let Some(region) = parse_conflict_at(lines, index) else {
+            index += 1;
+            continue;
+        };
+        index = region.end;
+        regions.push(region);
+    }
+    regions
+}
+
+fn parse_conflict_at(lines: &[String], start: usize) -> Option<ConflictRegion> {
+    let mut cursor = start + 1;
+    let mut base_at = None;
+    let separator = loop {
+        if cursor >= lines.len() {
+            return None;
+        }
+        match marker_kind(&lines[cursor]) {
+            Some(b'|') if base_at.is_none() => {
+                base_at = Some(cursor);
+                cursor += 1;
+            }
+            Some(b'=') => break cursor,
+            Some(b'<') | Some(b'>') => return None,
+            _ => cursor += 1,
+        }
+    };
+    let current_end = base_at.unwrap_or(separator);
+    let base = base_at.map(|at| (at + 1, separator));
+    cursor = separator + 1;
+    let end_marker = loop {
+        if cursor >= lines.len() {
+            return None;
+        }
+        match marker_kind(&lines[cursor]) {
+            Some(b'>') => break cursor,
+            Some(b'<') | Some(b'=') | Some(b'|') => return None,
+            _ => cursor += 1,
+        }
+    };
+    Some(ConflictRegion {
+        start,
+        current: (start + 1, current_end),
+        base,
+        separator,
+        incoming: (separator + 1, end_marker),
+        end_marker,
+        end: end_marker + 1,
+    })
+}
+
+fn marker_kind(line: &str) -> Option<u8> {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let bytes = line.as_bytes();
+    let ch = *bytes.first()?;
+    if !matches!(ch, b'<' | b'=' | b'>' | b'|') {
+        return None;
+    }
+    let count = bytes.iter().take_while(|byte| **byte == ch).count();
+    if count < 7 {
+        return None;
+    }
+    let rest = &line[count..];
+    if rest.is_empty() || rest.starts_with([' ', '\t']) {
+        Some(ch)
+    } else {
+        None
+    }
+}
+
+pub fn conflict_replacement(
+    lines: &[String],
+    region: &ConflictRegion,
+    choice: ConflictChoice,
+    trailing_newline: bool,
+) -> String {
+    let mut picked = Vec::new();
+    let mut take = |range: (usize, usize)| {
+        picked.extend(lines.iter().take(range.1).skip(range.0).map(String::as_str));
+    };
+    match choice {
+        ConflictChoice::Current => take(region.current),
+        ConflictChoice::Incoming => take(region.incoming),
+        ConflictChoice::Both => {
+            take(region.current);
+            take(region.incoming);
+        }
+    }
+    if picked.is_empty() {
+        return String::new();
+    }
+    let mut text = picked.join("\n");
+    if trailing_newline {
+        text.push('\n');
+    }
+    text
+}
+
+pub fn conflict_view_rows(
+    line_count: usize,
+    hunks: &[Hunk],
+    folded: &[usize],
+    conflicts: &[ConflictRegion],
+    keep_delete: bool,
+) -> Vec<VisualRow> {
+    if keep_delete {
+        let mut rows = vec![VisualRow::Bar {
+            anchor: KEEP_DELETE_ANCHOR,
+        }];
+        for index in 0..line_count {
+            rows.push(VisualRow::Line(index));
+        }
+        return rows;
+    }
+    if conflicts.is_empty() {
+        return visual_rows(line_count, hunks, folded);
+    }
+    let mut rows = Vec::new();
+    let mut index = 0;
+    while index < line_count {
+        if let Some(region) = conflicts.iter().find(|region| region.start == index) {
+            rows.push(VisualRow::Bar {
+                anchor: region.start,
+            });
+            if !folded.contains(&region.start) {
+                for line in region.current.0..region.current.1 {
+                    rows.push(VisualRow::Line(line));
+                }
+                for line in region.incoming.0..region.incoming.1 {
+                    rows.push(VisualRow::Line(line));
+                }
+            }
+            index = region.end;
+            continue;
+        }
+        if conflicts
+            .iter()
+            .any(|region| index > region.start && index < region.end)
+        {
+            index += 1;
+            continue;
+        }
+        if let Some(hunk) = hunks.iter().find(|hunk| hunk.start == index) {
+            rows.push(VisualRow::Bar { anchor: hunk.start });
+            if !folded.contains(&hunk.start) {
+                push_removed(&mut rows, hunk);
+            }
+        }
+        rows.push(VisualRow::Line(index));
+        index += 1;
+    }
+    rows
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -661,6 +899,9 @@ pub fn directory_status(
         if !path.starts_with(dir) {
             continue;
         }
+        if status.conflict.is_some() {
+            unstaged = Some(prefer_status(unstaged, GitFileStatus::Conflict));
+        }
         if let Some(kind) = status.unstaged {
             unstaged = Some(prefer_status(unstaged, kind));
         }
@@ -687,11 +928,12 @@ fn prefer_status(current: Option<GitFileStatus>, next: GitFileStatus) -> GitFile
 
 fn status_rank(status: GitFileStatus) -> u8 {
     match status {
-        GitFileStatus::Modified => 0,
-        GitFileStatus::Added => 1,
-        GitFileStatus::Deleted => 2,
-        GitFileStatus::Renamed => 3,
-        GitFileStatus::Untracked => 4,
+        GitFileStatus::Conflict => 0,
+        GitFileStatus::Modified => 1,
+        GitFileStatus::Added => 2,
+        GitFileStatus::Deleted => 3,
+        GitFileStatus::Renamed => 4,
+        GitFileStatus::Untracked => 5,
     }
 }
 
@@ -741,10 +983,18 @@ pub fn parse_git_status(root: &Path, output: &[u8]) -> HashMap<PathBuf, GitPathS
 }
 
 fn path_status(x: u8, y: u8) -> Option<GitPathStatus> {
+    if let Some(kind) = conflict_kind(x, y) {
+        return Some(GitPathStatus {
+            staged: None,
+            unstaged: None,
+            conflict: Some(kind),
+        });
+    }
     if x == b'?' && y == b'?' {
         return Some(GitPathStatus {
             staged: None,
             unstaged: Some(GitFileStatus::Untracked),
+            conflict: None,
         });
     }
     let staged = column_status(x);
@@ -752,13 +1002,28 @@ fn path_status(x: u8, y: u8) -> Option<GitPathStatus> {
     if staged.is_none() && unstaged.is_none() {
         None
     } else {
-        Some(GitPathStatus { staged, unstaged })
+        Some(GitPathStatus {
+            staged,
+            unstaged,
+            conflict: None,
+        })
+    }
+}
+
+fn conflict_kind(x: u8, y: u8) -> Option<ConflictKind> {
+    match (x, y) {
+        (b'U', b'U') | (b'A', b'A') => Some(ConflictKind::Both),
+        (b'U', b'D') | (b'D', b'U') | (b'A', b'U') | (b'U', b'A') => {
+            Some(ConflictKind::KeepOrDelete)
+        }
+        (b'D', b'D') => Some(ConflictKind::Deleted),
+        _ => None,
     }
 }
 
 fn column_status(byte: u8) -> Option<GitFileStatus> {
     match byte {
-        b'M' | b'T' | b'U' => Some(GitFileStatus::Modified),
+        b'M' | b'T' => Some(GitFileStatus::Modified),
         b'A' => Some(GitFileStatus::Added),
         b'D' => Some(GitFileStatus::Deleted),
         b'R' | b'C' => Some(GitFileStatus::Renamed),
@@ -839,7 +1104,9 @@ pub fn repo_relative(root: &Path, path: &Path) -> Option<String> {
 }
 
 pub fn can_commit(message: &str, files: &HashMap<PathBuf, GitPathStatus>) -> bool {
-    !message.trim().is_empty() && files.values().any(|status| status.staged.is_some())
+    !message.trim().is_empty()
+        && files.values().all(|status| status.conflict.is_none())
+        && files.values().any(|status| status.staged.is_some())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1330,6 +1597,7 @@ fn new_file_diff(relative: &str, text: &str) -> Option<ParsedGitDiff> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitPanelRow {
+    Conflicts,
     Section {
         staged: bool,
     },
@@ -1341,9 +1609,14 @@ pub enum GitPanelRow {
 }
 
 pub fn git_panel_rows(files: &HashMap<PathBuf, GitPathStatus>) -> Vec<GitPanelRow> {
+    let mut conflicts = Vec::new();
     let mut staged = Vec::new();
     let mut changed = Vec::new();
     for (path, status) in files {
+        if status.conflict.is_some() {
+            conflicts.push(path.clone());
+            continue;
+        }
         if let Some(kind) = status.staged {
             staged.push((path.clone(), kind));
         }
@@ -1351,9 +1624,21 @@ pub fn git_panel_rows(files: &HashMap<PathBuf, GitPathStatus>) -> Vec<GitPanelRo
             changed.push((path.clone(), kind));
         }
     }
+    conflicts.sort();
     staged.sort_by(|left, right| left.0.cmp(&right.0));
     changed.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut rows = vec![GitPanelRow::Section { staged: true }];
+    let mut rows = Vec::new();
+    if !conflicts.is_empty() {
+        rows.push(GitPanelRow::Conflicts);
+        for path in conflicts {
+            rows.push(GitPanelRow::File {
+                path,
+                status: GitFileStatus::Conflict,
+                staged: false,
+            });
+        }
+    }
+    rows.push(GitPanelRow::Section { staged: true });
     for (path, status) in staged {
         rows.push(GitPanelRow::File {
             path,
@@ -2450,6 +2735,7 @@ diff --git a/readme.md b/readme.md
             GitPathStatus {
                 staged: None,
                 unstaged: Some(GitFileStatus::Modified),
+                conflict: None,
             },
         )]);
         let after = HashMap::from([
@@ -2458,6 +2744,7 @@ diff --git a/readme.md b/readme.md
                 GitPathStatus {
                     staged: Some(GitFileStatus::Modified),
                     unstaged: None,
+                    conflict: None,
                 },
             ),
             (
@@ -2465,6 +2752,7 @@ diff --git a/readme.md b/readme.md
                 GitPathStatus {
                     staged: None,
                     unstaged: Some(GitFileStatus::Untracked),
+                    conflict: None,
                 },
             ),
         ]);
@@ -2476,6 +2764,7 @@ diff --git a/readme.md b/readme.md
             whole_file_action(GitPathStatus {
                 staged: None,
                 unstaged: Some(GitFileStatus::Modified),
+                conflict: None,
             }),
             Some(WholeFileAction::Restore)
         );
@@ -2483,6 +2772,7 @@ diff --git a/readme.md b/readme.md
             whole_file_action(GitPathStatus {
                 staged: Some(GitFileStatus::Deleted),
                 unstaged: None,
+                conflict: None,
             }),
             Some(WholeFileAction::Restore)
         );
@@ -2490,6 +2780,7 @@ diff --git a/readme.md b/readme.md
             whole_file_action(GitPathStatus {
                 staged: Some(GitFileStatus::Added),
                 unstaged: None,
+                conflict: None,
             }),
             Some(WholeFileAction::Remove)
         );
@@ -2497,6 +2788,7 @@ diff --git a/readme.md b/readme.md
             whole_file_action(GitPathStatus {
                 staged: None,
                 unstaged: Some(GitFileStatus::Untracked),
+                conflict: None,
             }),
             Some(WholeFileAction::Delete)
         );
@@ -2504,6 +2796,7 @@ diff --git a/readme.md b/readme.md
             whole_file_action(GitPathStatus {
                 staged: Some(GitFileStatus::Renamed),
                 unstaged: None,
+                conflict: None,
             }),
             None
         );
@@ -2519,6 +2812,7 @@ diff --git a/readme.md b/readme.md
             GitPathStatus {
                 staged: None,
                 unstaged: Some(GitFileStatus::Modified),
+                conflict: None,
             },
         );
         assert!(!can_commit("Keep it", &files));
@@ -2527,10 +2821,143 @@ diff --git a/readme.md b/readme.md
             GitPathStatus {
                 staged: Some(GitFileStatus::Added),
                 unstaged: None,
+                conflict: None,
             },
         );
         assert!(!can_commit("   ", &files));
         assert!(can_commit("Keep it", &files));
+        files.insert(
+            PathBuf::from("conflict.ts"),
+            GitPathStatus {
+                staged: None,
+                unstaged: None,
+                conflict: Some(ConflictKind::Both),
+            },
+        );
+        assert!(!can_commit("Keep it", &files));
+    }
+
+    #[test]
+    fn porcelain_unmerged_paths_are_conflicts() {
+        let root = Path::new("/repo");
+        let statuses = parse_git_status(
+            root,
+            b"UU src/both.ts\0AA src/added.ts\0UD src/ours.ts\0DU src/theirs.ts\0DD src/gone.ts\0",
+        );
+        assert_eq!(
+            statuses.get(&root.join("src/both.ts")).unwrap().conflict,
+            Some(ConflictKind::Both)
+        );
+        assert_eq!(
+            statuses.get(&root.join("src/added.ts")).unwrap().conflict,
+            Some(ConflictKind::Both)
+        );
+        assert_eq!(
+            statuses.get(&root.join("src/ours.ts")).unwrap().conflict,
+            Some(ConflictKind::KeepOrDelete)
+        );
+        assert_eq!(
+            statuses.get(&root.join("src/theirs.ts")).unwrap().conflict,
+            Some(ConflictKind::KeepOrDelete)
+        );
+        assert_eq!(
+            statuses.get(&root.join("src/gone.ts")).unwrap().conflict,
+            Some(ConflictKind::Deleted)
+        );
+        assert!(
+            statuses
+                .values()
+                .all(|status| status.staged.is_none() && status.unstaged.is_none())
+        );
+        let rows = git_panel_rows(&statuses);
+        assert!(matches!(rows.first(), Some(GitPanelRow::Conflicts)));
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            GitPanelRow::File {
+                status: GitFileStatus::Conflict,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn conflict_choices_drop_the_markers() {
+        let lines = [
+            "keep",
+            "<<<<<<< HEAD",
+            "current",
+            "still",
+            "=======",
+            "incoming",
+            ">>>>>>> topic",
+            "after",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let regions = conflict_regions(&lines);
+        assert_eq!(regions.len(), 1);
+        let region = &regions[0];
+        assert_eq!(
+            conflict_replacement(&lines, region, ConflictChoice::Current, true),
+            "current\nstill\n"
+        );
+        assert_eq!(
+            conflict_replacement(&lines, region, ConflictChoice::Incoming, true),
+            "incoming\n"
+        );
+        assert_eq!(
+            conflict_replacement(&lines, region, ConflictChoice::Both, true),
+            "current\nstill\nincoming\n"
+        );
+        let rows = conflict_view_rows(lines.len(), &[], &[], &regions, false);
+        let shown: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                VisualRow::Line(line) => Some(lines[*line].as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown, vec!["keep", "current", "still", "incoming", "after"]);
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row, VisualRow::Bar { anchor: 1 }))
+        );
+
+        let diff3 = [
+            "<<<<<<< HEAD",
+            "ours",
+            "||||||| base",
+            "older",
+            "=======",
+            "theirs",
+            ">>>>>>> topic",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let parsed = conflict_regions(&diff3);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].base, Some((3, 4)));
+        assert_eq!(
+            conflict_replacement(&diff3, &parsed[0], ConflictChoice::Both, false),
+            "ours\ntheirs"
+        );
+        let hidden = conflict_view_rows(diff3.len(), &[], &[], &parsed, false);
+        let text: Vec<_> = hidden
+            .iter()
+            .filter_map(|row| match row {
+                VisualRow::Line(line) => Some(diff3[*line].as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, vec!["ours", "theirs"]);
+
+        let broken = ["<<<<<<< HEAD", "only ours"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(conflict_regions(&broken).is_empty());
     }
 
     #[test]
@@ -2541,6 +2968,7 @@ diff --git a/readme.md b/readme.md
             GitPathStatus {
                 staged: Some(GitFileStatus::Modified),
                 unstaged: Some(GitFileStatus::Modified),
+                conflict: None,
             },
         );
         files.insert(
@@ -2548,6 +2976,7 @@ diff --git a/readme.md b/readme.md
             GitPathStatus {
                 staged: None,
                 unstaged: Some(GitFileStatus::Untracked),
+                conflict: None,
             },
         );
         files.insert(
@@ -2555,6 +2984,7 @@ diff --git a/readme.md b/readme.md
             GitPathStatus {
                 staged: Some(GitFileStatus::Added),
                 unstaged: None,
+                conflict: None,
             },
         );
         let rows = git_panel_rows(&files);
@@ -2773,6 +3203,7 @@ diff --git a/readme.md b/readme.md
             GitPathStatus {
                 staged: None,
                 unstaged: Some(GitFileStatus::Untracked),
+                conflict: None,
             },
         );
         statuses.insert(
@@ -2780,6 +3211,7 @@ diff --git a/readme.md b/readme.md
             GitPathStatus {
                 staged: None,
                 unstaged: Some(GitFileStatus::Modified),
+                conflict: None,
             },
         );
         statuses.insert(
@@ -2787,6 +3219,7 @@ diff --git a/readme.md b/readme.md
             GitPathStatus {
                 staged: Some(GitFileStatus::Added),
                 unstaged: None,
+                conflict: None,
             },
         );
         assert_eq!(

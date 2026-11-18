@@ -204,6 +204,7 @@ fn status_mark(dirty: bool, git: Option<DirectoryStatus>) -> &'static str {
         Some(GitFileStatus::Deleted) => " D",
         Some(GitFileStatus::Renamed) => " R",
         Some(GitFileStatus::Untracked) => " U",
+        Some(GitFileStatus::Conflict) => " C",
         None => "",
     }
 }
@@ -223,6 +224,7 @@ pub(crate) fn git_mark_color(status: GitFileStatus, staged: bool, theme: Theme) 
         GitFileStatus::Modified | GitFileStatus::Renamed => theme.warning,
         GitFileStatus::Deleted => theme.deleted,
         GitFileStatus::Added | GitFileStatus::Untracked => theme.untracked,
+        GitFileStatus::Conflict => theme.deleted,
     }
 }
 

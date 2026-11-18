@@ -218,6 +218,7 @@ pub fn move_sel(app: &mut App, movement: Movement, selecting: bool) {
         );
     }
     reveal_cursor(app, id);
+    app.settle_conflict_cursor();
 }
 
 pub fn backspace(app: &mut App) {
@@ -841,6 +842,7 @@ pub fn confirm_yes(app: &mut App) {
         ConfirmAction::DiscardHunk { patch, path } => app.discard_hunk(patch, path),
         ConfirmAction::RestoreFile(path) => app.enqueue_git_write(GitWrite::Restore(path)),
         ConfirmAction::DiscardAdded(path) => app.enqueue_git_write(GitWrite::Remove(path)),
+        ConfirmAction::ResolveDelete(path) => resolve_delete(app, path),
         ConfirmAction::DeletePath(path) => {
             if let Err(err) = delete_path(&path) {
                 app.message = Some(format!("delete failed: {err}"));
@@ -1740,13 +1742,17 @@ pub fn show_explorer_menu(app: &mut App, x: u16, y: u16) {
 }
 
 pub fn show_git_menu(app: &mut App, x: u16, y: u16) {
-    let rows = crate::workspace::git_panel_rows(&app.git_status);
+    let rows = app.git_rows();
     let Some(crate::workspace::GitPanelRow::File { path, .. }) = rows.get(app.git_selected) else {
         return;
     };
     let Some(status) = app.git_status.get(path).copied() else {
         return;
     };
+    if status.conflict.is_some() {
+        app.message = Some("Resolve the conflict in the file".into());
+        return;
+    }
     if whole_file_action(status).is_none() {
         app.message = Some("A rename stays as it is".into());
         return;
@@ -1771,8 +1777,35 @@ pub fn show_git_menu(app: &mut App, x: u16, y: u16) {
     };
 }
 
+fn resolve_delete(app: &mut App, path: PathBuf) {
+    if path.exists() {
+        if let Err(err) = delete_path(&path) {
+            app.message = Some(format!("delete failed: {err}"));
+            return;
+        }
+        let ids: Vec<_> = app
+            .documents
+            .iter()
+            .filter(|(_, doc)| {
+                doc.path
+                    .as_ref()
+                    .is_some_and(|item| item == &path || item.starts_with(&path))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            app.active = Some(id);
+            app.close_active(true);
+        }
+        app.refresh_explorer();
+    }
+    app.git_publish_armed = false;
+    app.enqueue_git_write(GitWrite::Stage(path));
+    app.refresh_git_status();
+}
+
 fn confirm_selected_git_file(app: &mut App) {
-    let rows = crate::workspace::git_panel_rows(&app.git_status);
+    let rows = app.git_rows();
     let Some(crate::workspace::GitPanelRow::File { path, .. }) = rows.get(app.git_selected) else {
         return;
     };
@@ -2182,7 +2215,7 @@ pub fn scroll_editor(app: &mut App, delta: i32) {
 
 pub fn scroll_explorer(app: &mut App, delta: i32) {
     if app.git_open {
-        let len = crate::workspace::git_panel_rows(&app.git_status).len();
+        let len = app.git_rows().len();
         let inner = git_list_rows(app.explorer_area.3, app.git_body_open);
         let max = max_explorer_scroll(len, inner);
         let next = app.git_scroll as i64 + i64::from(delta);
@@ -2683,7 +2716,7 @@ pub fn commit_git(app: &mut App) {
 }
 
 pub fn move_git(app: &mut App, delta: i32) {
-    let rows = crate::workspace::git_panel_rows(&app.git_status);
+    let rows = app.git_rows();
     let files: Vec<usize> = rows
         .iter()
         .enumerate()
@@ -2713,25 +2746,51 @@ pub fn move_git(app: &mut App, delta: i32) {
 }
 
 pub fn open_selected_git(app: &mut App) {
-    let rows = crate::workspace::git_panel_rows(&app.git_status);
+    let rows = app.git_rows();
     let Some(crate::workspace::GitPanelRow::File { path, staged, .. }) = rows.get(app.git_selected)
     else {
         return;
     };
-    app.open_git_entry(path.clone(), *staged);
+    let path = path.clone();
+    let staged = *staged;
+    if deleted_conflict(app, &path) {
+        confirm_resolve_delete(app, path);
+        return;
+    }
+    app.open_git_entry(path, staged);
 }
 
 pub fn toggle_selected_git(app: &mut App) {
-    let rows = crate::workspace::git_panel_rows(&app.git_status);
+    let rows = app.git_rows();
     let Some(crate::workspace::GitPanelRow::File { path, staged, .. }) = rows.get(app.git_selected)
     else {
         return;
     };
-    app.toggle_stage(path.clone(), *staged);
+    let path = path.clone();
+    let staged = *staged;
+    if deleted_conflict(app, &path) {
+        confirm_resolve_delete(app, path);
+        return;
+    }
+    app.toggle_stage(path, staged);
+}
+
+fn deleted_conflict(app: &App, path: &std::path::Path) -> bool {
+    app.git_status
+        .get(path)
+        .is_some_and(|status| status.conflict == Some(crate::workspace::ConflictKind::Deleted))
+}
+
+fn confirm_resolve_delete(app: &mut App, path: PathBuf) {
+    let name = app.relative(&path);
+    app.overlay = Overlay::Confirm {
+        message: format!("Delete {name}?"),
+        action: ConfirmAction::ResolveDelete(path),
+    };
 }
 
 pub fn git_file_index_at(app: &App, y: u16) -> Option<usize> {
-    let rows = crate::workspace::git_panel_rows(&app.git_status);
+    let rows = app.git_rows();
     let inner = git_list_rows(app.explorer_area.3, app.git_body_open);
     if inner == 0 || y <= app.explorer_area.1 {
         return None;
@@ -2778,8 +2837,12 @@ pub fn click_git(app: &mut App, x: u16, y: u16) {
             crate::app::state::GitClick::StageAll => app.stage_all(),
             crate::app::state::GitClick::UnstageAll => app.unstage_all(),
             crate::app::state::GitClick::Toggle { path, staged } => app.toggle_stage(path, staged),
+            crate::app::state::GitClick::DeleteConflict { path } => {
+                confirm_resolve_delete(app, path);
+            }
             crate::app::state::GitClick::Open { path, staged } => {
-                app.git_selected = crate::workspace::git_panel_rows(&app.git_status)
+                app.git_selected = app
+                    .git_rows()
                     .iter()
                     .position(|row| {
                         matches!(
@@ -2804,7 +2867,7 @@ pub fn click_git(app: &mut App, x: u16, y: u16) {
     let bottom = top.saturating_add(list_h as u16);
     if y >= top && y < bottom {
         let index = app.git_scroll + usize::from(y - top);
-        let len = crate::workspace::git_panel_rows(&app.git_status).len();
+        let len = app.git_rows().len();
         if index < len {
             app.git_selected = index;
         }

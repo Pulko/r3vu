@@ -15,7 +15,9 @@ use crate::editor::{
 };
 use crate::syntax::HighlightKind;
 use crate::ui::theme::{Theme, highlight_color, highlight_modifier};
-use crate::workspace::{HunkBar, LineChanges, LineMark, VisualRow};
+use crate::workspace::{
+    ConflictSide, HunkBar, KEEP_DELETE_ANCHOR, LineChanges, LineMark, VisualRow,
+};
 
 pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
     app.hscroll_hit = None;
@@ -41,6 +43,9 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
         render_markdown(frame, area, app, theme);
         return;
     }
+    app.settle_conflict_cursor();
+    let (conflicts, _) = app.conflict_view(id);
+    let rows = app.visual_rows(id);
     let Some(doc) = app.documents.get(&id) else {
         return;
     };
@@ -49,7 +54,6 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
     };
     let tab_width = app.config.tab_width;
     let number_width = ((doc.rope.len_lines().max(1).ilog10() as u16) + 2).max(4);
-    let rows = app.visual_rows(id);
     let changes = app.inline_changes.get(&id).cloned();
     let hunks = app.present_hunks(id);
     let gutter = number_width + 1;
@@ -99,11 +103,17 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
         };
         let y = area.y.saturating_add(1).saturating_add(lines.len() as u16);
         if let VisualRow::Bar { anchor } = visual {
-            let bar = hunks
-                .iter()
-                .find(|hunk| hunk.start == anchor)
-                .map(|hunk| hunk.bar)
-                .unwrap_or(HunkBar::StageDiscard);
+            let bar = if anchor == KEEP_DELETE_ANCHOR {
+                HunkBar::KeepOrDelete
+            } else if conflicts.iter().any(|region| region.start == anchor) {
+                HunkBar::Conflict
+            } else {
+                hunks
+                    .iter()
+                    .find(|hunk| hunk.start == anchor)
+                    .map(|hunk| hunk.bar)
+                    .unwrap_or(HunkBar::StageDiscard)
+            };
             let open = !app.folded_hunks.contains(&(id, anchor));
             let (line, hits) = hunk_bar(
                 bar,
@@ -138,13 +148,22 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
             continue;
         }
         let text = line_text(&doc.rope, line_idx);
-        let wash = changes
-            .as_ref()
-            .and_then(|changes| line_wash(changes, line_idx, theme));
+        let side = conflicts.iter().find_map(|region| region.side(line_idx));
+        let wash = match side {
+            Some(ConflictSide::Current) => Some(theme.added_bg),
+            Some(ConflictSide::Incoming) => Some(theme.deleted_bg),
+            None => changes
+                .as_ref()
+                .and_then(|changes| line_wash(changes, line_idx, theme)),
+        };
         let mut spans = line_number(line_idx, number_width, theme);
-        spans.push(match changes.as_ref() {
-            Some(changes) => gutter_span(changes, line_idx, theme),
-            None => Span::raw(" "),
+        spans.push(match side {
+            Some(ConflictSide::Current) => Span::styled("+", Style::default().fg(theme.added)),
+            Some(ConflictSide::Incoming) => Span::styled("-", Style::default().fg(theme.deleted)),
+            None => match changes.as_ref() {
+                Some(changes) => gutter_span(changes, line_idx, theme),
+                None => Span::raw(" "),
+            },
         });
         let current = view.cursor.line == line_idx;
         let blame = current
@@ -349,11 +368,21 @@ fn hunk_bar(
     x: u16,
     y: u16,
 ) -> (Line<'static>, Vec<DiffHit>) {
-    let icon = if open { "▾" } else { "▸" };
+    let icon = if matches!(bar, HunkBar::KeepOrDelete) {
+        " "
+    } else if open {
+        "▾"
+    } else {
+        "▸"
+    };
     let note = match bar {
         HunkBar::Renamed => "Renamed ",
         HunkBar::Revert => "Unsaved ",
-        HunkBar::Unstage | HunkBar::StageUnstageDiscard | HunkBar::StageDiscard => "",
+        HunkBar::Unstage
+        | HunkBar::StageUnstageDiscard
+        | HunkBar::StageDiscard
+        | HunkBar::Conflict
+        | HunkBar::KeepOrDelete => "",
     };
     let actions: &[(&str, HunkAction)] = match bar {
         HunkBar::StageDiscard => &[
@@ -368,15 +397,33 @@ fn hunk_bar(
         ],
         HunkBar::Revert => &[(" Revert ", HunkAction::Revert)],
         HunkBar::Renamed => &[],
+        HunkBar::Conflict => &[
+            (" Current ", HunkAction::Current),
+            (" Incoming ", HunkAction::Incoming),
+            (" Both ", HunkAction::Both),
+        ],
+        HunkBar::KeepOrDelete => &[
+            (" Keep this file ", HunkAction::KeepFile),
+            (" Delete ", HunkAction::DeleteFile),
+        ],
     };
     let content_w = number_width as usize + 1 + inner_w;
     let fold = format!(" {icon} ");
     let fold_w = UnicodeWidthStr::width(fold.as_str());
     let note_w = UnicodeWidthStr::width(note);
+    let separate = matches!(bar, HunkBar::Conflict);
+    let separator = " │ ";
+    let separator_w = UnicodeWidthStr::width(separator);
+    let gaps = if separate {
+        actions.len().saturating_sub(1)
+    } else {
+        0
+    };
     let actions_w: usize = actions
         .iter()
         .map(|(label, _)| UnicodeWidthStr::width(*label))
-        .sum();
+        .sum::<usize>()
+        .saturating_add(separator_w.saturating_mul(gaps));
     let used = fold_w.saturating_add(note_w).saturating_add(actions_w);
     let gap = content_w.saturating_sub(used);
     let mut spans = vec![Span::styled(
@@ -386,7 +433,7 @@ fn hunk_bar(
             .add_modifier(Modifier::BOLD),
     )];
     let mut hits = Vec::new();
-    if fold_w > 0 && fold_w <= content_w {
+    if fold_w > 0 && fold_w <= content_w && !matches!(bar, HunkBar::KeepOrDelete) {
         hits.push(DiffHit {
             x,
             y,
@@ -410,7 +457,18 @@ fn hunk_bar(
         spans.push(Span::raw(" ".repeat(gap)));
     }
     let mut cursor = x.saturating_add(content_w.saturating_sub(actions_w) as u16);
-    for (label, action) in actions {
+    for (index, (label, action)) in actions.iter().enumerate() {
+        if separate && index > 0 {
+            let width = separator_w as u16;
+            if cursor.saturating_add(width) > x.saturating_add(content_w as u16) {
+                break;
+            }
+            spans.push(Span::styled(
+                separator.to_string(),
+                Style::default().fg(theme.fg_dim),
+            ));
+            cursor = cursor.saturating_add(width);
+        }
         let width = UnicodeWidthStr::width(*label) as u16;
         if cursor.saturating_add(width) > x.saturating_add(content_w as u16) {
             break;
@@ -432,6 +490,16 @@ fn hunk_bar(
             HunkAction::Stage | HunkAction::Unstage => Style::default()
                 .fg(theme.on_accent)
                 .bg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+            HunkAction::Current
+            | HunkAction::Incoming
+            | HunkAction::Both
+            | HunkAction::KeepFile => Style::default()
+                .fg(theme.on_accent)
+                .bg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+            HunkAction::DeleteFile => Style::default()
+                .fg(theme.deleted)
                 .add_modifier(Modifier::BOLD),
             HunkAction::Fold => Style::default().fg(theme.accent),
         };

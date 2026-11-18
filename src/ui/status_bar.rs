@@ -110,7 +110,15 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     if app.git_repo
         && let Some(branch) = &app.git_branch
     {
-        let branch_style = if app.git_open {
+        let conflicted = app
+            .git_status
+            .values()
+            .any(|status| status.conflict.is_some());
+        let branch_style = if conflicted {
+            Style::default()
+                .fg(theme.deleted)
+                .add_modifier(Modifier::BOLD)
+        } else if app.git_open {
             Style::default()
                 .fg(theme.on_accent)
                 .bg(theme.accent)

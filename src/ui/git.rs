@@ -9,12 +9,12 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::App;
 use crate::app::state::{GitClick, GitHit, git_footer_layout};
 use crate::ui::theme::Theme;
-use crate::workspace::{GitFileStatus, GitPanelRow, git_panel_rows};
+use crate::workspace::{GitFileStatus, GitPanelRow};
 
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     app.git_hits.clear();
     let theme = app.theme();
-    let rows = git_panel_rows(&app.git_status);
+    let rows = app.git_rows();
     let inner_h = area.height.saturating_sub(2) as usize;
     let inner_w = area.width.saturating_sub(2) as usize;
     let body_open = app.git_body_open;
@@ -132,6 +132,26 @@ fn row_line(
         }
     };
     match row {
+        GitPanelRow::Conflicts => {
+            let title = "Conflicts ";
+            let head_w = UnicodeWidthStr::width(title);
+            if head_w >= inner_w {
+                return Line::from(Span::styled(
+                    fit("Conflicts", inner_w),
+                    selected_style(theme.deleted),
+                ));
+            }
+            let rule = "─".repeat(inner_w - head_w);
+            let rule_style = if selected {
+                selected_style(theme.deleted)
+            } else {
+                Style::default().fg(theme.deleted)
+            };
+            Line::from(vec![
+                Span::styled(title.to_string(), selected_style(theme.deleted)),
+                Span::styled(rule, rule_style),
+            ])
+        }
         GitPanelRow::Section { staged } => {
             let (mark, title, action) = if *staged {
                 ("−", "Staged", GitClick::UnstageAll)
@@ -158,6 +178,36 @@ fn row_line(
                 Span::styled(mark.to_string(), selected_style(theme.accent)),
                 Span::styled(format!(" {title} "), selected_style(theme.fg)),
                 Span::styled(rule, rule_style),
+            ])
+        }
+        GitPanelRow::File {
+            path,
+            status,
+            staged,
+        } if *status == GitFileStatus::Conflict => {
+            let name = app.relative(path);
+            let mark = format!(" {}", letter(*status));
+            let mark_w = UnicodeWidthStr::width(mark.as_str());
+            let name = fit(&name, inner_w.saturating_sub(mark_w));
+            let open_w = inner_w as u16;
+            if open_w > 0 {
+                let action = if app.git_status.get(path).is_some_and(|item| {
+                    item.conflict == Some(crate::workspace::ConflictKind::Deleted)
+                }) {
+                    GitClick::DeleteConflict { path: path.clone() }
+                } else {
+                    GitClick::Open {
+                        path: path.clone(),
+                        staged: false,
+                    }
+                };
+                hit(app, x, y, open_w, action);
+            }
+            let color = super::explorer::git_mark_color(*status, false, theme);
+            let name_style = selected_style(if selected { theme.fg } else { theme.deleted });
+            Line::from(vec![
+                Span::styled(name, name_style),
+                Span::styled(mark, Style::default().fg(color)),
             ])
         }
         GitPanelRow::File {
@@ -529,6 +579,7 @@ fn letter(status: GitFileStatus) -> &'static str {
         GitFileStatus::Deleted => "D",
         GitFileStatus::Renamed => "R",
         GitFileStatus::Untracked => "U",
+        GitFileStatus::Conflict => "C",
     }
 }
 

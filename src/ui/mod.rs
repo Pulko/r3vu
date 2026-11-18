@@ -81,7 +81,7 @@ mod tests {
 
     use crate::app::state::{App, Focus, Overlay};
     use crate::language::LanguageClient;
-    use crate::workspace::{GitFileStatus, GitPathStatus};
+    use crate::workspace::{ConflictKind, GitFileStatus, GitPathStatus};
 
     use super::draw;
 
@@ -310,6 +310,63 @@ mod tests {
     }
 
     #[test]
+    fn conflict_bar_hides_markers_and_offers_both_sides() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(PathBuf::from("/repo"), LanguageClient { tx });
+        app.git_repo = true;
+        let path = PathBuf::from("/repo/src/user.ts");
+        app.git_status.insert(
+            path.clone(),
+            GitPathStatus {
+                staged: None,
+                unstaged: None,
+                conflict: Some(ConflictKind::Both),
+            },
+        );
+        let id = crate::editor::DocumentId(app.next_id);
+        app.next_id += 1;
+        app.documents.insert(
+            id,
+            crate::editor::Document::new(
+                id,
+                Some(path),
+                "export function greet() {\n<<<<<<< HEAD\n  return \"Hello\";\n=======\n  return \"Hi\";\n>>>>>>> topic\n}\n".into(),
+            ),
+        );
+        app.views.insert(id, crate::editor::EditorView::new(id));
+        app.order.push(id);
+        app.active = Some(id);
+        app.focus = Focus::Editor;
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("Current"));
+        assert!(text.contains("Incoming"));
+        assert!(text.contains("Both"));
+        assert!(text.contains("│"));
+        assert!(text.contains("return \"Hello\""));
+        assert!(text.contains("return \"Hi\""));
+        assert!(!text.contains("<<<<<<<"));
+        assert!(!text.contains("======="));
+        assert!(!text.contains(">>>>>>>"));
+        assert!(!text.contains("|||||||"));
+        assert!(
+            app.diff_hits
+                .iter()
+                .any(|hit| { hit.action == crate::app::state::HunkAction::Current })
+        );
+        app.git_open = true;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let panel = buffer_text(terminal.backend().buffer());
+        assert!(panel.contains("Conflicts"));
+        assert!(
+            !app.git_hits
+                .iter()
+                .any(|hit| matches!(hit.action, crate::app::state::GitClick::Toggle { .. }))
+        );
+    }
+
+    #[test]
     fn git_panel_lists_staged_changes_and_commit() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(PathBuf::from("/repo"), LanguageClient { tx });
@@ -323,6 +380,7 @@ mod tests {
             GitPathStatus {
                 staged: Some(GitFileStatus::Modified),
                 unstaged: Some(GitFileStatus::Modified),
+                conflict: None,
             },
         );
         app.git_status.insert(
@@ -330,6 +388,7 @@ mod tests {
             GitPathStatus {
                 staged: None,
                 unstaged: Some(GitFileStatus::Untracked),
+                conflict: None,
             },
         );
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();

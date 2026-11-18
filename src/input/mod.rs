@@ -508,6 +508,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                         app.active = Some(tab.document_id);
                         app.focus = Focus::Editor;
                         app.overlay = Overlay::None;
+                        app.reveal_active_in_explorer();
                     }
                 }
             } else if in_search {

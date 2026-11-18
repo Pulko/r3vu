@@ -611,6 +611,45 @@ impl App {
             clamp_explorer_scroll(self.explorer_scroll, self.explorer_entries.len(), inner);
     }
 
+    pub fn reveal_active_in_explorer(&mut self) {
+        let Some(path) = self.active_doc().and_then(|doc| doc.path.clone()) else {
+            return;
+        };
+        if !path.starts_with(&self.root) {
+            return;
+        }
+        let mut dir = path.parent();
+        let mut added = Vec::new();
+        while let Some(ancestor) = dir {
+            if !ancestor.starts_with(&self.root) {
+                break;
+            }
+            if self.expanded.insert(ancestor.to_path_buf()) {
+                added.push(ancestor.to_path_buf());
+            }
+            if ancestor == self.root {
+                break;
+            }
+            dir = ancestor.parent();
+        }
+        self.refresh_explorer();
+        if let Some(index) = self
+            .explorer_entries
+            .iter()
+            .position(|entry| !entry.is_dir && entry.path == path)
+        {
+            self.explorer_selected = index;
+            crate::app::commands::reveal_explorer_selection(self);
+            return;
+        }
+        for ancestor in &added {
+            self.expanded.remove(ancestor);
+        }
+        if !added.is_empty() {
+            self.refresh_explorer();
+        }
+    }
+
     pub fn refresh_git_status(&mut self) {
         self.git_status_at = Some(Instant::now());
         self.pump_git_status();
@@ -1418,6 +1457,7 @@ impl App {
             self.active = Some(id);
             self.focus = Focus::Editor;
             self.markdown_preview = None;
+            self.reveal_active_in_explorer();
             if !dirty {
                 self.mark_absent(id);
             }
@@ -1439,6 +1479,7 @@ impl App {
         self.active = Some(id);
         self.focus = Focus::Editor;
         self.overlay = Overlay::None;
+        self.reveal_active_in_explorer();
         self.mark_absent(id);
     }
 
@@ -1480,6 +1521,7 @@ impl App {
         };
         self.active = Some(id);
         self.focus = Focus::Editor;
+        self.reveal_active_in_explorer();
         if self.absent.contains(&id) {
             return;
         }
@@ -1650,6 +1692,7 @@ impl App {
             let id = *id;
             self.active = Some(id);
             self.focus = Focus::Editor;
+            self.reveal_active_in_explorer();
             return;
         }
         match Document::load(DocumentId(self.next_id), path.clone()) {
@@ -1673,6 +1716,7 @@ impl App {
                 self.overlay = Overlay::None;
                 self.request_inline_diff(id);
                 self.request_review_patches(id);
+                self.reveal_active_in_explorer();
             }
             Err(err) => {
                 self.message = Some(format!("open failed: {err}"));
@@ -1758,6 +1802,7 @@ impl App {
             self.reveal_change = None;
         }
         self.active = self.order.last().copied();
+        self.reveal_active_in_explorer();
         if self
             .markdown_preview
             .as_ref()
@@ -1871,6 +1916,7 @@ impl App {
         self.active = Some(self.order[next]);
         self.focus = Focus::Editor;
         self.overlay = Overlay::None;
+        self.reveal_active_in_explorer();
     }
 
     pub fn markdown_preview_open(&self) -> bool {
@@ -3052,5 +3098,39 @@ mod tests {
         crate::app::commands::overlay_submit(&mut app);
         assert!(matches!(app.overlay, Overlay::Branches { selected: 1, .. }));
         assert!(app.git_write_queue.is_empty());
+    }
+
+    #[test]
+    fn cycling_to_a_nested_file_expands_its_parents_and_selects_it() {
+        with_runtime(|| {
+            let dir = std::env::temp_dir().join(format!("p0-reveal-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("src/deep")).unwrap();
+            let nested = dir.join("src/deep/file.rs");
+            let other = dir.join("other.rs");
+            std::fs::write(&nested, "fn nested() {}\n").unwrap();
+            std::fs::write(&other, "fn other() {}\n").unwrap();
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut app = App::new(dir.clone(), LanguageClient { tx });
+            app.open_path(nested.clone());
+            app.open_path(other.clone());
+            app.expanded.remove(&dir.join("src"));
+            app.expanded.remove(&dir.join("src/deep"));
+            app.refresh_explorer();
+            app.focus = Focus::Editor;
+            assert!(
+                app.explorer_entries
+                    .iter()
+                    .all(|entry| entry.path != nested)
+            );
+            app.cycle_tab(false);
+            assert!(app.expanded.contains(&dir.join("src")));
+            assert!(app.expanded.contains(&dir.join("src/deep")));
+            let selected = &app.explorer_entries[app.explorer_selected];
+            assert_eq!(selected.path, nested);
+            assert!(!selected.is_dir);
+            assert_eq!(app.focus, Focus::Editor);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 }

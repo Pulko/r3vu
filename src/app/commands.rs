@@ -22,6 +22,7 @@ use super::state::{
     App, ConfirmAction, Focus, HScrollHit, MenuAction, MenuItem, Overlay, PendingRename,
     PromptKind, SearchKind, SearchScope, clamp_explorer_scroll, decode_diagnostic_pos,
     explorer_index_at, explorer_inner_rows, git_list_rows, is_ident_char, max_explorer_scroll,
+    max_git_scroll,
 };
 
 pub fn save_active(app: &mut App) {
@@ -1923,6 +1924,24 @@ pub fn show_explorer_menu(app: &mut App, x: u16, y: u16) {
 
 pub fn show_git_menu(app: &mut App, x: u16, y: u16) {
     let rows = app.git_rows();
+    if let Some(crate::workspace::GitPanelRow::Dir { deleted: true, .. }) =
+        rows.get(app.git_selected)
+    {
+        app.overlay = Overlay::ContextMenu {
+            x,
+            y,
+            selected: 0,
+            show_type: false,
+            type_text: String::new(),
+            hover_token: 0,
+            items: vec![MenuItem {
+                label: "Restore".into(),
+                action: MenuAction::RestoreFile,
+                enabled: true,
+            }],
+        };
+        return;
+    }
     let Some(crate::workspace::GitPanelRow::File { path, .. }) = rows.get(app.git_selected) else {
         return;
     };
@@ -1986,6 +2005,19 @@ fn resolve_delete(app: &mut App, path: PathBuf) {
 
 fn confirm_selected_git_file(app: &mut App) {
     let rows = app.git_rows();
+    if let Some(crate::workspace::GitPanelRow::Dir {
+        path,
+        deleted: true,
+        ..
+    }) = rows.get(app.git_selected)
+    {
+        let name = app.relative(path);
+        app.overlay = Overlay::Confirm {
+            message: format!("Restore {name}/?"),
+            action: ConfirmAction::RestoreFile(path.clone()),
+        };
+        return;
+    }
     let Some(crate::workspace::GitPanelRow::File { path, .. }) = rows.get(app.git_selected) else {
         return;
     };
@@ -2406,7 +2438,7 @@ pub fn scroll_explorer(app: &mut App, delta: i32) {
     if app.git_open {
         let len = app.git_rows().len();
         let inner = git_list_rows(app.explorer_area.3, app.git_body_open);
-        let max = max_explorer_scroll(len, inner);
+        let max = max_git_scroll(len, inner);
         let next = app.git_scroll as i64 + i64::from(delta);
         app.git_scroll = next.clamp(0, max as i64) as usize;
         return;
@@ -2951,9 +2983,7 @@ pub fn move_git(app: &mut App, delta: i32) {
     let files: Vec<usize> = rows
         .iter()
         .enumerate()
-        .filter_map(|(index, row)| {
-            matches!(row, crate::workspace::GitPanelRow::File { .. }).then_some(index)
-        })
+        .filter_map(|(index, row)| row.is_entry().then_some(index))
         .collect();
     if files.is_empty() {
         return;
@@ -2978,6 +3008,18 @@ pub fn move_git(app: &mut App, delta: i32) {
 
 pub fn open_selected_git(app: &mut App) {
     let rows = app.git_rows();
+    if let Some(crate::workspace::GitPanelRow::Dir {
+        path,
+        staged,
+        deleted,
+        ..
+    }) = rows.get(app.git_selected)
+    {
+        if !*deleted {
+            app.toggle_git_folder(path.clone(), *staged);
+        }
+        return;
+    }
     let Some(crate::workspace::GitPanelRow::File { path, staged, .. }) = rows.get(app.git_selected)
     else {
         return;
@@ -2993,13 +3035,28 @@ pub fn open_selected_git(app: &mut App) {
 
 pub fn toggle_selected_git(app: &mut App) {
     let rows = app.git_rows();
-    let Some(crate::workspace::GitPanelRow::File { path, staged, .. }) = rows.get(app.git_selected)
-    else {
-        return;
+    let (path, staged, deleted_dir) = match rows.get(app.git_selected) {
+        Some(crate::workspace::GitPanelRow::File { path, staged, .. }) => {
+            (path.clone(), *staged, false)
+        }
+        Some(crate::workspace::GitPanelRow::Dir {
+            path,
+            staged,
+            deleted: true,
+            ..
+        }) => (path.clone(), *staged, true),
+        Some(crate::workspace::GitPanelRow::Dir {
+            path,
+            staged,
+            deleted: false,
+            ..
+        }) => {
+            app.toggle_git_folder(path.clone(), *staged);
+            return;
+        }
+        _ => return,
     };
-    let path = path.clone();
-    let staged = *staged;
-    if deleted_conflict(app, &path) {
+    if !deleted_dir && deleted_conflict(app, &path) {
         confirm_resolve_delete(app, path);
         return;
     }
@@ -3031,11 +3088,9 @@ pub fn git_file_index_at(app: &App, y: u16) -> Option<usize> {
         return None;
     }
     let index = app.git_scroll + rel;
-    matches!(
-        rows.get(index),
-        Some(crate::workspace::GitPanelRow::File { .. })
-    )
-    .then_some(index)
+    rows.get(index)
+        .is_some_and(|row| row.is_entry())
+        .then_some(index)
 }
 
 pub fn click_git(app: &mut App, x: u16, y: u16) {
@@ -3068,6 +3123,21 @@ pub fn click_git(app: &mut App, x: u16, y: u16) {
             crate::app::state::GitClick::StageAll => app.stage_all(),
             crate::app::state::GitClick::UnstageAll => app.unstage_all(),
             crate::app::state::GitClick::Toggle { path, staged } => app.toggle_stage(path, staged),
+            crate::app::state::GitClick::Fold { path, staged } => {
+                if let Some(index) = app.git_rows().iter().position(|row| {
+                    matches!(
+                        row,
+                        crate::workspace::GitPanelRow::Dir {
+                            path: row_path,
+                            staged: row_staged,
+                            ..
+                        } if row_path == &path && *row_staged == staged
+                    )
+                }) {
+                    app.git_selected = index;
+                }
+                app.toggle_git_folder(path, staged);
+            }
             crate::app::state::GitClick::DeleteConflict { path } => {
                 confirm_resolve_delete(app, path);
             }
@@ -3130,7 +3200,11 @@ pub fn receive_git_write(app: &mut App, result: crate::workspace::GitWriteResult
             settle_external_git(app);
         }
         if let Some(path) = reload {
-            app.reload_clean_document(&path);
+            if path.is_dir() {
+                settle_external_git(app);
+            } else {
+                app.reload_clean_document(&path);
+            }
         }
         if let Some(path) = close_path {
             let ids: Vec<_> = app
@@ -3698,6 +3772,49 @@ mod tests {
         );
         assert!(matches!(app.overlay, Overlay::None));
         let _ = std::fs::remove_dir_all(app.root.clone());
+    }
+
+    #[test]
+    fn a_deleted_folder_confirms_one_restore() {
+        let root = std::env::temp_dir().join(format!("p0-restore-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = with_runtime(|| App::new(root.clone(), LanguageClient { tx }));
+        app.git_repo = true;
+        let gone = root.join("src/old");
+        for name in ["a.ts", "nested/b.ts"] {
+            app.git_status.insert(
+                gone.join(name),
+                crate::workspace::GitPathStatus {
+                    staged: None,
+                    unstaged: Some(crate::workspace::GitFileStatus::Deleted),
+                    conflict: None,
+                },
+            );
+        }
+        let rows = app.git_rows();
+        app.git_selected = rows
+            .iter()
+            .position(|row| {
+                matches!(
+                    row,
+                    crate::workspace::GitPanelRow::Dir { deleted: true, path, .. } if path == &gone
+                )
+            })
+            .expect("deleted folder");
+        super::run_menu(&mut app, MenuAction::RestoreFile);
+        match &app.overlay {
+            Overlay::Confirm {
+                action: ConfirmAction::RestoreFile(path),
+                message,
+            } => {
+                assert_eq!(path, &gone);
+                assert_eq!(message, "Restore src/old/?");
+            }
+            other => panic!("expected confirm, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

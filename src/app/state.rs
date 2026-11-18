@@ -239,6 +239,7 @@ pub enum GitClick {
     Toggle { path: PathBuf, staged: bool },
     Open { path: PathBuf, staged: bool },
     DeleteConflict { path: PathBuf },
+    Fold { path: PathBuf, staged: bool },
 }
 
 #[derive(Clone, Debug)]
@@ -436,6 +437,7 @@ pub struct App {
     pub git_open: bool,
     pub git_selected: usize,
     pub git_scroll: usize,
+    git_collapsed: HashSet<(PathBuf, bool)>,
     pub git_message: String,
     pub git_message_focus: bool,
     pub git_body: String,
@@ -570,6 +572,7 @@ impl App {
             git_open: false,
             git_selected: 0,
             git_scroll: 0,
+            git_collapsed: HashSet::new(),
             git_message: String::new(),
             git_message_focus: false,
             git_body: String::new(),
@@ -1006,12 +1009,9 @@ impl App {
         let rows = self.git_rows();
         if !rows
             .get(self.git_selected)
-            .is_some_and(|row| matches!(row, crate::workspace::GitPanelRow::File { .. }))
+            .is_some_and(|row| row.is_entry())
         {
-            self.git_selected = rows
-                .iter()
-                .position(|row| matches!(row, crate::workspace::GitPanelRow::File { .. }))
-                .unwrap_or(0);
+            self.git_selected = rows.iter().position(|row| row.is_entry()).unwrap_or(0);
         }
     }
 
@@ -2107,7 +2107,18 @@ impl App {
     }
 
     pub fn git_rows(&self) -> Vec<crate::workspace::GitPanelRow> {
-        crate::workspace::git_panel_rows(&self.presented_git_status())
+        crate::workspace::git_panel_rows(
+            &self.root,
+            &self.presented_git_status(),
+            &self.git_collapsed,
+        )
+    }
+
+    pub fn toggle_git_folder(&mut self, path: PathBuf, staged: bool) {
+        let key = (path, staged);
+        if !self.git_collapsed.remove(&key) {
+            self.git_collapsed.insert(key);
+        }
     }
 
     fn presented_git_status(&self) -> HashMap<PathBuf, GitPathStatus> {
@@ -2555,6 +2566,9 @@ pub fn click_was_double(last: Option<(Instant, u16, u16)>, x: u16, y: u16) -> bo
 
 pub const GIT_BODY_LINES: usize = 3;
 
+/// Blank rows after the last tree row, so it can scroll clear of Pull and Commit.
+pub const GIT_TREE_TAIL: usize = 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GitFooterLayout {
     pub rows: usize,
@@ -2629,6 +2643,14 @@ pub fn max_explorer_scroll(len: usize, inner: usize) -> usize {
         0
     } else {
         len.saturating_sub(inner)
+    }
+}
+
+pub fn max_git_scroll(len: usize, inner: usize) -> usize {
+    if len == 0 || inner == 0 {
+        0
+    } else {
+        len.saturating_sub(inner).saturating_add(GIT_TREE_TAIL)
     }
 }
 
@@ -2943,6 +2965,9 @@ mod tests {
         assert_eq!(clamp_explorer_scroll(100, 10, 4), 6);
         assert_eq!(clamp_explorer_scroll(5, 3, 10), 0);
         assert_eq!(clamp_explorer_scroll(2, 8, 0), 0);
+        assert_eq!(max_git_scroll(20, 10), 12);
+        assert_eq!(max_git_scroll(4, 10), GIT_TREE_TAIL);
+        assert_eq!(max_git_scroll(0, 10), 0);
     }
 
     #[test]

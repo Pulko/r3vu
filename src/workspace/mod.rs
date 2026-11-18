@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -1728,32 +1728,41 @@ pub enum GitPanelRow {
     Section {
         staged: bool,
     },
+    Dir {
+        path: PathBuf,
+        depth: usize,
+        expanded: bool,
+        deleted: bool,
+        staged: bool,
+        status: GitFileStatus,
+    },
     File {
         path: PathBuf,
         status: GitFileStatus,
         staged: bool,
+        depth: usize,
     },
 }
 
-pub fn git_panel_rows(files: &HashMap<PathBuf, GitPathStatus>) -> Vec<GitPanelRow> {
+impl GitPanelRow {
+    pub fn is_entry(&self) -> bool {
+        matches!(self, Self::File { .. } | Self::Dir { .. })
+    }
+}
+
+pub fn git_panel_rows(
+    root: &Path,
+    files: &HashMap<PathBuf, GitPathStatus>,
+    collapsed: &HashSet<(PathBuf, bool)>,
+) -> Vec<GitPanelRow> {
+    let folders = deleted_folders(root, files);
     let mut conflicts = Vec::new();
-    let mut staged = Vec::new();
-    let mut changed = Vec::new();
     for (path, status) in files {
         if status.conflict.is_some() {
             conflicts.push(path.clone());
-            continue;
-        }
-        if let Some(kind) = status.staged {
-            staged.push((path.clone(), kind));
-        }
-        if let Some(kind) = status.unstaged {
-            changed.push((path.clone(), kind));
         }
     }
     conflicts.sort();
-    staged.sort_by(|left, right| left.0.cmp(&right.0));
-    changed.sort_by(|left, right| left.0.cmp(&right.0));
     let mut rows = Vec::new();
     if !conflicts.is_empty() {
         rows.push(GitPanelRow::Conflicts);
@@ -1762,26 +1771,207 @@ pub fn git_panel_rows(files: &HashMap<PathBuf, GitPathStatus>) -> Vec<GitPanelRo
                 path,
                 status: GitFileStatus::Conflict,
                 staged: false,
+                depth: 0,
             });
         }
     }
     rows.push(GitPanelRow::Section { staged: true });
-    for (path, status) in staged {
-        rows.push(GitPanelRow::File {
-            path,
-            status,
-            staged: true,
-        });
-    }
+    rows.extend(section_tree(root, files, &folders, true, collapsed));
     rows.push(GitPanelRow::Section { staged: false });
-    for (path, status) in changed {
-        rows.push(GitPanelRow::File {
+    rows.extend(section_tree(root, files, &folders, false, collapsed));
+    rows
+}
+
+fn deleted_folders(root: &Path, files: &HashMap<PathBuf, GitPathStatus>) -> Vec<(PathBuf, bool)> {
+    let mut found = Vec::new();
+    for (path, status) in files {
+        if !is_pure_deletion(status) {
+            continue;
+        }
+        let Some(dir) = highest_deleted_dir(root, path, files) else {
+            continue;
+        };
+        if found.iter().any(|(have, _)| have == &dir) {
+            continue;
+        }
+        let in_changes = files.iter().any(|(item, status)| {
+            covers(&dir, item) && status.unstaged == Some(GitFileStatus::Deleted)
+        });
+        found.push((dir, in_changes));
+    }
+    found
+}
+
+fn is_pure_deletion(status: &GitPathStatus) -> bool {
+    status.conflict.is_none()
+        && matches!(status.staged, None | Some(GitFileStatus::Deleted))
+        && matches!(status.unstaged, None | Some(GitFileStatus::Deleted))
+        && (status.staged.is_some() || status.unstaged.is_some())
+}
+
+fn covers(dir: &Path, path: &Path) -> bool {
+    path.starts_with(dir) && path != dir
+}
+
+fn highest_deleted_dir(
+    root: &Path,
+    file: &Path,
+    files: &HashMap<PathBuf, GitPathStatus>,
+) -> Option<PathBuf> {
+    let mut current = file.parent()?.to_path_buf();
+    let mut best = None;
+    loop {
+        if current == root || !current.starts_with(root) {
+            break;
+        }
+        if current.exists() || !dir_is_pure_deletion(&current, files) {
+            break;
+        }
+        best = Some(current.clone());
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent.to_path_buf();
+    }
+    best
+}
+
+fn dir_is_pure_deletion(dir: &Path, files: &HashMap<PathBuf, GitPathStatus>) -> bool {
+    let mut any = false;
+    for (path, status) in files {
+        if !covers(dir, path) {
+            continue;
+        }
+        any = true;
+        if !is_pure_deletion(status) {
+            return false;
+        }
+    }
+    any
+}
+
+struct TreeNode {
+    depth: usize,
+    deleted: bool,
+    file: bool,
+    status: GitFileStatus,
+}
+
+fn section_tree(
+    root: &Path,
+    files: &HashMap<PathBuf, GitPathStatus>,
+    folders: &[(PathBuf, bool)],
+    staged: bool,
+    collapsed: &HashSet<(PathBuf, bool)>,
+) -> Vec<GitPanelRow> {
+    let mut nodes: BTreeMap<PathBuf, TreeNode> = BTreeMap::new();
+    for (path, status) in files {
+        if path_in_deleted_folder(path, folders) {
+            continue;
+        }
+        let Some(kind) = (if staged {
+            status.staged
+        } else {
+            status.unstaged
+        }) else {
+            continue;
+        };
+        insert_leaf(&mut nodes, root, path, kind, false);
+    }
+    for (dir, in_changes) in folders {
+        if *in_changes == !staged {
+            insert_leaf(&mut nodes, root, dir, GitFileStatus::Deleted, true);
+        }
+    }
+    let mut rows = Vec::new();
+    let mut skip: Option<PathBuf> = None;
+    for (path, node) in nodes {
+        if let Some(prefix) = &skip {
+            if path.starts_with(prefix) && path != *prefix {
+                continue;
+            }
+            skip = None;
+        }
+        if node.file {
+            rows.push(GitPanelRow::File {
+                path,
+                status: node.status,
+                staged,
+                depth: node.depth,
+            });
+            continue;
+        }
+        let expanded = !node.deleted && !collapsed.contains(&(path.clone(), staged));
+        if !node.deleted && !expanded {
+            skip = Some(path.clone());
+        }
+        rows.push(GitPanelRow::Dir {
             path,
-            status,
-            staged: false,
+            depth: node.depth,
+            expanded,
+            deleted: node.deleted,
+            staged,
+            status: node.status,
         });
     }
     rows
+}
+
+fn path_in_deleted_folder(path: &Path, folders: &[(PathBuf, bool)]) -> bool {
+    folders.iter().any(|(dir, _)| covers(dir, path))
+}
+
+fn insert_leaf(
+    nodes: &mut BTreeMap<PathBuf, TreeNode>,
+    root: &Path,
+    path: &Path,
+    status: GitFileStatus,
+    deleted: bool,
+) {
+    if let Ok(relative) = path.strip_prefix(root)
+        && !relative.as_os_str().is_empty()
+    {
+        let comps: Vec<_> = relative.components().collect();
+        let mut acc = root.to_path_buf();
+        for (index, comp) in comps.iter().enumerate() {
+            if index + 1 == comps.len() {
+                break;
+            }
+            acc.push(comp);
+            match nodes.get_mut(&acc) {
+                Some(node) if !node.file && !node.deleted => {
+                    node.status = prefer_status(Some(node.status), status);
+                }
+                Some(_) => {}
+                None => {
+                    nodes.insert(
+                        acc.clone(),
+                        TreeNode {
+                            depth: index,
+                            deleted: false,
+                            file: false,
+                            status,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    let depth = path
+        .strip_prefix(root)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map(|relative| relative.components().count().saturating_sub(1))
+        .unwrap_or(0);
+    nodes.insert(
+        path.to_path_buf(),
+        TreeNode {
+            depth,
+            deleted,
+            file: !deleted,
+            status,
+        },
+    );
 }
 
 #[derive(Clone, Debug)]
@@ -2507,6 +2697,8 @@ pub fn find_in_document(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
@@ -2852,6 +3044,19 @@ diff --git a/readme.md b/readme.md
                 "src/a.ts"
             ]
         );
+        let directory =
+            prepare_git_write(root, &GitWrite::Restore(PathBuf::from("/repo/src/old"))).unwrap();
+        assert_eq!(
+            directory.args,
+            [
+                "restore",
+                "--source=HEAD",
+                "--staged",
+                "--worktree",
+                "--",
+                "src/old"
+            ]
+        );
         let remove =
             prepare_git_write(root, &GitWrite::Remove(PathBuf::from("/repo/src/a.ts"))).unwrap();
         assert_eq!(remove.args, ["rm", "-f", "--", "src/a.ts"]);
@@ -3015,7 +3220,7 @@ diff --git a/readme.md b/readme.md
                 .values()
                 .all(|status| status.staged.is_none() && status.unstaged.is_none())
         );
-        let rows = git_panel_rows(&statuses);
+        let rows = git_panel_rows(root, &statuses, &HashSet::new());
         assert!(matches!(rows.first(), Some(GitPanelRow::Conflicts)));
         assert!(rows.iter().any(|row| matches!(
             row,
@@ -3133,7 +3338,7 @@ diff --git a/readme.md b/readme.md
                 conflict: None,
             },
         );
-        let rows = git_panel_rows(&files);
+        let rows = git_panel_rows(Path::new("/repo"), &files, &HashSet::new());
         let staged: Vec<_> = rows
             .iter()
             .filter_map(|row| match row {
@@ -3162,6 +3367,135 @@ diff --git a/readme.md b/readme.md
             changed,
             vec![PathBuf::from("both.ts"), PathBuf::from("new.ts")]
         );
+    }
+
+    #[test]
+    fn a_missing_directory_of_deletions_is_one_folder() {
+        let root = std::env::temp_dir().join(format!("p0-gone-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src/mix")).unwrap();
+        let deleted = |path: PathBuf| {
+            (
+                path,
+                GitPathStatus {
+                    staged: None,
+                    unstaged: Some(GitFileStatus::Deleted),
+                    conflict: None,
+                },
+            )
+        };
+        let modified = |path: PathBuf| {
+            (
+                path,
+                GitPathStatus {
+                    staged: None,
+                    unstaged: Some(GitFileStatus::Modified),
+                    conflict: None,
+                },
+            )
+        };
+        let mut files = HashMap::new();
+        let (path, status) = deleted(root.join("src/old/a.ts"));
+        files.insert(path, status);
+        let (path, status) = deleted(root.join("src/old/nested/b.ts"));
+        files.insert(path, status);
+        let (path, status) = modified(root.join("src/keep.ts"));
+        files.insert(path, status);
+        let (path, status) = deleted(root.join("src/mix/a.ts"));
+        files.insert(path, status);
+        let (path, status) = modified(root.join("src/mix/b.ts"));
+        files.insert(path, status);
+
+        let rows = git_panel_rows(&root, &files, &HashSet::new());
+        let changes = changes_entries(&rows);
+        assert!(matches!(
+            changes[0],
+            GitPanelRow::Dir {
+                deleted: false,
+                expanded: true,
+                depth: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &changes[1],
+            GitPanelRow::File { path, status: GitFileStatus::Modified, depth: 1, .. }
+                if path.ends_with("keep.ts")
+        ));
+        assert!(matches!(
+            changes[2],
+            GitPanelRow::Dir {
+                deleted: false,
+                depth: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &changes[3],
+            GitPanelRow::File {
+                status: GitFileStatus::Deleted,
+                depth: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &changes[4],
+            GitPanelRow::File {
+                status: GitFileStatus::Modified,
+                depth: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &changes[5],
+            GitPanelRow::Dir {
+                deleted: true,
+                depth: 1,
+                path,
+                ..
+            } if path.ends_with("src/old")
+        ));
+        assert_eq!(changes.len(), 6);
+
+        let mut collapsed = HashSet::new();
+        collapsed.insert((root.join("src"), false));
+        let folded = git_panel_rows(&root, &files, &collapsed);
+        let folded_changes = changes_entries(&folded);
+        assert_eq!(folded_changes.len(), 1);
+        assert!(matches!(
+            folded_changes[0],
+            GitPanelRow::Dir {
+                expanded: false,
+                deleted: false,
+                ..
+            }
+        ));
+
+        let gone = std::env::temp_dir().join(format!("p0-gone-all-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&gone);
+        std::fs::create_dir_all(&gone).unwrap();
+        let mut only_deleted = HashMap::new();
+        let (path, status) = deleted(gone.join("src/old/a.ts"));
+        only_deleted.insert(path, status);
+        let (path, status) = deleted(gone.join("src/old/nested/b.ts"));
+        only_deleted.insert(path, status);
+        let whole = git_panel_rows(&gone, &only_deleted, &HashSet::new());
+        let whole_changes = changes_entries(&whole);
+        assert_eq!(whole_changes.len(), 1);
+        assert!(matches!(
+            &whole_changes[0],
+            GitPanelRow::Dir { deleted: true, path, .. } if path.ends_with("src")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&gone);
+    }
+
+    fn changes_entries(rows: &[GitPanelRow]) -> Vec<&GitPanelRow> {
+        let start = rows
+            .iter()
+            .position(|row| matches!(row, GitPanelRow::Section { staged: false }))
+            .unwrap();
+        rows[start + 1..].iter().collect()
     }
 
     #[test]

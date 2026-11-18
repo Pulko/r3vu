@@ -2217,6 +2217,9 @@ fn utf16(doc: &crate::editor::Document, pos: Position) -> Position {
 }
 
 pub fn handle_watch(app: &mut App, event: WatchEvent) {
+    if crate::workspace::is_git_metadata(&event.path) {
+        app.note_external_git();
+    }
     app.schedule_git_status();
     if event.kind.changes_tree() {
         app.refresh_explorer();
@@ -2243,8 +2246,14 @@ pub fn handle_watch(app: &mut App, event: WatchEvent) {
             DiskRefresh::Dirty(path) => {
                 app.message = Some(format!("file changed on disk: {}", path.display()));
             }
-            DiskRefresh::Reloaded | DiskRefresh::Same | DiskRefresh::Skipped => {}
+            DiskRefresh::Reloaded
+            | DiskRefresh::Removed
+            | DiskRefresh::Same
+            | DiskRefresh::Skipped => {}
         }
+        return;
+    }
+    if app.external_git_pending() {
         return;
     }
     if dirty {
@@ -2761,19 +2770,37 @@ fn finish_turn(app: &mut App, success: bool, stderr: String) {
     app.finish_turn_status();
 }
 
-pub fn settle_agent_edits(app: &mut App) {
+pub fn settle_agent_edits(app: &mut App) -> Vec<DocumentId> {
     let ids: Vec<DocumentId> = app.documents.keys().copied().collect();
     let mut dirty_note = None;
+    let mut reloaded = Vec::new();
     for id in ids {
         match refresh_from_disk(app, id) {
             DiskRefresh::Dirty(path) => {
                 dirty_note = Some(format!("file changed on disk: {}", path.display()));
             }
-            DiskRefresh::Reloaded | DiskRefresh::Same | DiskRefresh::Skipped => {}
+            DiskRefresh::Reloaded | DiskRefresh::Removed => reloaded.push(id),
+            DiskRefresh::Same | DiskRefresh::Skipped => {}
         }
     }
     if let Some(note) = dirty_note {
         app.message = Some(note);
+    }
+    reloaded
+}
+
+pub fn settle_external_git(app: &mut App) {
+    let confirm_id = match &app.overlay {
+        Overlay::Confirm {
+            action: ConfirmAction::Reload(id),
+            ..
+        } => Some(*id),
+        _ => None,
+    };
+    let reloaded = settle_agent_edits(app);
+    app.refresh_explorer();
+    if confirm_id.is_some_and(|id| reloaded.contains(&id)) {
+        app.overlay = Overlay::None;
     }
 }
 
@@ -2781,6 +2808,7 @@ enum DiskRefresh {
     Same,
     Dirty(PathBuf),
     Reloaded,
+    Removed,
     Skipped,
 }
 
@@ -2792,8 +2820,23 @@ fn refresh_from_disk(app: &mut App, id: DocumentId) -> DiskRefresh {
     else {
         return DiskRefresh::Skipped;
     };
-    let Ok(bytes) = std::fs::read(&path) else {
-        return DiskRefresh::Skipped;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if dirty {
+                return DiskRefresh::Dirty(path);
+            }
+            if app.absent.contains(&id) {
+                return DiskRefresh::Skipped;
+            }
+            let Some(doc) = app.documents.get_mut(&id) else {
+                return DiskRefresh::Skipped;
+            };
+            doc.note_removed();
+            publish_buffer(app, id, path);
+            return DiskRefresh::Removed;
+        }
+        Err(_) => return DiskRefresh::Skipped,
     };
     let Ok(text) = String::from_utf8(bytes) else {
         return DiskRefresh::Skipped;
@@ -2809,20 +2852,29 @@ fn refresh_from_disk(app: &mut App, id: DocumentId) -> DiskRefresh {
     if dirty {
         return DiskRefresh::Dirty(path);
     }
-    let reloaded = {
-        let Some(doc) = app.documents.get_mut(&id) else {
-            return DiskRefresh::Skipped;
-        };
-        if doc.replace_from_disk().is_err() {
-            return DiskRefresh::Skipped;
-        }
-        (doc.language, doc.rope.clone(), doc.revision, doc.text())
+    let Some(doc) = app.documents.get_mut(&id) else {
+        return DiskRefresh::Skipped;
     };
-    let (language, rope, revision, full) = reloaded;
+    if doc.replace_from_disk().is_err() {
+        return DiskRefresh::Skipped;
+    }
+    app.absent.remove(&id);
+    publish_buffer(app, id, path);
+    DiskRefresh::Reloaded
+}
+
+fn publish_buffer(app: &mut App, id: DocumentId, path: PathBuf) {
+    let Some(doc) = app.documents.get(&id) else {
+        return;
+    };
+    let language = doc.language;
+    let rope = doc.rope.clone();
+    let revision = doc.revision;
+    let full = doc.text();
     app.syntax.close(id);
     app.syntax.open(id, language, &rope);
     let _ = app.lsp.tx.send(LspCmd::DidChange {
-        path: path.clone(),
+        path,
         version: revision as i64,
         change: full_document_change(id, revision, full.clone()),
         full_text: full,
@@ -2837,7 +2889,6 @@ fn refresh_from_disk(app: &mut App, id: DocumentId) -> DiskRefresh {
         view.selection = None;
     }
     app.request_inline_diff(id);
-    DiskRefresh::Reloaded
 }
 
 fn full_document_change(id: DocumentId, revision: u64, text: String) -> DocumentChange {
@@ -3075,6 +3126,9 @@ pub fn receive_git_write(app: &mut App, result: crate::workspace::GitWriteResult
         }
     }
     if ok {
+        if branch {
+            settle_external_git(app);
+        }
         if let Some(path) = reload {
             app.reload_clean_document(&path);
         }
@@ -3511,6 +3565,138 @@ mod tests {
                 .unwrap_or("")
                 .contains("changed on disk")
         );
+        let _ = std::fs::remove_dir_all(app.root.clone());
+    }
+
+    #[test]
+    fn an_outside_git_move_reloads_clean_buffers() {
+        let dir = std::env::temp_dir().join(format!("p0-git-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let clean = dir.join("clean.ts");
+        let dirty = dir.join("dirty.ts");
+        std::fs::write(&clean, "export const clean = 1;\n").unwrap();
+        std::fs::write(&dirty, "export const dirty = 1;\n").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = with_runtime(|| {
+            let mut app = App::new(dir.clone(), LanguageClient { tx });
+            app.open_path(clean.clone());
+            app.open_path(dirty.clone());
+            app
+        });
+        let clean_id = app
+            .documents
+            .iter()
+            .find(|(_, doc)| doc.path.as_ref() == Some(&clean))
+            .map(|(id, _)| *id)
+            .unwrap();
+        let dirty_id = app
+            .documents
+            .iter()
+            .find(|(_, doc)| doc.path.as_ref() == Some(&dirty))
+            .map(|(id, _)| *id)
+            .unwrap();
+        app.documents.get_mut(&dirty_id).unwrap().revision = 1;
+        std::fs::write(&clean, "export const clean = 2;\n").unwrap();
+        std::fs::write(&dirty, "export const dirty = 2;\n").unwrap();
+        for doc in app.documents.values_mut() {
+            doc.mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+        }
+        super::handle_watch(
+            &mut app,
+            crate::workspace::WatchEvent {
+                path: dir.join(".git/HEAD"),
+                kind: crate::workspace::WatchKind::Modify,
+            },
+        );
+        super::handle_watch(
+            &mut app,
+            crate::workspace::WatchEvent {
+                path: clean.clone(),
+                kind: crate::workspace::WatchKind::Modify,
+            },
+        );
+        assert!(matches!(app.overlay, Overlay::None));
+        app.overlay = Overlay::Confirm {
+            message: format!("Reload {}?", clean.display()),
+            action: ConfirmAction::Reload(clean_id),
+        };
+        with_runtime(|| {
+            app.receive_git_status(Ok(crate::workspace::GitSnapshot {
+                files: std::collections::HashMap::new(),
+                branch: Some("topic".into()),
+                ahead_behind: None,
+            }));
+        });
+        assert_eq!(app.git_branch.as_deref(), Some("topic"));
+        assert_eq!(
+            app.documents.get(&clean_id).unwrap().text(),
+            "export const clean = 2;\n"
+        );
+        assert_eq!(
+            app.documents.get(&dirty_id).unwrap().text(),
+            "export const dirty = 1;\n"
+        );
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("changed on disk")
+        );
+        std::fs::write(&clean, "export const clean = 3;\n").unwrap();
+        app.documents.get_mut(&clean_id).unwrap().mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+        super::handle_watch(
+            &mut app,
+            crate::workspace::WatchEvent {
+                path: clean.clone(),
+                kind: crate::workspace::WatchKind::Modify,
+            },
+        );
+        assert!(matches!(
+            app.overlay,
+            Overlay::Confirm {
+                action: ConfirmAction::Reload(_),
+                ..
+            }
+        ));
+        let _ = std::fs::remove_dir_all(app.root.clone());
+    }
+
+    #[test]
+    fn a_branch_switch_reloads_a_clean_buffer() {
+        let dir = std::env::temp_dir().join(format!("p0-git-switch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("file.ts");
+        std::fs::write(&path, "export const n = 1;\n").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = with_runtime(|| {
+            let mut app = App::new(dir, LanguageClient { tx });
+            app.open_path(path.clone());
+            app
+        });
+        std::fs::write(&path, "export const n = 2;\n").unwrap();
+        with_runtime(|| {
+            super::receive_git_write(
+                &mut app,
+                crate::workspace::GitWriteResult {
+                    ok: true,
+                    message: String::new(),
+                    reload: None,
+                    close_path: None,
+                    committed: None,
+                    committed_body: None,
+                    notice: Some("Switched to topic".into()),
+                    branch: true,
+                },
+            );
+        });
+        assert_eq!(
+            app.documents.values().next().unwrap().text(),
+            "export const n = 2;\n"
+        );
+        assert!(matches!(app.overlay, Overlay::None));
         let _ = std::fs::remove_dir_all(app.root.clone());
     }
 

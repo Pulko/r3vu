@@ -854,7 +854,38 @@ pub fn classify_watch_kind(kind: EventKind) -> Option<WatchKind> {
     }
 }
 
+pub fn is_git_metadata(path: &Path) -> bool {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".lock"))
+    {
+        return false;
+    }
+    let mut rest = PathBuf::new();
+    let mut seen_git = false;
+    for component in path.components() {
+        if !seen_git {
+            if component.as_os_str() == ".git" {
+                seen_git = true;
+            }
+            continue;
+        }
+        rest.push(component);
+    }
+    if !seen_git {
+        return false;
+    }
+    rest.as_path() == Path::new("HEAD")
+        || rest.as_path() == Path::new("index")
+        || rest.as_path() == Path::new("packed-refs")
+        || rest.starts_with(Path::new("refs").join("heads"))
+}
+
 pub fn is_watch_noise(path: &Path) -> bool {
+    if is_git_metadata(path) {
+        return false;
+    }
     if path
         .components()
         .any(|component| component.as_os_str() == ".git")
@@ -867,6 +898,9 @@ pub fn is_watch_noise(path: &Path) -> bool {
 }
 
 pub fn accept_watch_path(root: &Path, path: &Path, ignore: &mut ignore::IncrementalIgnore) -> bool {
+    if is_git_metadata(path) {
+        return true;
+    }
     if is_watch_noise(path) {
         return false;
     }
@@ -3385,8 +3419,17 @@ diff --git a/readme.md b/readme.md
         assert!(!WatchKind::Modify.changes_tree());
 
         let root = Path::new("/repo");
-        assert!(is_watch_noise(&root.join(".git/index")));
+        assert!(is_git_metadata(&root.join(".git/HEAD")));
+        assert!(is_git_metadata(&root.join(".git/index")));
+        assert!(is_git_metadata(&root.join(".git/refs/heads/main")));
+        assert!(is_git_metadata(&root.join(".git/packed-refs")));
+        assert!(!is_git_metadata(&root.join(".git/index.lock")));
+        assert!(!is_git_metadata(&root.join(".git/objects/ab/cd")));
+        assert!(!is_watch_noise(&root.join(".git/HEAD")));
+        assert!(!is_watch_noise(&root.join(".git/index")));
         assert!(is_watch_noise(&root.join(".git/index.lock")));
+        assert!(is_watch_noise(&root.join(".git/objects/ab/cd")));
+        assert!(is_watch_noise(&root.join(".git/logs/HEAD")));
         assert!(is_watch_noise(&root.join("index.lock")));
         assert!(!is_watch_noise(&root.join("src/main.rs")));
     }
@@ -3425,9 +3468,39 @@ diff --git a/readme.md b/readme.md
             &root.join("notes.p0tmp"),
             &mut ignore
         ));
-        assert!(!accept_watch_path(
+        assert!(accept_watch_path(
             &root,
             &root.join(".git/HEAD"),
+            &mut ignore
+        ));
+        assert!(accept_watch_path(
+            &root,
+            &root.join(".git/index"),
+            &mut ignore
+        ));
+        assert!(accept_watch_path(
+            &root,
+            &root.join(".git/refs/heads/main"),
+            &mut ignore
+        ));
+        assert!(accept_watch_path(
+            &root,
+            &root.join(".git/packed-refs"),
+            &mut ignore
+        ));
+        assert!(!accept_watch_path(
+            &root,
+            &root.join(".git/objects/ab/cd"),
+            &mut ignore
+        ));
+        assert!(!accept_watch_path(
+            &root,
+            &root.join(".git/index.lock"),
+            &mut ignore
+        ));
+        assert!(!accept_watch_path(
+            &root,
+            &root.join(".git/refs/heads/main.lock"),
             &mut ignore
         ));
     }

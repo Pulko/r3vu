@@ -405,6 +405,7 @@ pub struct App {
     git_status_running: bool,
     git_status_again: bool,
     git_status_at: Option<Instant>,
+    git_external: bool,
     pub diff_baselines: HashMap<DocumentId, FileBaselines>,
     pub review_patches: HashMap<DocumentId, ReviewPatches>,
     pub reveal_change: Option<DocumentId>,
@@ -538,6 +539,7 @@ impl App {
             git_status_running: false,
             git_status_again: false,
             git_status_at: None,
+            git_external: false,
             diff_baselines: HashMap::new(),
             review_patches: HashMap::new(),
             reveal_change: None,
@@ -657,6 +659,14 @@ impl App {
 
     pub fn schedule_git_status(&mut self) {
         self.git_status_at = Some(Instant::now() + GIT_STATUS_DEBOUNCE);
+    }
+
+    pub fn note_external_git(&mut self) {
+        self.git_external = true;
+    }
+
+    pub fn external_git_pending(&self) -> bool {
+        self.git_external
     }
 
     pub fn git_status_delay(&self) -> Option<Duration> {
@@ -943,6 +953,11 @@ impl App {
 
     pub fn receive_git_status(&mut self, result: crate::workspace::GitStatusUpdate) {
         self.git_status_running = false;
+        let follow_up = self.git_status_again;
+        let external = self.git_external;
+        if !follow_up {
+            self.git_external = false;
+        }
         match result {
             Ok(snapshot) => {
                 self.git_repo = true;
@@ -963,6 +978,9 @@ impl App {
                 }
                 if self.git_ahead_behind.is_some() {
                     self.git_publish_armed = false;
+                }
+                if external && !follow_up {
+                    crate::app::commands::settle_external_git(self);
                 }
                 let open: Vec<_> = self.order.clone();
                 for id in open {

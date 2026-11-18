@@ -412,20 +412,28 @@ pub fn open_search_file(app: &mut App) {
     } else {
         SearchScope::Global
     };
-    if let Overlay::Search {
-        kind: SearchKind::Content,
-        scope: current,
-        ..
-    } = &app.overlay
-    {
-        if *current == scope {
-            app.overlay = Overlay::None;
-            return;
-        }
-        set_search_scope(app, scope);
+    let current = match &app.overlay {
+        Overlay::Search {
+            kind: SearchKind::Content,
+            scope,
+            ..
+        } => Some(*scope),
+        _ => None,
+    };
+    let Some(current) = current else {
+        begin_content_search(app, scope, editor_search_seed(app));
+        return;
+    };
+    let seed = editor_search_seed(app);
+    if !seed.is_empty() {
+        begin_content_search(app, scope, seed);
         return;
     }
-    begin_content_search(app, scope, editor_search_seed(app));
+    if current == scope {
+        app.overlay = Overlay::None;
+        return;
+    }
+    set_search_scope(app, scope);
 }
 
 fn begin_content_search(app: &mut App, mut scope: SearchScope, query: String) {
@@ -2945,6 +2953,46 @@ mod tests {
                 cursor: Position::new(2, 8),
             })
         );
+    }
+
+    #[test]
+    fn open_search_file_reseeds_an_open_search_from_the_selection() {
+        let (mut app, ids) = app_with_tabs(1);
+        let id = ids[0];
+        app.documents.get_mut(&id).unwrap().rope =
+            Rope::from("alpha here\nbeta\n  alpha  \nbeta again\n");
+        app.views.get_mut(&id).unwrap().selection = Some(Selection {
+            anchor: Position::new(2, 2),
+            cursor: Position::new(2, 7),
+        });
+        open_search_file(&mut app);
+
+        app.views.get_mut(&id).unwrap().selection = Some(Selection {
+            anchor: Position::new(3, 0),
+            cursor: Position::new(3, 4),
+        });
+        open_search_file(&mut app);
+        match &app.overlay {
+            Overlay::Search {
+                kind,
+                scope,
+                query,
+                file_matches,
+                selected,
+                ..
+            } => {
+                assert_eq!(*kind, SearchKind::Content);
+                assert_eq!(*scope, SearchScope::File);
+                assert_eq!(query, "beta");
+                assert_eq!(file_matches.len(), 2);
+                assert_eq!(*selected, 1);
+            }
+            other => panic!("expected file search, got {other:?}"),
+        }
+
+        app.views.get_mut(&id).unwrap().selection = None;
+        open_search_file(&mut app);
+        assert!(matches!(app.overlay, Overlay::None));
     }
 
     #[test]

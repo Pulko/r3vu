@@ -533,6 +533,7 @@ pub(crate) fn shortcut_rows(git: bool) -> Vec<(&'static str, &'static str)> {
             ("Ctrl+Shift+G", "Git panel"),
             ("Click Changes", "Stage and commit"),
             ("Space", "Stage or unstage the file"),
+            ("Click ↩", "Discard or restore the file or folder"),
             ("Click ▾", "Fold or unfold a change"),
             ("Click Stage", "Stage, unstage, discard, or revert a hunk"),
             ("Click Current", "Keep a side, then save and stage the file"),

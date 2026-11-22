@@ -66,8 +66,6 @@ pub enum MenuAction {
     CloseOthers(DocumentId),
     CloseAll,
     AskClaude,
-    DiscardFile,
-    RestoreFile,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,6 +227,7 @@ pub enum GitClick {
     StageAll,
     UnstageAll,
     Toggle { path: PathBuf, staged: bool },
+    Discard { path: PathBuf },
     Open { path: PathBuf, staged: bool },
     DeleteConflict { path: PathBuf },
     Fold { path: PathBuf, staged: bool },
@@ -429,6 +428,7 @@ pub struct App {
     pub git_open: bool,
     pub git_selected: usize,
     pub git_scroll: usize,
+    pub git_hover: Option<(PathBuf, bool)>,
     git_collapsed: HashSet<(PathBuf, bool)>,
     pub git_message: String,
     pub git_message_focus: bool,
@@ -564,6 +564,7 @@ impl App {
             git_open: false,
             git_selected: 0,
             git_scroll: 0,
+            git_hover: None,
             git_collapsed: HashSet::new(),
             git_message: String::new(),
             git_message_focus: false,
@@ -2687,6 +2688,7 @@ mod tests {
     use crate::language::LanguageClient;
     use crate::workspace::{
         DiffBaseline, FileBaselines, GitFileStatus, GitPathStatus, GitSnapshot, GitStatusError,
+        GitWrite,
     };
 
     use super::*;
@@ -2712,6 +2714,55 @@ mod tests {
             .insert(id, Document::new(id, Some(path), "fn main() {}\n".into()));
         app.order.push(id);
         app.active = Some(id);
+    }
+
+    #[test]
+    fn discarding_a_folder_discards_every_change_inside_it() {
+        let root = std::env::temp_dir().join(format!("p0-discard-folder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let kept = root.join("src/kept.rs");
+        let other = root.join("src/other.rs");
+        let untracked = root.join("src/new.rs");
+        let outside = root.join("notes.txt");
+        std::fs::write(&untracked, "new\n").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = with_runtime(|| App::new(root.clone(), LanguageClient { tx }));
+        app.git_repo = true;
+        app.git_write_running = true;
+        for path in [&kept, &other, &outside] {
+            app.git_status.insert(
+                path.clone(),
+                GitPathStatus {
+                    staged: None,
+                    unstaged: Some(GitFileStatus::Modified),
+                    conflict: None,
+                },
+            );
+        }
+        app.git_status.insert(
+            untracked.clone(),
+            GitPathStatus {
+                staged: None,
+                unstaged: Some(GitFileStatus::Untracked),
+                conflict: None,
+            },
+        );
+        app.git_status.insert(
+            root.join("src/fight.rs"),
+            GitPathStatus {
+                staged: None,
+                unstaged: Some(GitFileStatus::Conflict),
+                conflict: Some(crate::workspace::ConflictKind::Both),
+            },
+        );
+        with_runtime(|| crate::app::commands::discard_git_path(&mut app, root.join("src")));
+        assert!(!untracked.exists());
+        assert_eq!(
+            app.git_write_queue.iter().cloned().collect::<Vec<_>>(),
+            vec![GitWrite::Restore(kept), GitWrite::Restore(other)]
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -1890,78 +1890,44 @@ pub fn show_explorer_menu(app: &mut App, x: u16, y: u16) {
     };
 }
 
-pub fn show_git_menu(app: &mut App, x: u16, y: u16) {
-    let rows = app.git_rows();
-    if let Some(crate::workspace::GitPanelRow::Dir { deleted: true, .. }) =
-        rows.get(app.git_selected)
-    {
-        app.overlay = Overlay::ContextMenu {
-            x,
-            y,
-            selected: 0,
-            show_type: false,
-            type_text: String::new(),
-            hover_token: 0,
-            items: vec![MenuItem {
-                label: "Restore".into(),
-                action: MenuAction::RestoreFile,
-                enabled: true,
-            }],
-        };
+pub(crate) fn discard_git_path(app: &mut App, path: PathBuf) {
+    let deleted_dir = app.git_rows().iter().any(|row| {
+        matches!(
+            row,
+            crate::workspace::GitPanelRow::Dir {
+                path: row_path,
+                deleted: true,
+                ..
+            } if row_path == &path
+        )
+    });
+    if deleted_dir {
+        app.enqueue_git_write(GitWrite::Restore(path));
         return;
     }
-    let Some(crate::workspace::GitPanelRow::File { path, .. }) = rows.get(app.git_selected) else {
-        return;
-    };
-    let Some(status) = app.git_status.get(path).copied() else {
-        return;
-    };
-    if status.conflict.is_some() {
-        app.message = Some("Resolve the conflict in the file".into());
+    if app.git_status.contains_key(&path) {
+        discard_one(app, path);
         return;
     }
-    if whole_file_action(status).is_none() {
-        app.message = Some("A rename stays as it is".into());
-        return;
+    let mut paths: Vec<_> = app
+        .git_status
+        .keys()
+        .filter(|item| item.starts_with(&path) && item.as_path() != path.as_path())
+        .cloned()
+        .collect();
+    paths.sort();
+    for child in paths {
+        discard_one(app, child);
     }
-    let restore = matches!(whole_file_action(status), Some(WholeFileAction::Restore));
-    app.overlay = Overlay::ContextMenu {
-        x,
-        y,
-        selected: 0,
-        show_type: false,
-        type_text: String::new(),
-        hover_token: 0,
-        items: vec![MenuItem {
-            label: if restore { "Restore" } else { "Discard" }.into(),
-            action: if restore {
-                MenuAction::RestoreFile
-            } else {
-                MenuAction::DiscardFile
-            },
-            enabled: true,
-        }],
-    };
 }
 
-fn apply_selected_git_file(app: &mut App) {
-    let rows = app.git_rows();
-    if let Some(crate::workspace::GitPanelRow::Dir {
-        path,
-        deleted: true,
-        ..
-    }) = rows.get(app.git_selected)
-    {
-        app.enqueue_git_write(GitWrite::Restore(path.clone()));
-        return;
-    }
-    let Some(crate::workspace::GitPanelRow::File { path, .. }) = rows.get(app.git_selected) else {
-        return;
-    };
-    let path = path.clone();
+fn discard_one(app: &mut App, path: PathBuf) {
     let Some(status) = app.git_status.get(&path).copied() else {
         return;
     };
+    if status.conflict.is_some() {
+        return;
+    }
     match whole_file_action(status) {
         Some(WholeFileAction::Restore) => app.enqueue_git_write(GitWrite::Restore(path)),
         Some(WholeFileAction::Remove) => app.enqueue_git_write(GitWrite::Remove(path)),
@@ -2140,8 +2106,6 @@ pub fn run_menu(app: &mut App, action: MenuAction) {
             app.close_documents(&ids);
         }
         MenuAction::AskClaude => start_thread(app),
-        MenuAction::DiscardFile => apply_selected_git_file(app),
-        MenuAction::RestoreFile => apply_selected_git_file(app),
         MenuAction::DeletePath => {
             if let Some(entry) = app.explorer_entries.get(app.explorer_selected) {
                 app.delete_path_now(entry.path.clone());
@@ -2921,16 +2885,10 @@ pub fn move_git(app: &mut App, delta: i32) {
 
 pub fn open_selected_git(app: &mut App) {
     let rows = app.git_rows();
-    if let Some(crate::workspace::GitPanelRow::Dir {
-        path,
-        staged,
-        deleted,
-        ..
-    }) = rows.get(app.git_selected)
+    if let Some(crate::workspace::GitPanelRow::Dir { path, staged, .. }) =
+        rows.get(app.git_selected)
     {
-        if !*deleted {
-            app.toggle_git_folder(path.clone(), *staged);
-        }
+        app.toggle_git_folder(path.clone(), *staged);
         return;
     }
     let Some(crate::workspace::GitPanelRow::File { path, staged, .. }) = rows.get(app.git_selected)
@@ -2998,6 +2956,18 @@ pub fn git_file_index_at(app: &App, y: u16) -> Option<usize> {
         .then_some(index)
 }
 
+pub fn hover_git_row(app: &mut App, y: u16) {
+    let Some(index) = git_file_index_at(app, y) else {
+        app.git_hover = None;
+        return;
+    };
+    app.git_hover = app.git_rows().get(index).and_then(|row| match row {
+        crate::workspace::GitPanelRow::File { path, staged, .. }
+        | crate::workspace::GitPanelRow::Dir { path, staged, .. } => Some((path.clone(), *staged)),
+        _ => None,
+    });
+}
+
 pub fn click_git(app: &mut App, x: u16, y: u16) {
     app.focus = Focus::Explorer;
     if let Some(action) = app
@@ -3028,6 +2998,7 @@ pub fn click_git(app: &mut App, x: u16, y: u16) {
             crate::app::state::GitClick::StageAll => app.stage_all(),
             crate::app::state::GitClick::UnstageAll => app.unstage_all(),
             crate::app::state::GitClick::Toggle { path, staged } => app.toggle_stage(path, staged),
+            crate::app::state::GitClick::Discard { path } => discard_git_path(app, path),
             crate::app::state::GitClick::Fold { path, staged } => {
                 if let Some(index) = app.git_rows().iter().position(|row| {
                     matches!(
@@ -3698,7 +3669,7 @@ mod tests {
                 )
             })
             .expect("deleted folder");
-        with_runtime(|| super::run_menu(&mut app, MenuAction::RestoreFile));
+        with_runtime(|| super::discard_git_path(&mut app, gone.clone()));
         assert!(matches!(app.overlay, Overlay::None));
         assert!(app.git_busy());
         let _ = std::fs::remove_dir_all(&root);

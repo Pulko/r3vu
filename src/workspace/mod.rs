@@ -1866,9 +1866,6 @@ fn section_tree(
 ) -> Vec<GitPanelRow> {
     let mut nodes: BTreeMap<PathBuf, TreeNode> = BTreeMap::new();
     for (path, status) in files {
-        if path_in_deleted_folder(path, folders) {
-            continue;
-        }
         let Some(kind) = (if staged {
             status.staged
         } else {
@@ -1901,8 +1898,8 @@ fn section_tree(
             });
             continue;
         }
-        let expanded = !node.deleted && !collapsed.contains(&(path.clone(), staged));
-        if !node.deleted && !expanded {
+        let expanded = !collapsed.contains(&(path.clone(), staged));
+        if !expanded {
             skip = Some(path.clone());
         }
         rows.push(GitPanelRow::Dir {
@@ -1915,10 +1912,6 @@ fn section_tree(
         });
     }
     rows
-}
-
-fn path_in_deleted_folder(path: &Path, folders: &[(PathBuf, bool)]) -> bool {
-    folders.iter().any(|(dir, _)| covers(dir, path))
 }
 
 fn insert_leaf(
@@ -3450,12 +3443,55 @@ diff --git a/readme.md b/readme.md
             &changes[5],
             GitPanelRow::Dir {
                 deleted: true,
+                expanded: true,
                 depth: 1,
                 path,
                 ..
             } if path.ends_with("src/old")
         ));
-        assert_eq!(changes.len(), 6);
+        assert!(matches!(
+            &changes[6],
+            GitPanelRow::File {
+                status: GitFileStatus::Deleted,
+                depth: 2,
+                path,
+                ..
+            } if path.ends_with("src/old/a.ts")
+        ));
+        assert!(matches!(
+            &changes[7],
+            GitPanelRow::Dir {
+                deleted: false,
+                expanded: true,
+                depth: 2,
+                path,
+                ..
+            } if path.ends_with("src/old/nested")
+        ));
+        assert!(matches!(
+            &changes[8],
+            GitPanelRow::File {
+                status: GitFileStatus::Deleted,
+                depth: 3,
+                path,
+                ..
+            } if path.ends_with("nested/b.ts")
+        ));
+        assert_eq!(changes.len(), 9);
+        let mut hide_old = HashSet::new();
+        hide_old.insert((root.join("src/old"), false));
+        let hidden_rows = git_panel_rows(&root, &files, &hide_old);
+        let hidden = changes_entries(&hidden_rows);
+        assert!(matches!(
+            hidden.last(),
+            Some(GitPanelRow::Dir {
+                deleted: true,
+                expanded: false,
+                path,
+                ..
+            }) if path.ends_with("src/old")
+        ));
+        assert_eq!(hidden.len(), 6);
 
         let mut collapsed = HashSet::new();
         collapsed.insert((root.join("src"), false));
@@ -3481,10 +3517,36 @@ diff --git a/readme.md b/readme.md
         only_deleted.insert(path, status);
         let whole = git_panel_rows(&gone, &only_deleted, &HashSet::new());
         let whole_changes = changes_entries(&whole);
-        assert_eq!(whole_changes.len(), 1);
         assert!(matches!(
             &whole_changes[0],
-            GitPanelRow::Dir { deleted: true, path, .. } if path.ends_with("src")
+            GitPanelRow::Dir {
+                deleted: true,
+                expanded: true,
+                path,
+                ..
+            } if path.ends_with("src")
+        ));
+        assert!(whole_changes.iter().any(|row| matches!(
+            row,
+            GitPanelRow::File { path, status: GitFileStatus::Deleted, .. } if path.ends_with("a.ts")
+        )));
+        assert!(whole_changes.iter().any(|row| matches!(
+            row,
+            GitPanelRow::File { path, status: GitFileStatus::Deleted, .. } if path.ends_with("b.ts")
+        )));
+        let mut collapsed = HashSet::new();
+        collapsed.insert((gone.join("src"), false));
+        let folded_rows = git_panel_rows(&gone, &only_deleted, &collapsed);
+        let folded = changes_entries(&folded_rows);
+        assert_eq!(folded.len(), 1);
+        assert!(matches!(
+            &folded[0],
+            GitPanelRow::Dir {
+                deleted: true,
+                expanded: false,
+                path,
+                ..
+            } if path.ends_with("src")
         ));
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&gone);

@@ -362,6 +362,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             } else {
                 commands::cancel_hover(app);
             }
+            if in_explorer && app.git_open {
+                commands::hover_git_row(app, y);
+            } else {
+                app.git_hover = None;
+            }
         }
         MouseEventKind::Down(MouseButton::Left) => {
             commands::cancel_hover(app);
@@ -628,7 +633,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                 if let Some(index) = commands::git_file_index_at(app, y) {
                     app.git_selected = index;
                     app.focus = Focus::Explorer;
-                    commands::show_git_menu(app, x, y);
                 }
             } else if in_explorer && !app.git_open && y != app.explorer_area.1 {
                 app.focus = Focus::Explorer;

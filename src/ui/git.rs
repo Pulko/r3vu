@@ -9,7 +9,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::App;
 use crate::app::state::{GitClick, GitHit, git_footer_layout, max_git_scroll};
 use crate::ui::theme::Theme;
-use crate::workspace::{GitFileStatus, GitPanelRow};
+use crate::workspace::{GitFileStatus, GitPanelRow, whole_file_action};
 
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     app.git_hits.clear();
@@ -28,14 +28,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let message_focus = app.git_message_focus;
     let body = app.git_body.clone();
     let body_focus = app.git_body_focus;
-    let selected = app.git_selected;
     let scroll = app.git_scroll;
     let origin_x = area.x.saturating_add(1);
     let mut lines = Vec::new();
-    for (index, row) in rows.iter().enumerate().skip(scroll).take(list_h) {
+    for row in rows.iter().skip(scroll).take(list_h) {
         let y = area.y.saturating_add(1).saturating_add(lines.len() as u16);
-        let on = index == selected;
-        lines.push(row_line(app, row, theme, inner_w, origin_x, y, on));
+        lines.push(row_line(app, row, theme, inner_w, origin_x, y));
     }
     while lines.len() < list_h {
         lines.push(Line::from(""));
@@ -114,18 +112,8 @@ fn row_line(
     inner_w: usize,
     x: u16,
     y: u16,
-    selected: bool,
 ) -> Line<'static> {
-    let selected_style = |color: Color| {
-        if selected {
-            Style::default()
-                .fg(color)
-                .bg(theme.bg_selected)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(color)
-        }
-    };
+    let paint = |color: Color| Style::default().fg(color);
     match row {
         GitPanelRow::Conflicts => {
             let title = "Conflicts ";
@@ -133,17 +121,13 @@ fn row_line(
             if head_w >= inner_w {
                 return Line::from(Span::styled(
                     fit("Conflicts", inner_w),
-                    selected_style(theme.deleted),
+                    paint(theme.deleted),
                 ));
             }
             let rule = "─".repeat(inner_w - head_w);
-            let rule_style = if selected {
-                selected_style(theme.deleted)
-            } else {
-                Style::default().fg(theme.deleted)
-            };
+            let rule_style = Style::default().fg(theme.deleted);
             Line::from(vec![
-                Span::styled(title.to_string(), selected_style(theme.deleted)),
+                Span::styled(title.to_string(), paint(theme.deleted)),
                 Span::styled(rule, rule_style),
             ])
         }
@@ -160,18 +144,14 @@ fn row_line(
             if head_w >= inner_w {
                 return Line::from(Span::styled(
                     fit(&format!("{mark} {title}"), inner_w),
-                    selected_style(theme.fg),
+                    paint(theme.fg),
                 ));
             }
             let rule = "─".repeat(inner_w - head_w);
-            let rule_style = if selected {
-                selected_style(theme.fg_dim)
-            } else {
-                Style::default().fg(theme.border)
-            };
+            let rule_style = Style::default().fg(theme.border);
             Line::from(vec![
-                Span::styled(mark.to_string(), selected_style(theme.accent)),
-                Span::styled(format!(" {title} "), selected_style(theme.fg)),
+                Span::styled(mark.to_string(), paint(theme.accent)),
+                Span::styled(format!(" {title} "), paint(theme.fg)),
                 Span::styled(rule, rule_style),
             ])
         }
@@ -194,8 +174,6 @@ fn row_line(
             inner_w,
             x,
             y,
-            selected,
-            selected_style,
         ),
         GitPanelRow::File {
             path,
@@ -222,7 +200,7 @@ fn row_line(
                 hit(app, x, y, open_w, action);
             }
             let color = super::explorer::git_mark_color(*status, false, theme);
-            let name_style = selected_style(if selected { theme.fg } else { theme.deleted });
+            let name_style = paint(theme.deleted);
             Line::from(vec![
                 Span::styled(name, name_style),
                 Span::styled(mark, Style::default().fg(color)),
@@ -234,51 +212,31 @@ fn row_line(
             staged,
             depth,
         } => {
-            let tick = if *staged { "−" } else { "+" };
             let indent = " ".repeat(depth.saturating_mul(2));
-            let indent_w = UnicodeWidthStr::width(indent.as_str());
-            let tick_w = UnicodeWidthStr::width(tick);
-            hit(
+            let name_style = paint(theme.fg_muted);
+            let discard = file_discardable(app, path);
+            let open = GitClick::Open {
+                path: path.clone(),
+                staged: *staged,
+            };
+            entry_line(
                 app,
-                x.saturating_add(indent_w as u16),
+                path,
+                &indent,
+                None,
+                &entry_name(path),
+                &format!(" {}", letter(*status)),
+                super::explorer::git_mark_color(*status, *staged, theme),
+                discard,
+                Some(*staged),
+                row_hovered(app, path, *staged),
+                theme,
+                name_style,
+                inner_w,
+                x,
                 y,
-                tick_w as u16,
-                GitClick::Toggle {
-                    path: path.clone(),
-                    staged: *staged,
-                },
-            );
-            let name = entry_name(path);
-            let mark = format!(" {}", letter(*status));
-            let mark_w = UnicodeWidthStr::width(mark.as_str());
-            let prefix_w = indent_w.saturating_add(tick_w).saturating_add(1);
-            let name = fit(
-                &name,
-                inner_w.saturating_sub(prefix_w.saturating_add(mark_w)),
-            );
-            let open_x = x.saturating_add(prefix_w as u16);
-            let open_w = inner_w.saturating_sub(prefix_w) as u16;
-            if open_w > 0 {
-                hit(
-                    app,
-                    open_x,
-                    y,
-                    open_w,
-                    GitClick::Open {
-                        path: path.clone(),
-                        staged: *staged,
-                    },
-                );
-            }
-            let color = super::explorer::git_mark_color(*status, *staged, theme);
-            let name_style = selected_style(if selected { theme.fg } else { theme.fg_muted });
-            Line::from(vec![
-                Span::styled(indent, name_style),
-                Span::styled(tick.to_string(), Style::default().fg(theme.accent)),
-                Span::styled(" ", name_style),
-                Span::styled(name, name_style),
-                Span::styled(mark, Style::default().fg(color)),
-            ])
+                Some(open),
+            )
         }
     }
 }
@@ -295,68 +253,181 @@ fn dir_line(
     inner_w: usize,
     x: u16,
     y: u16,
-    selected: bool,
-    selected_style: impl Fn(Color) -> Style,
 ) -> Line<'static> {
     let indent = " ".repeat(depth.saturating_mul(2));
-    let indent_w = UnicodeWidthStr::width(indent.as_str());
-    let name = entry_name(path);
-    let mark = format!(" {}", letter(status));
-    let mark_w = UnicodeWidthStr::width(mark.as_str());
-    let name_style = selected_style(if selected { theme.fg } else { theme.fg_muted });
+    let name_style = Style::default().fg(theme.fg_muted);
     let color = super::explorer::git_mark_color(status, staged, theme);
-    if deleted {
-        let tick = if staged { "−" } else { "+" };
-        let tick_w = UnicodeWidthStr::width(tick);
-        hit(
-            app,
-            x.saturating_add(indent_w as u16),
-            y,
-            tick_w as u16,
-            GitClick::Toggle {
-                path: path.to_path_buf(),
-                staged,
-            },
-        );
-        let prefix_w = indent_w.saturating_add(tick_w).saturating_add(1);
-        let name = fit(
-            &name,
-            inner_w.saturating_sub(prefix_w.saturating_add(mark_w)),
-        );
-        return Line::from(vec![
-            Span::styled(indent, name_style),
-            Span::styled(tick.to_string(), Style::default().fg(theme.accent)),
-            Span::styled(" ", name_style),
-            Span::styled(name, name_style),
-            Span::styled(mark, Style::default().fg(color)),
-        ]);
-    }
+    let mark = format!(" {}", letter(status));
     let marker = if expanded { "▾ " } else { "▸ " };
-    let marker_w = UnicodeWidthStr::width(marker);
-    let prefix_w = indent_w.saturating_add(marker_w);
-    let name = fit(
-        &name,
-        inner_w.saturating_sub(prefix_w.saturating_add(mark_w)),
-    );
-    let row_w = inner_w as u16;
-    if row_w > 0 {
-        hit(
-            app,
-            x,
-            y,
-            row_w,
-            GitClick::Fold {
-                path: path.to_path_buf(),
-                staged,
-            },
-        );
+    let discard = deleted || folder_discardable(app, path);
+    let fold = GitClick::Fold {
+        path: path.to_path_buf(),
+        staged,
+    };
+    entry_line(
+        app,
+        path,
+        &indent,
+        Some(marker),
+        &entry_name(path),
+        &mark,
+        color,
+        discard,
+        deleted.then_some(staged),
+        row_hovered(app, path, staged),
+        theme,
+        name_style,
+        inner_w,
+        x,
+        y,
+        Some(fold),
+    )
+}
+
+fn row_hovered(app: &App, path: &std::path::Path, staged: bool) -> bool {
+    app.git_hover
+        .as_ref()
+        .is_some_and(|(hover, hover_staged)| hover == path && *hover_staged == staged)
+}
+
+fn file_discardable(app: &App, path: &std::path::Path) -> bool {
+    app.git_status
+        .get(path)
+        .copied()
+        .is_some_and(status_discardable)
+}
+
+fn folder_discardable(app: &App, dir: &std::path::Path) -> bool {
+    app.git_status.iter().any(|(path, status)| {
+        path.starts_with(dir) && path.as_path() != dir && status_discardable(*status)
+    })
+}
+
+fn status_discardable(status: crate::workspace::GitPathStatus) -> bool {
+    status.conflict.is_none() && whole_file_action(status).is_some()
+}
+
+fn entry_line(
+    app: &mut App,
+    path: &std::path::Path,
+    indent: &str,
+    marker: Option<&str>,
+    name: &str,
+    mark: &str,
+    mark_color: Color,
+    discard: bool,
+    staged: Option<bool>,
+    show_actions: bool,
+    theme: Theme,
+    name_style: Style,
+    inner_w: usize,
+    x: u16,
+    y: u16,
+    wide: Option<GitClick>,
+) -> Line<'static> {
+    let indent_w = UnicodeWidthStr::width(indent);
+    let marker_w = marker.map(UnicodeWidthStr::width).unwrap_or(0);
+    let left_w = indent_w.saturating_add(marker_w);
+    let mark_w = UnicodeWidthStr::width(mark);
+    let icon = "↩";
+    let icon_w = UnicodeWidthStr::width(icon);
+    let tick = staged.map(|staged| if staged { "−" } else { "+" });
+    let tick_w = tick.map(UnicodeWidthStr::width).unwrap_or(0);
+    let discard_w = if discard { icon_w.saturating_add(1) } else { 0 };
+    let stage_w = if tick.is_some() {
+        tick_w.saturating_add(1)
+    } else {
+        0
+    };
+    let right_w = mark_w.saturating_add(discard_w).saturating_add(stage_w);
+    let name = fit(name, inner_w.saturating_sub(left_w.saturating_add(right_w)));
+    let name_w = UnicodeWidthStr::width(name.as_str());
+    let action_w = discard_w.saturating_add(stage_w);
+    let gap = inner_w
+        .saturating_sub(left_w)
+        .saturating_sub(name_w)
+        .saturating_sub(mark_w)
+        .saturating_sub(action_w);
+    let mut spans = vec![Span::styled(indent.to_string(), name_style)];
+    if let Some(marker) = marker {
+        spans.push(Span::styled(marker.to_string(), name_style));
     }
-    Line::from(vec![
-        Span::styled(indent, name_style),
-        Span::styled(marker.to_string(), name_style),
-        Span::styled(name, name_style),
-        Span::styled(mark, Style::default().fg(color)),
-    ])
+    spans.push(Span::styled(name, name_style));
+    if gap > 0 {
+        spans.push(Span::styled(" ".repeat(gap), name_style));
+    }
+    let mut cursor = left_w.saturating_add(name_w).saturating_add(gap);
+    if show_actions {
+        if discard {
+            cursor = cursor.saturating_add(1);
+            hit(
+                app,
+                x.saturating_add(cursor as u16),
+                y,
+                icon_w as u16,
+                GitClick::Discard {
+                    path: path.to_path_buf(),
+                },
+            );
+            spans.push(Span::styled(" ".to_string(), name_style));
+            spans.push(Span::styled(
+                icon.to_string(),
+                Style::default().fg(theme.deleted),
+            ));
+            cursor = cursor.saturating_add(icon_w);
+        }
+        if let Some(tick) = tick {
+            cursor = cursor.saturating_add(1);
+            hit(
+                app,
+                x.saturating_add(cursor as u16),
+                y,
+                tick_w as u16,
+                GitClick::Toggle {
+                    path: path.to_path_buf(),
+                    staged: staged.unwrap_or(false),
+                },
+            );
+            spans.push(Span::styled(" ".to_string(), name_style));
+            spans.push(Span::styled(
+                tick.to_string(),
+                Style::default().fg(theme.accent),
+            ));
+        }
+    } else if action_w > 0 {
+        spans.push(Span::styled(" ".repeat(action_w), name_style));
+    }
+    spans.push(Span::styled(
+        mark.to_string(),
+        Style::default().fg(mark_color),
+    ));
+    if let Some(action) = wide {
+        let before = left_w.saturating_add(name_w).saturating_add(gap);
+        if show_actions && action_w > 0 {
+            if before > 0 {
+                hit(app, x, y, before.min(inner_w) as u16, action.clone());
+            }
+            let mark_at = before.saturating_add(action_w);
+            if mark_w > 0 {
+                hit(
+                    app,
+                    x.saturating_add(mark_at as u16),
+                    y,
+                    mark_w.min(inner_w.saturating_sub(mark_at)) as u16,
+                    action,
+                );
+            }
+        } else {
+            let wide_w = before
+                .saturating_add(action_w)
+                .saturating_add(mark_w)
+                .min(inner_w) as u16;
+            if wide_w > 0 {
+                hit(app, x, y, wide_w, action);
+            }
+        }
+    }
+    Line::from(spans)
 }
 
 fn entry_name(path: &std::path::Path) -> String {

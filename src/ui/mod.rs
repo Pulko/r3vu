@@ -426,6 +426,11 @@ mod tests {
                 .iter()
                 .any(|hit| matches!(hit.action, crate::app::state::GitClick::Toggle { .. }))
         );
+        assert!(
+            !app.git_hits
+                .iter()
+                .any(|hit| matches!(hit.action, crate::app::state::GitClick::Discard { .. }))
+        );
     }
 
     #[test]
@@ -553,14 +558,50 @@ mod tests {
             terminal.backend().buffer()[(quiet.x, quiet.y)].bg,
             theme.border
         );
-        assert!(app.git_hits.iter().any(|hit| matches!(
-            hit.action,
-            crate::app::state::GitClick::Toggle { staged: true, .. }
-        )));
-        assert!(app.git_hits.iter().any(|hit| matches!(
-            hit.action,
-            crate::app::state::GitClick::Toggle { staged: false, .. }
-        )));
+        assert!(!app.git_hits.iter().any(|hit| {
+            matches!(
+                hit.action,
+                crate::app::state::GitClick::Toggle { .. }
+                    | crate::app::state::GitClick::Discard { .. }
+            )
+        }));
+        app.git_hover = Some((PathBuf::from("/repo/src/main.rs"), false));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let stage = app
+            .git_hits
+            .iter()
+            .find(|hit| {
+                matches!(
+                    &hit.action,
+                    crate::app::state::GitClick::Toggle {
+                        path,
+                        staged: false
+                    } if path.ends_with("main.rs")
+                )
+            })
+            .expect("stage");
+        let discard = app
+            .git_hits
+            .iter()
+            .find(|hit| {
+                hit.y == stage.y
+                    && matches!(
+                        &hit.action,
+                        crate::app::state::GitClick::Discard { path } if path.ends_with("main.rs")
+                    )
+            })
+            .expect("discard");
+        let inner_end = app.explorer_area.0 + app.explorer_area.2 - 1;
+        let letter = inner_end.saturating_sub(1);
+        assert_eq!(buffer[(letter, stage.y)].symbol(), "M");
+        assert!(stage.x.saturating_add(stage.width) < letter);
+        assert_eq!(
+            stage.x,
+            discard.x.saturating_add(discard.width).saturating_add(1)
+        );
+        assert!(slice_text(&buffer, discard.x, discard.y, discard.width).contains("↩"));
+        assert_eq!(buffer[(discard.x, discard.y)].fg, theme.deleted);
         app.git_body =
             "Why it stays.\nThe review still holds.\nAnd one more line.\nPast the fold.".into();
         app.git_body_open = true;
@@ -611,6 +652,177 @@ mod tests {
             terminal.backend().buffer()[(focused.x, focused.y)].bg,
             theme.bg_selected
         );
+    }
+
+    #[test]
+    fn folder_row_keeps_the_fold_icon() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(PathBuf::from("/repo"), LanguageClient { tx });
+        app.git_repo = true;
+        app.git_open = true;
+        app.git_status.insert(
+            PathBuf::from("/repo/src/main.rs"),
+            GitPathStatus {
+                staged: None,
+                unstaged: Some(GitFileStatus::Modified),
+                conflict: None,
+            },
+        );
+        app.git_status.insert(
+            PathBuf::from("/repo/src/lib.rs"),
+            GitPathStatus {
+                staged: None,
+                unstaged: Some(GitFileStatus::Modified),
+                conflict: None,
+            },
+        );
+        app.git_status.insert(
+            PathBuf::from("/repo/conflict/a.ts"),
+            GitPathStatus {
+                staged: None,
+                unstaged: Some(GitFileStatus::Conflict),
+                conflict: Some(ConflictKind::Both),
+            },
+        );
+        app.git_hover = Some((PathBuf::from("/repo/src"), false));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let discard = app
+            .git_hits
+            .iter()
+            .find(|hit| {
+                matches!(
+                    &hit.action,
+                    crate::app::state::GitClick::Discard { path } if path.ends_with("src")
+                )
+            })
+            .expect("folder discard");
+        let row = row_text(&buffer, discard.y);
+        let chevron = row.find('▾').expect("fold icon");
+        let name = row.find("src").expect("folder name");
+        let arrow = row.find('↩').expect("discard icon");
+        assert!(chevron < name && name < arrow);
+        let chevron_x = (0..buffer.area.width)
+            .find(|col| buffer[(*col, discard.y)].symbol() == "▾")
+            .expect("fold icon");
+        let fold = app
+            .git_hits
+            .iter()
+            .find(|hit| {
+                hit.y == discard.y
+                    && matches!(
+                        &hit.action,
+                        crate::app::state::GitClick::Fold { path, .. } if path.ends_with("src")
+                    )
+            })
+            .expect("fold");
+        assert!(chevron_x < discard.x);
+        assert!(chevron_x >= fold.x && chevron_x < fold.x.saturating_add(fold.width));
+        assert!(slice_text(&buffer, discard.x, discard.y, discard.width).contains("↩"));
+        assert_eq!(buffer[(discard.x, discard.y)].fg, app.theme().deleted);
+        assert!(!app.git_hits.iter().any(|hit| {
+            hit.y == discard.y && matches!(hit.action, crate::app::state::GitClick::Toggle { .. })
+        }));
+        assert!(!app.git_hits.iter().any(|hit| {
+            matches!(
+                &hit.action,
+                crate::app::state::GitClick::Discard { path } if path.ends_with("conflict")
+            )
+        }));
+    }
+
+    #[test]
+    fn a_deleted_directory_keeps_the_fold_icon() {
+        let root = std::env::temp_dir().join(format!("p0-chevron-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(root.clone(), LanguageClient { tx });
+        app.git_repo = true;
+        app.git_open = true;
+        for name in ["src/old/a.ts", "src/old/b.ts"] {
+            app.git_status.insert(
+                root.join(name),
+                GitPathStatus {
+                    staged: None,
+                    unstaged: Some(GitFileStatus::Deleted),
+                    conflict: None,
+                },
+            );
+        }
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let fold = app
+            .git_hits
+            .iter()
+            .find(|hit| {
+                matches!(
+                    &hit.action,
+                    crate::app::state::GitClick::Fold { path, .. } if path.ends_with("src")
+                )
+            })
+            .expect("deleted folder");
+        let row = row_text(&buffer, fold.y);
+        let chevron = row.find('▾').expect("fold icon");
+        let name = row.find("src").expect("folder name");
+        assert!(chevron < name);
+        assert_eq!(buffer[(fold.x, fold.y)].symbol(), "▾");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_long_name_truncates_before_the_actions() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(PathBuf::from("/repo"), LanguageClient { tx });
+        app.git_repo = true;
+        app.git_open = true;
+        let name = "a-very-long-changed-file-name-that-cannot-fit.rs";
+        app.git_status.insert(
+            PathBuf::from(format!("/repo/{name}")),
+            GitPathStatus {
+                staged: None,
+                unstaged: Some(GitFileStatus::Modified),
+                conflict: None,
+            },
+        );
+        app.git_hover = Some((PathBuf::from(format!("/repo/{name}")), false));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let stage = app
+            .git_hits
+            .iter()
+            .find(|hit| {
+                matches!(
+                    &hit.action,
+                    crate::app::state::GitClick::Toggle { staged: false, .. }
+                )
+            })
+            .expect("stage");
+        let discard = app
+            .git_hits
+            .iter()
+            .find(|hit| {
+                hit.y == stage.y
+                    && matches!(&hit.action, crate::app::state::GitClick::Discard { .. })
+            })
+            .expect("discard");
+        let inner_end = app.explorer_area.0 + app.explorer_area.2 - 1;
+        let letter = inner_end.saturating_sub(1);
+        assert_eq!(buffer[(letter, stage.y)].symbol(), "M");
+        assert!(stage.x.saturating_add(stage.width) < letter);
+        assert_eq!(
+            stage.x,
+            discard.x.saturating_add(discard.width).saturating_add(1)
+        );
+        let row = row_text(&buffer, stage.y);
+        assert!(row.contains('…'));
+        assert!(!row.contains(name));
+        assert!(row.find('…').unwrap() < row.find('↩').unwrap());
+        assert!(stage.x.saturating_add(stage.width) <= inner_end);
+        assert!(discard.x.saturating_add(discard.width) <= stage.x);
     }
 
     fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {

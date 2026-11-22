@@ -128,10 +128,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let inner_h = area.height.saturating_sub(2) as usize;
     let inner_w = area.width.saturating_sub(2) as usize;
     let mut lines = Vec::new();
-    for (idx, entry) in app
+    for entry in app
         .explorer_entries
         .iter()
-        .enumerate()
         .skip(app.explorer_scroll)
         .take(inner_h.max(1))
     {
@@ -164,17 +163,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             })
         };
         let status = status_color(dirty, git, theme);
-        let mut style = Style::default().fg(status.unwrap_or(if entry.is_dir {
+        let style = Style::default().fg(status.unwrap_or(if entry.is_dir {
             theme.folder
         } else {
             theme.fg_muted
         }));
-        if idx == app.explorer_selected {
-            style = style.bg(theme.bg_selected).add_modifier(Modifier::BOLD);
-            if app.focus == Focus::Explorer && status.is_none() {
-                style = style.fg(theme.fg);
-            }
-        }
         let mark = status_mark(dirty, git);
         let mark_style = status
             .map(|color| Style::default().fg(color))

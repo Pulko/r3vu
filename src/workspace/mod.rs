@@ -87,6 +87,16 @@ pub struct GitSnapshot {
     pub files: HashMap<PathBuf, GitPathStatus>,
     pub branch: Option<String>,
     pub ahead_behind: Option<(u32, u32)>,
+    pub commits: Vec<GitCommit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitCommit {
+    pub hash: String,
+    pub author: String,
+    pub time: i64,
+    pub subject: String,
+    pub body: String,
 }
 
 pub fn branch_chip(branch: &str, ahead_behind: Option<(u32, u32)>) -> String {
@@ -102,6 +112,41 @@ pub fn parse_ahead_behind(output: &[u8]) -> Option<(u32, u32)> {
     let ahead = parts.next()?.parse().ok()?;
     let behind = parts.next()?.parse().ok()?;
     Some((ahead, behind))
+}
+
+pub fn parse_git_log(output: &[u8]) -> Vec<GitCommit> {
+    let text = String::from_utf8_lossy(output);
+    let mut commits = Vec::new();
+    for record in text.split('\u{1e}') {
+        let record = record.trim_matches(['\r', '\n']);
+        if record.is_empty() {
+            continue;
+        }
+        let mut parts = record.splitn(5, '\u{1f}');
+        let hash = parts.next().unwrap_or("").trim();
+        if hash.is_empty() {
+            continue;
+        }
+        let author = parts.next().unwrap_or("").to_string();
+        let time = parts
+            .next()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0);
+        let subject = parts.next().unwrap_or("").to_string();
+        let body = parts
+            .next()
+            .unwrap_or("")
+            .trim_matches(['\r', '\n'])
+            .to_string();
+        commits.push(GitCommit {
+            hash: hash.to_string(),
+            author,
+            time,
+            subject,
+            body,
+        });
+    }
+    commits
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -791,12 +836,16 @@ pub fn spawn_git_status(root: PathBuf, tx: mpsc::UnboundedSender<GitStatusUpdate
             .await;
         let update = match output {
             Ok(output) if output.status.success() => {
-                let (branch, ahead_behind) =
-                    tokio::join!(git_branch(&root), git_ahead_behind(&root));
+                let (branch, ahead_behind, commits) = tokio::join!(
+                    git_branch(&root),
+                    git_ahead_behind(&root),
+                    git_commits(&root)
+                );
                 Ok(GitSnapshot {
                     files: parse_git_status(&root, &output.stdout),
                     branch,
                     ahead_behind,
+                    commits,
                 })
             }
             Ok(output) => {
@@ -840,6 +889,27 @@ async fn git_ahead_behind(root: &Path) -> Option<(u32, u32)> {
         return None;
     }
     parse_ahead_behind(&output.stdout)
+}
+
+async fn git_commits(root: &Path) -> Vec<GitCommit> {
+    let Ok(output) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "log",
+            "-n",
+            "50",
+            "--pretty=format:%H%x1f%an%x1f%at%x1f%s%x1f%b%x1e",
+        ])
+        .output()
+        .await
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_git_log(&output.stdout)
 }
 
 pub fn classify_watch_kind(kind: EventKind) -> Option<WatchKind> {
@@ -3019,6 +3089,18 @@ diff --git a/readme.md b/readme.md
         assert_eq!(parse_ahead_behind(b"2\t1\n"), Some((2, 1)));
         assert_eq!(parse_ahead_behind(b"0 0\n"), Some((0, 0)));
         assert!(parse_ahead_behind(b"nope").is_none());
+        let log = b"abc123\x1fAda\x1f1700000000\x1fStart\x1fLine one\nLine two\x1edef456\x1fGrace\x1f1700000060\x1fNext\x1f\x1e";
+        let commits = parse_git_log(log);
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].hash, "abc123");
+        assert_eq!(commits[0].author, "Ada");
+        assert_eq!(commits[0].time, 1_700_000_000);
+        assert_eq!(commits[0].subject, "Start");
+        assert_eq!(commits[0].body, "Line one\nLine two");
+        assert_eq!(commits[1].subject, "Next");
+        assert!(commits[1].body.is_empty());
+        assert!(parse_git_log(b"").is_empty());
+        assert!(parse_git_log(b"\n").is_empty());
     }
 
     #[test]

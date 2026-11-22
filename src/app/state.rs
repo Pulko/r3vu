@@ -15,8 +15,9 @@ use crate::language::{
 };
 use crate::syntax::SyntaxService;
 use crate::workspace::{
-    ExplorerEntry, FileBaselines, FileDiffResult, FileFinder, GitDiffResult, GitFileStatus,
-    GitPathStatus, GitWrite, GitWriteResult, LineChanges, ParsedGitDiff, SearchMatch, delete_path,
+    ExplorerEntry, FileBaselines, FileDiffResult, FileFinder, GitCommit, GitDiffResult,
+    GitFileStatus, GitPathStatus, GitWrite, GitWriteResult, LineChanges, ParsedGitDiff,
+    SearchMatch, delete_path,
 };
 
 use super::config::Config;
@@ -181,6 +182,16 @@ pub enum Overlay {
         x: u16,
         y: u16,
     },
+    Commit {
+        index: usize,
+        hash: String,
+        author: String,
+        summary: String,
+        body: String,
+        time: i64,
+        x: u16,
+        y: u16,
+    },
     Branches {
         query: String,
         branches: Vec<String>,
@@ -231,6 +242,7 @@ pub enum GitClick {
     Open { path: PathBuf, staged: bool },
     DeleteConflict { path: PathBuf },
     Fold { path: PathBuf, staged: bool },
+    Log { index: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -319,6 +331,14 @@ pub struct HoverDwell {
     pub position: Position,
     pub screen_x: u16,
     pub screen_y: u16,
+    pub since: Instant,
+}
+
+#[derive(Clone, Debug)]
+pub struct GitLogDwell {
+    pub index: usize,
+    pub x: u16,
+    pub y: u16,
     pub since: Instant,
 }
 
@@ -435,6 +455,9 @@ pub struct App {
     pub git_body: String,
     pub git_body_focus: bool,
     pub git_body_open: bool,
+    pub git_commits: Vec<GitCommit>,
+    pub git_log_scroll: usize,
+    pub git_log_dwell: Option<GitLogDwell>,
     pub git_hits: Vec<GitHit>,
     pub side_tabs: Vec<SideTabHit>,
     pub content_tabs: Vec<ContentTabHit>,
@@ -571,6 +594,9 @@ impl App {
             git_body: String::new(),
             git_body_focus: false,
             git_body_open: false,
+            git_commits: Vec::new(),
+            git_log_scroll: 0,
+            git_log_dwell: None,
             git_hits: Vec::new(),
             side_tabs: Vec::new(),
             content_tabs: Vec::new(),
@@ -969,6 +995,14 @@ impl App {
                 }
                 self.git_branch = snapshot.branch;
                 self.git_ahead_behind = snapshot.ahead_behind;
+                if self.git_commits != snapshot.commits {
+                    self.git_commits = snapshot.commits;
+                    self.git_log_dwell = None;
+                    if matches!(self.overlay, Overlay::Commit { .. }) {
+                        self.overlay = Overlay::None;
+                    }
+                }
+                self.clamp_git_log_scroll();
                 if blame_stale {
                     self.clear_line_blame();
                 }
@@ -1008,6 +1042,17 @@ impl App {
         }
     }
 
+    pub fn clamp_git_log_scroll(&mut self) {
+        let inner = explorer_inner_rows(self.explorer_area.3);
+        let window = git_footer_layout(inner, self.git_body_open, self.git_commits.len()).log_lines;
+        let max = if window == 0 {
+            self.git_commits.len().saturating_sub(1)
+        } else {
+            self.git_commits.len().saturating_sub(window)
+        };
+        self.git_log_scroll = self.git_log_scroll.min(max);
+    }
+
     pub fn toggle_git(&mut self) {
         if self.git_repo {
             self.show_changes(!self.git_open);
@@ -1037,6 +1082,12 @@ impl App {
         self.git_branch = None;
         self.git_ahead_behind = None;
         self.git_publish_armed = false;
+        self.git_commits.clear();
+        self.git_log_scroll = 0;
+        self.git_log_dwell = None;
+        if matches!(self.overlay, Overlay::Commit { .. }) {
+            self.overlay = Overlay::None;
+        }
         self.git_status.clear();
         self.git_selected = 0;
         self.clear_line_blame();
@@ -2566,6 +2617,8 @@ pub fn click_was_double(last: Option<(Instant, u16, u16)>, x: u16, y: u16) -> bo
 
 pub const GIT_BODY_LINES: usize = 3;
 
+pub const GIT_LOG_LINES: usize = 5;
+
 /// Blank rows after the last tree row, so it can scroll clear of Pull and Commit.
 pub const GIT_TREE_TAIL: usize = 2;
 
@@ -2577,13 +2630,14 @@ pub struct GitFooterLayout {
     pub subject: bool,
     pub body_gap: bool,
     pub body_lines: usize,
+    pub log_lines: usize,
 }
 
-/// Sync and the subject stay. The rule goes next. Body lines are the first to drop,
-/// down to one collapsed row, then none. A blank row between the subject and the
-/// body stays while any body line is shown and there is room for it. An open body
-/// can use three lines.
-pub fn git_footer_layout(inner_h: usize, body_open: bool) -> GitFooterLayout {
+/// Sync and the subject stay. The rule is next. A closed section reserves nothing
+/// else. An open section keeps the body budget, then up to five commit rows with
+/// whatever space remains. Commit rows drop first, then body lines, the gap, and
+/// the rule.
+pub fn git_footer_layout(inner_h: usize, body_open: bool, commits: usize) -> GitFooterLayout {
     if inner_h == 0 {
         return GitFooterLayout {
             rows: 0,
@@ -2592,6 +2646,7 @@ pub fn git_footer_layout(inner_h: usize, body_open: bool) -> GitFooterLayout {
             subject: false,
             body_gap: false,
             body_lines: 0,
+            log_lines: 0,
         };
     }
     if inner_h == 1 {
@@ -2602,6 +2657,7 @@ pub fn git_footer_layout(inner_h: usize, body_open: bool) -> GitFooterLayout {
             subject: false,
             body_gap: false,
             body_lines: 0,
+            log_lines: 0,
         };
     }
     let mut rows = 2;
@@ -2611,14 +2667,27 @@ pub fn git_footer_layout(inner_h: usize, body_open: bool) -> GitFooterLayout {
         rows += 1;
         spare -= 1;
     }
-    let max_body = if body_open { GIT_BODY_LINES } else { 1 };
+    if !body_open {
+        return GitFooterLayout {
+            rows,
+            sync: true,
+            rule,
+            subject: true,
+            body_gap: false,
+            body_lines: 0,
+            log_lines: 0,
+        };
+    }
     let body_gap = spare >= 2;
     if body_gap {
         rows += 1;
         spare -= 1;
     }
-    let body_lines = spare.min(max_body);
+    let body_lines = spare.min(GIT_BODY_LINES);
     rows += body_lines;
+    spare -= body_lines;
+    let log_lines = spare.min(GIT_LOG_LINES).min(commits);
+    rows += log_lines;
     GitFooterLayout {
         rows,
         sync: true,
@@ -2626,6 +2695,7 @@ pub fn git_footer_layout(inner_h: usize, body_open: bool) -> GitFooterLayout {
         subject: true,
         body_gap,
         body_lines,
+        log_lines,
     }
 }
 
@@ -2633,9 +2703,9 @@ pub fn explorer_inner_rows(height: u16) -> usize {
     height.saturating_sub(2) as usize
 }
 
-pub fn git_list_rows(height: u16, body_open: bool) -> usize {
+pub fn git_list_rows(height: u16, body_open: bool, commits: usize) -> usize {
     let inner = explorer_inner_rows(height);
-    inner.saturating_sub(git_footer_layout(inner, body_open).rows)
+    inner.saturating_sub(git_footer_layout(inner, body_open, commits).rows)
 }
 
 pub fn max_explorer_scroll(len: usize, inner: usize) -> usize {
@@ -2687,8 +2757,8 @@ mod tests {
     use crate::editor::{Document, DocumentId};
     use crate::language::LanguageClient;
     use crate::workspace::{
-        DiffBaseline, FileBaselines, GitFileStatus, GitPathStatus, GitSnapshot, GitStatusError,
-        GitWrite,
+        DiffBaseline, FileBaselines, GitCommit, GitFileStatus, GitPathStatus, GitSnapshot,
+        GitStatusError, GitWrite,
     };
 
     use super::*;
@@ -2963,13 +3033,35 @@ mod tests {
             assert_eq!(app.git_branch.as_deref(), Some("main"));
 
             app.git_repo = false;
+            app.git_log_scroll = 9;
+            app.git_body_open = true;
+            app.explorer_area = (0, 0, 40, 30);
             app.receive_git_status(Ok(GitSnapshot {
                 files: HashMap::new(),
                 branch: Some("main".into()),
                 ahead_behind: None,
+                commits: vec![
+                    GitCommit {
+                        hash: "abc1234".into(),
+                        author: "Ada".into(),
+                        time: 1_700_000_000,
+                        subject: "Start".into(),
+                        body: String::new(),
+                    },
+                    GitCommit {
+                        hash: "def5678".into(),
+                        author: "Grace".into(),
+                        time: 1_700_000_060,
+                        subject: "Next".into(),
+                        body: "Because.".into(),
+                    },
+                ],
             }));
             assert!(app.git_repo);
             assert_eq!(app.git_branch.as_deref(), Some("main"));
+            assert_eq!(app.git_commits.len(), 2);
+            assert_eq!(app.git_commits[0].subject, "Start");
+            assert_eq!(app.git_log_scroll, 0);
         });
     }
 
@@ -3031,37 +3123,56 @@ mod tests {
 
     #[test]
     fn git_footer_drops_body_lines_before_the_rule() {
-        let collapsed = git_footer_layout(20, false);
-        assert_eq!(collapsed.rows, 5);
-        assert!(collapsed.sync && collapsed.rule && collapsed.subject && collapsed.body_gap);
-        assert_eq!(collapsed.body_lines, 1);
+        let collapsed = git_footer_layout(20, false, 8);
+        assert_eq!(collapsed.rows, 3);
+        assert!(collapsed.sync && collapsed.rule && collapsed.subject);
+        assert!(!collapsed.body_gap);
+        assert_eq!(collapsed.body_lines, 0);
+        assert_eq!(collapsed.log_lines, 0);
 
-        let open = git_footer_layout(20, true);
+        let open = git_footer_layout(20, true, 0);
         assert_eq!(open.rows, 7);
         assert!(open.body_gap);
         assert_eq!(open.body_lines, GIT_BODY_LINES);
+        assert_eq!(open.log_lines, 0);
 
-        let one_body = git_footer_layout(4, true);
+        let logged = git_footer_layout(20, true, 8);
+        assert_eq!(logged.body_lines, GIT_BODY_LINES);
+        assert_eq!(logged.log_lines, GIT_LOG_LINES);
+        assert_eq!(logged.rows, 12);
+
+        let few = git_footer_layout(20, true, 2);
+        assert_eq!(few.log_lines, 2);
+        assert_eq!(few.rows, 9);
+
+        let tight = git_footer_layout(9, true, 8);
+        assert_eq!(tight.body_lines, GIT_BODY_LINES);
+        assert!(tight.body_gap);
+        assert_eq!(tight.log_lines, 2);
+
+        let one_body = git_footer_layout(4, true, 8);
         assert!(one_body.sync && one_body.rule && one_body.subject);
         assert_eq!(one_body.body_lines, 1);
+        assert_eq!(one_body.log_lines, 0);
         assert_eq!(one_body.rows, 4);
 
-        let rule = git_footer_layout(3, true);
+        let rule = git_footer_layout(3, true, 8);
         assert!(rule.sync && rule.rule && rule.subject);
         assert_eq!(rule.body_lines, 0);
+        assert_eq!(rule.log_lines, 0);
         assert_eq!(rule.rows, 3);
 
-        let pair = git_footer_layout(2, false);
+        let pair = git_footer_layout(2, false, 8);
         assert!(pair.sync && pair.subject);
         assert!(!pair.rule);
         assert_eq!(pair.body_lines, 0);
         assert_eq!(pair.rows, 2);
 
-        let sync = git_footer_layout(1, true);
+        let sync = git_footer_layout(1, true, 8);
         assert!(sync.sync);
         assert!(!sync.subject && !sync.rule);
         assert_eq!(sync.rows, 1);
-        assert_eq!(git_footer_layout(0, true).rows, 0);
+        assert_eq!(git_footer_layout(0, true, 8).rows, 0);
     }
 
     #[test]
@@ -3103,6 +3214,7 @@ mod tests {
                 files: HashMap::new(),
                 branch: Some("main".into()),
                 ahead_behind: None,
+                commits: Vec::new(),
             }));
             assert!(app.cached_line_blame().is_none());
         });

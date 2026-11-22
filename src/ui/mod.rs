@@ -487,8 +487,8 @@ mod tests {
             matches!(action, crate::app::state::GitClick::Message)
         });
         let last_inner = app.explorer_area.1 + app.explorer_area.3 - 2;
-        assert_eq!(commit.y, last_inner - 2);
-        assert_eq!(pull.y, last_inner - 4);
+        assert_eq!(commit.y, last_inner);
+        assert_eq!(pull.y, last_inner - 2);
         assert_eq!(pull.y, push.y);
         assert_eq!(commit.y, message.y);
         assert!(pull.x < push.x);
@@ -524,28 +524,18 @@ mod tests {
         let commit_row = row_text(buffer, commit.y);
         assert!(commit_row.contains("Commit"));
         assert!(commit_row.contains("Keep the review"));
+        assert!(commit_row.contains("▸"));
         assert!(!commit_row.contains("body (optional)"));
-        let body = hit_for(&app, |action| {
-            matches!(action, crate::app::state::GitClick::Body)
-        });
+        assert!(
+            !app.git_hits
+                .iter()
+                .any(|hit| { matches!(hit.action, crate::app::state::GitClick::Body) })
+        );
         let fold = hit_for(&app, |action| {
             matches!(action, crate::app::state::GitClick::BodyFold)
         });
-        assert_eq!(body.y, commit.y + 2);
-        assert_eq!(body.y, last_inner);
-        let body_gap = slice_text(
-            buffer,
-            app.explorer_area.0 + 1,
-            commit.y + 1,
-            app.explorer_area.2.saturating_sub(2),
-        );
-        assert!(body_gap.trim().is_empty());
-        assert_eq!(fold.y, body.y);
-        assert!(fold.x < body.x);
-        let body_row = row_text(buffer, body.y);
-        assert!(body_row.contains("▸"));
-        assert!(body_row.contains("body (optional)"));
-        assert_eq!(buffer[(body.x, body.y)].bg, theme.bg_status);
+        assert_eq!(fold.y, message.y);
+        assert!(fold.x < message.x);
         let inner_right = app.explorer_area.0 + app.explorer_area.2 - 1;
         assert!(push.x + push.width <= inner_right);
         assert!(commit.x + commit.width <= inner_right);
@@ -631,12 +621,17 @@ mod tests {
         assert_eq!(body_hits[1].y, body_hits[0].y + 1);
         assert_eq!(body_hits[2].y, body_hits[1].y + 1);
         assert_eq!(body_hits[2].y, last_inner);
-        assert_eq!(fold.y, body_hits[0].y);
-        assert!(fold.x < body_hits[0].x);
+        assert_eq!(fold.y, commit.y);
+        let message = hit_for(&app, |action| {
+            matches!(action, crate::app::state::GitClick::Message)
+        });
+        assert!(fold.x < message.x);
+        let message_row = row_text(buffer, commit.y);
+        assert!(message_row.contains("▾"));
         let first = row_text(buffer, body_hits[0].y);
         let second = row_text(buffer, body_hits[1].y);
         let third = row_text(buffer, body_hits[2].y);
-        assert!(first.contains("▾"));
+        assert!(!first.contains("▾"));
         assert!(first.contains("The review still holds."));
         assert!(!first.contains("Why it stays."));
         assert!(second.contains("And one more line."));
@@ -652,6 +647,87 @@ mod tests {
             terminal.backend().buffer()[(focused.x, focused.y)].bg,
             theme.bg_selected
         );
+        let long = format!("Subject-start-{}ENDMARKER", "n".repeat(300));
+        app.git_commits = vec![
+            commit_row_sample("aaa1111", "Ada", &long, "Explains the change"),
+            commit_row_sample("bbb2222", "Grace", "beta", ""),
+            commit_row_sample("ccc3333", "Grace", "gamma", ""),
+            commit_row_sample("ddd4444", "Grace", "delta", ""),
+            commit_row_sample("eee5555", "Grace", "epsilon", ""),
+            commit_row_sample("fff6666", "Grace", "zeta-hidden", ""),
+        ];
+        app.git_log_scroll = 0;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut logs: Vec<_> = app
+            .git_hits
+            .iter()
+            .filter(|hit| matches!(hit.action, crate::app::state::GitClick::Log { .. }))
+            .cloned()
+            .collect();
+        logs.sort_by_key(|hit| hit.y);
+        assert_eq!(logs.len(), 5);
+        let body_hits: Vec<_> = app
+            .git_hits
+            .iter()
+            .filter(|hit| matches!(hit.action, crate::app::state::GitClick::Body))
+            .map(|hit| hit.y)
+            .collect();
+        assert_eq!(logs[0].y, body_hits.iter().copied().max().unwrap() + 1);
+        assert_eq!(logs[4].y, last_inner);
+        let first_log = row_text(buffer, logs[0].y);
+        assert!(first_log.contains("├─"));
+        assert!(first_log.contains("Subject-start"));
+        assert!(first_log.contains('…'));
+        assert!(!first_log.contains("ENDMARKER"));
+        assert!(row_text(buffer, logs[1].y).contains("├─"));
+        assert!(row_text(buffer, logs[1].y).contains("beta"));
+        assert!(!buffer_text(buffer).contains("zeta-hidden"));
+        app.git_log_scroll = 1;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut logs: Vec<_> = app
+            .git_hits
+            .iter()
+            .filter(|hit| matches!(hit.action, crate::app::state::GitClick::Log { .. }))
+            .cloned()
+            .collect();
+        logs.sort_by_key(|hit| hit.y);
+        assert!(row_text(buffer, logs[0].y).contains("├─"));
+        assert!(row_text(buffer, logs[0].y).contains("beta"));
+        assert!(row_text(buffer, logs[4].y).contains("└─"));
+        assert!(row_text(buffer, logs[4].y).contains("zeta-hidden"));
+        assert!(!row_text(buffer, logs[0].y).contains("Subject"));
+        app.overlay = Overlay::Commit {
+            index: 0,
+            hash: "aaa1111".into(),
+            author: "Ada".into(),
+            summary: long.clone(),
+            body: "Explains the change".into(),
+            time: 1_700_000_000,
+            x: logs[0].x,
+            y: logs[0].y,
+        };
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let card = buffer_text(terminal.backend().buffer());
+        assert!(card.contains("aaa1111"));
+        assert!(card.contains("Ada"));
+        assert!(card.contains("Explains the change"));
+    }
+
+    fn commit_row_sample(
+        hash: &str,
+        author: &str,
+        subject: &str,
+        body: &str,
+    ) -> crate::workspace::GitCommit {
+        crate::workspace::GitCommit {
+            hash: hash.into(),
+            author: author.into(),
+            time: 1_700_000_000,
+            subject: subject.into(),
+            body: body.into(),
+        }
     }
 
     #[test]

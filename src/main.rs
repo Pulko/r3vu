@@ -169,7 +169,14 @@ async fn main() -> anyhow::Result<()> {
         let hover_delay = app
             .hover_dwell
             .as_ref()
-            .map(|dwell| HOVER_DWELL.saturating_sub(dwell.since.elapsed()));
+            .map(|dwell| HOVER_DWELL.saturating_sub(dwell.since.elapsed()))
+            .into_iter()
+            .chain(
+                app.git_log_dwell
+                    .as_ref()
+                    .map(|dwell| HOVER_DWELL.saturating_sub(dwell.since.elapsed())),
+            )
+            .min();
         let git_delay = app.git_status_delay();
         let blame_delay = app.blame_delay();
         tokio::select! {
@@ -232,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
             }
             _ = ready_in(hover_delay) => {
                 app::commands::poll_hover(&mut app);
+                app::commands::poll_git_log_hover(&mut app);
             }
             _ = ready_in(git_delay) => {
                 app.pump_git_status();

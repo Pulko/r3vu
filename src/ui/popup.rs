@@ -97,6 +97,33 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_blame(frame, app, theme, &author, &summary, &hash, time, x, y);
         return;
     }
+    let commit = match &app.overlay {
+        Overlay::Commit {
+            hash,
+            author,
+            summary,
+            body,
+            time,
+            x,
+            y,
+            ..
+        } => Some((
+            hash.clone(),
+            author.clone(),
+            summary.clone(),
+            body.clone(),
+            *time,
+            *x,
+            *y,
+        )),
+        _ => None,
+    };
+    if let Some((hash, author, summary, body, time, x, y)) = commit {
+        render_commit(
+            frame, app, theme, &hash, &author, &summary, &body, time, x, y,
+        );
+        return;
+    }
     match &app.overlay {
         Overlay::Search {
             kind: SearchKind::Content,
@@ -283,6 +310,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         | Overlay::Help
         | Overlay::TypesNote
         | Overlay::Blame { .. }
+        | Overlay::Commit { .. }
         | Overlay::ContextMenu { .. }
         | Overlay::Branches { .. }
         | Overlay::None => {}
@@ -1212,6 +1240,80 @@ fn render_blame(
     frame.render_widget(Clear, area);
     let lines: Vec<Line> = rows
         .into_iter()
+        .map(|row| Line::from(Span::styled(row, Style::default().fg(theme.fg))))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(theme.text())
+            .block(theme.panel(" Commit ", false)),
+        area,
+    );
+}
+
+fn render_commit(
+    frame: &mut Frame,
+    app: &mut App,
+    theme: Theme,
+    hash: &str,
+    author: &str,
+    summary: &str,
+    body: &str,
+    time: i64,
+    x: u16,
+    y: u16,
+) {
+    let short: String = hash.chars().take(7).collect();
+    let summary = if summary.is_empty() {
+        "(no message)"
+    } else {
+        summary
+    };
+    let when = crate::workspace::format_unix_time(time);
+    let screen = frame.area();
+    let max_inner = (screen.width.saturating_sub(4).max(8) as usize).min(48);
+    let mut rows = vec![
+        fit_width(&format!("{short}  {summary}"), max_inner),
+        fit_width(author, max_inner),
+        fit_width(&when, max_inner),
+    ];
+    let body = body.trim();
+    if !body.is_empty() {
+        for line in body.split('\n') {
+            let wrapped = wrap_to_width(line, max_inner);
+            if wrapped.is_empty() {
+                rows.push(String::new());
+            } else {
+                rows.extend(wrapped);
+            }
+        }
+    }
+    let inner = rows
+        .iter()
+        .map(|row| UnicodeWidthStr::width(row.as_str()))
+        .max()
+        .unwrap_or(8)
+        .min(max_inner);
+    let width = (inner as u16 + 2).clamp(12, screen.width.saturating_sub(1).max(12));
+    let max_height = 14u16.min(screen.height.max(3));
+    let height = (rows.len() as u16 + 2).clamp(3, max_height);
+    let x = x.min(screen.right().saturating_sub(width));
+    let y = if y >= height {
+        y - height
+    } else {
+        y.saturating_add(1)
+            .min(screen.bottom().saturating_sub(height))
+    };
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    app.overlay_area = Some((area.x, area.y, area.width, area.height));
+    frame.render_widget(Clear, area);
+    let lines: Vec<Line> = rows
+        .into_iter()
+        .take(height.saturating_sub(2) as usize)
         .map(|row| Line::from(Span::styled(row, Style::default().fg(theme.fg))))
         .collect();
     frame.render_widget(

@@ -21,8 +21,8 @@ use crate::workspace::{
 use super::state::{
     App, ConfirmAction, Focus, HScrollHit, MenuAction, MenuItem, Overlay, PendingRename,
     PromptKind, SearchKind, SearchScope, clamp_explorer_scroll, decode_diagnostic_pos,
-    explorer_index_at, explorer_inner_rows, git_list_rows, is_ident_char, max_explorer_scroll,
-    max_git_scroll,
+    explorer_index_at, explorer_inner_rows, git_footer_layout, git_list_rows, is_ident_char,
+    max_explorer_scroll, max_git_scroll,
 };
 
 pub fn save_active(app: &mut App) {
@@ -113,6 +113,7 @@ pub fn type_text(app: &mut App, text: &str) {
             | Overlay::Completion { .. }
             | Overlay::Signature { .. }
             | Overlay::Hover { .. }
+            | Overlay::Commit { .. }
     ) {
         return;
     }
@@ -203,6 +204,7 @@ pub fn move_sel(app: &mut App, movement: Movement, selecting: bool) {
             | Overlay::Completion { .. }
             | Overlay::Hover { .. }
             | Overlay::Signature { .. }
+            | Overlay::Commit { .. }
     ) {
         overlay_move(app, movement);
         return;
@@ -628,6 +630,74 @@ pub fn cancel_hover(app: &mut App) {
     if matches!(app.overlay, Overlay::Hover { .. }) {
         app.overlay = Overlay::None;
     }
+}
+
+pub fn clear_git_log_hover(app: &mut App) {
+    app.git_log_dwell = None;
+    if matches!(app.overlay, Overlay::Commit { .. }) {
+        app.overlay = Overlay::None;
+    }
+}
+
+pub fn schedule_git_log_hover(app: &mut App, x: u16, y: u16) {
+    if !matches!(app.overlay, Overlay::None | Overlay::Commit { .. }) {
+        return;
+    }
+    let index = app.git_hits.iter().find_map(|hit| match &hit.action {
+        crate::app::state::GitClick::Log { index }
+            if y == hit.y && x >= hit.x && x < hit.x.saturating_add(hit.width) =>
+        {
+            Some(*index)
+        }
+        _ => None,
+    });
+    let Some(index) = index else {
+        clear_git_log_hover(app);
+        return;
+    };
+    if matches!(app.overlay, Overlay::Commit { index: shown, .. } if shown == index) {
+        return;
+    }
+    if app
+        .git_log_dwell
+        .as_ref()
+        .is_some_and(|dwell| dwell.index == index)
+    {
+        return;
+    }
+    if matches!(app.overlay, Overlay::Commit { .. }) {
+        app.overlay = Overlay::None;
+    }
+    app.git_log_dwell = Some(super::state::GitLogDwell {
+        index,
+        x,
+        y,
+        since: std::time::Instant::now(),
+    });
+}
+
+pub fn poll_git_log_hover(app: &mut App) {
+    let Some(dwell) = app.git_log_dwell.clone() else {
+        return;
+    };
+    if dwell.since.elapsed() < super::state::HOVER_DWELL {
+        return;
+    }
+    let Some(commit) = app.git_commits.get(dwell.index).cloned() else {
+        app.git_log_dwell = None;
+        return;
+    };
+    app.git_log_dwell = None;
+    app.overlay = Overlay::Commit {
+        index: dwell.index,
+        hash: commit.hash,
+        author: commit.author,
+        summary: commit.subject,
+        body: commit.body,
+        time: commit.time,
+        x: dwell.x,
+        y: dwell.y,
+    };
 }
 
 fn wrap_plain(text: &str, width: usize) -> String {
@@ -2311,10 +2381,38 @@ pub fn scroll_editor(app: &mut App, delta: i32) {
     }
 }
 
+pub fn scroll_git_log_at(app: &mut App, y: u16, delta: i32) -> bool {
+    if !app.git_open {
+        return false;
+    }
+    let inner = explorer_inner_rows(app.explorer_area.3);
+    let layout = git_footer_layout(inner, app.git_body_open, app.git_commits.len());
+    if layout.log_lines == 0 || inner < layout.log_lines {
+        return false;
+    }
+    let top = app
+        .explorer_area
+        .1
+        .saturating_add(1)
+        .saturating_add((inner - layout.log_lines) as u16);
+    let bottom = top.saturating_add(layout.log_lines as u16);
+    if y < top || y >= bottom {
+        return false;
+    }
+    let max = app.git_commits.len().saturating_sub(layout.log_lines);
+    let next = app.git_log_scroll as i64 + i64::from(delta);
+    app.git_log_scroll = next.clamp(0, max as i64) as usize;
+    true
+}
+
 pub fn scroll_explorer(app: &mut App, delta: i32) {
     if app.git_open {
         let len = app.git_rows().len();
-        let inner = git_list_rows(app.explorer_area.3, app.git_body_open);
+        let inner = git_list_rows(
+            app.explorer_area.3,
+            app.git_body_open,
+            app.git_commits.len(),
+        );
         let max = max_git_scroll(len, inner);
         let next = app.git_scroll as i64 + i64::from(delta);
         app.git_scroll = next.clamp(0, max as i64) as usize;
@@ -2875,7 +2973,11 @@ pub fn move_git(app: &mut App, delta: i32) {
         (pos + 1).min(files.len() - 1)
     };
     app.git_selected = files[next];
-    let inner = git_list_rows(app.explorer_area.3, app.git_body_open);
+    let inner = git_list_rows(
+        app.explorer_area.3,
+        app.git_body_open,
+        app.git_commits.len(),
+    );
     if app.git_selected < app.git_scroll {
         app.git_scroll = app.git_selected;
     } else if inner > 0 && app.git_selected >= app.git_scroll + inner {
@@ -2942,7 +3044,11 @@ fn deleted_conflict(app: &App, path: &std::path::Path) -> bool {
 
 pub fn git_file_index_at(app: &App, y: u16) -> Option<usize> {
     let rows = app.git_rows();
-    let inner = git_list_rows(app.explorer_area.3, app.git_body_open);
+    let inner = git_list_rows(
+        app.explorer_area.3,
+        app.git_body_open,
+        app.git_commits.len(),
+    );
     if inner == 0 || y <= app.explorer_area.1 {
         return None;
     }
@@ -2990,8 +3096,10 @@ pub fn click_git(app: &mut App, x: u16, y: u16) {
                 app.git_body_open = !app.git_body_open;
                 if !app.git_body_open {
                     app.git_body_focus = false;
+                    clear_git_log_hover(app);
                 }
             }
+            crate::app::state::GitClick::Log { .. } => {}
             crate::app::state::GitClick::Pull => app.pull_git(),
             crate::app::state::GitClick::Push => app.push_git(),
             crate::app::state::GitClick::Commit => app.commit_git(),
@@ -3040,7 +3148,11 @@ pub fn click_git(app: &mut App, x: u16, y: u16) {
     app.git_message_focus = false;
     app.git_body_focus = false;
     let top = app.explorer_area.1.saturating_add(1);
-    let list_h = git_list_rows(app.explorer_area.3, app.git_body_open);
+    let list_h = git_list_rows(
+        app.explorer_area.3,
+        app.git_body_open,
+        app.git_commits.len(),
+    );
     let bottom = top.saturating_add(list_h as u16);
     if y >= top && y < bottom {
         let index = app.git_scroll + usize::from(y - top);
@@ -3566,6 +3678,7 @@ mod tests {
                 files: std::collections::HashMap::new(),
                 branch: Some("topic".into()),
                 ahead_behind: None,
+                commits: Vec::new(),
             }));
         });
         assert_eq!(app.git_branch.as_deref(), Some("topic"));

@@ -268,6 +268,7 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
                 | crate::app::state::Overlay::Completion { .. }
                 | crate::app::state::Overlay::Hover { .. }
                 | crate::app::state::Overlay::Signature { .. }
+                | crate::app::state::Overlay::Commit { .. }
         )
     {
         frame.set_cursor_position(cursor);

@@ -201,6 +201,7 @@ pub fn editor_has_focus(app: &App) -> bool {
                 | Overlay::Completion { .. }
                 | Overlay::Hover { .. }
                 | Overlay::Signature { .. }
+                | Overlay::Commit { .. }
         )
 }
 

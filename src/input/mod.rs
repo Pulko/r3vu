@@ -16,9 +16,13 @@ pub fn handle_event(app: &mut App, event: Event) {
             if commands::overlay_insert(app, &text) {
                 return;
             }
-            if app.git_message_focus && matches!(app.overlay, Overlay::None) {
+            if app.git_message_focus
+                && matches!(app.overlay, Overlay::None | Overlay::Commit { .. })
+            {
                 app.git_message.push_str(&text.replace(['\n', '\r'], " "));
-            } else if app.git_body_focus && matches!(app.overlay, Overlay::None) {
+            } else if app.git_body_focus
+                && matches!(app.overlay, Overlay::None | Overlay::Commit { .. })
+            {
                 let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
                 if normalized.contains('\n') {
                     app.git_body_open = true;
@@ -40,6 +44,13 @@ pub fn handle_event(app: &mut App, event: Event) {
 fn handle_key(app: &mut App, key: KeyEvent) {
     if app.hover_dwell.is_some() || matches!(app.overlay, Overlay::Hover { .. }) {
         commands::cancel_hover(app);
+    }
+    if app.git_log_dwell.is_some() || matches!(app.overlay, Overlay::Commit { .. }) {
+        let showing = matches!(app.overlay, Overlay::Commit { .. });
+        commands::clear_git_log_hover(app);
+        if showing && matches!(key.code, KeyCode::Esc) {
+            return;
+        }
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -117,6 +128,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             | Overlay::Completion { .. }
             | Overlay::Hover { .. }
             | Overlay::Signature { .. }
+            | Overlay::Commit { .. }
     );
     if alt && !modal {
         match key.code {
@@ -364,12 +376,26 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             }
             if in_explorer && app.git_open {
                 commands::hover_git_row(app, y);
+                commands::schedule_git_log_hover(app, x, y);
             } else {
                 app.git_hover = None;
+                commands::clear_git_log_hover(app);
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
             commands::cancel_hover(app);
+            if matches!(app.overlay, Overlay::Commit { .. }) {
+                let inside = app.overlay_area.is_some_and(|(ax, ay, width, height)| {
+                    x >= ax
+                        && x < ax.saturating_add(width)
+                        && y >= ay
+                        && y < ay.saturating_add(height)
+                });
+                commands::clear_git_log_hover(app);
+                if inside {
+                    return;
+                }
+            }
             if matches!(app.overlay, Overlay::Blame { .. }) {
                 let inside = app.overlay_area.is_some_and(|(ax, ay, width, height)| {
                     x >= ax
@@ -715,6 +741,7 @@ fn dispatch_wheel(
     axis: WheelAxis,
 ) {
     commands::cancel_hover(app);
+    commands::clear_git_log_hover(app);
     if matches!(app.overlay, Overlay::Search { .. }) && in_rect(app.overlay_area, x, y) {
         if let WheelAxis::Vertical(delta) = axis {
             commands::scroll_search(app, delta);
@@ -730,7 +757,11 @@ fn dispatch_wheel(
     let in_popup = in_rect(app.overlay_area, x, y) || in_rect(app.menu_area, x, y);
     let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
     match commands::wheel_action(in_popup, in_explorer, in_editor, in_thread, shift, axis) {
-        WheelAction::Explorer(delta) => commands::scroll_explorer(app, delta),
+        WheelAction::Explorer(delta) => {
+            if !commands::scroll_git_log_at(app, y, delta) {
+                commands::scroll_explorer(app, delta);
+            }
+        }
         WheelAction::EditorVertical(delta) => commands::scroll_editor(app, delta),
         WheelAction::EditorHorizontal(delta) => commands::scroll_editor_horizontal(app, delta),
         WheelAction::Thread(delta) => commands::scroll_thread(app, delta),
@@ -761,9 +792,15 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::app::commands;
-    use crate::app::state::{App, HeaderAction, HeaderHit, Overlay, SearchKind, SearchScope};
+    use std::time::{Duration, Instant};
+
+    use crate::app::state::{
+        App, GitClick, GitHit, HeaderAction, HeaderHit, Overlay, SearchKind, SearchScope,
+        explorer_inner_rows, git_footer_layout,
+    };
     use crate::language::LanguageClient;
     use crate::workspace::SearchMatch;
+    use crate::workspace::{GitCommit, GitFileStatus, GitPathStatus};
 
     use super::handle_event;
 
@@ -920,6 +957,114 @@ mod tests {
             let (selected, scroll) = search_window(&app);
             assert_eq!((selected, scroll), (3, 3));
             assert!(selected >= scroll && selected < scroll + 10);
+        });
+    }
+
+    fn sample_commit(index: usize, body: &str) -> GitCommit {
+        GitCommit {
+            hash: format!("abc{index:04}"),
+            author: "Ada".into(),
+            time: 1_700_000_000,
+            subject: format!("commit {index}"),
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn git_log_scrolls_only_under_the_pointer() {
+        with_runtime(|| {
+            let mut app = test_app();
+            app.explorer_visible = true;
+            app.git_open = true;
+            app.git_repo = true;
+            app.git_body_open = true;
+            app.explorer_area = (0, 1, 30, 20);
+            app.git_commits = (0..8).map(|index| sample_commit(index, "")).collect();
+            app.git_status.insert(
+                PathBuf::from("src/main.rs"),
+                GitPathStatus {
+                    staged: None,
+                    unstaged: Some(GitFileStatus::Modified),
+                    conflict: None,
+                },
+            );
+            let inner = explorer_inner_rows(app.explorer_area.3);
+            let layout = git_footer_layout(inner, true, app.git_commits.len());
+            assert_eq!(layout.log_lines, 5);
+            let log_y = app.explorer_area.1 + 1 + (inner - layout.log_lines) as u16;
+            let list_y = app.explorer_area.1 + 1;
+
+            handle_event(&mut app, scroll_down(2, log_y));
+            assert_eq!(app.git_log_scroll, 3);
+            assert_eq!(app.git_scroll, 0);
+
+            handle_event(&mut app, scroll_down(2, list_y));
+            assert_eq!(app.git_log_scroll, 3);
+            assert_eq!(app.git_scroll, 2);
+
+            app.git_body_open = false;
+            app.git_scroll = 0;
+            handle_event(&mut app, scroll_down(2, log_y));
+            assert_eq!(app.git_log_scroll, 3);
+            assert_eq!(app.git_scroll, 2);
+        });
+    }
+
+    #[test]
+    fn git_log_hover_shows_the_commit_until_the_pointer_leaves() {
+        with_runtime(|| {
+            let mut app = test_app();
+            app.explorer_visible = true;
+            app.git_open = true;
+            app.explorer_area = (0, 1, 30, 20);
+            app.git_commits = vec![sample_commit(0, ""), sample_commit(1, "Line one\nLine two")];
+            app.git_hits.push(GitHit {
+                x: 1,
+                y: 8,
+                width: 20,
+                action: GitClick::Log { index: 1 },
+            });
+            handle_event(
+                &mut app,
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: 4,
+                    row: 8,
+                    modifiers: KeyModifiers::empty(),
+                }),
+            );
+            let dwell = app.git_log_dwell.as_mut().expect("dwell");
+            assert_eq!(dwell.index, 1);
+            dwell.since = Instant::now() - Duration::from_millis(500);
+            commands::poll_git_log_hover(&mut app);
+            match &app.overlay {
+                Overlay::Commit {
+                    index,
+                    author,
+                    summary,
+                    body,
+                    hash,
+                    ..
+                } => {
+                    assert_eq!(*index, 1);
+                    assert_eq!(author, "Ada");
+                    assert_eq!(summary, "commit 1");
+                    assert_eq!(body, "Line one\nLine two");
+                    assert_eq!(hash, "abc0001");
+                }
+                other => panic!("expected a commit card, got {other:?}"),
+            }
+            handle_event(
+                &mut app,
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: 4,
+                    row: 2,
+                    modifiers: KeyModifiers::empty(),
+                }),
+            );
+            assert!(matches!(app.overlay, Overlay::None));
+            assert!(app.git_log_dwell.is_none());
         });
     }
 

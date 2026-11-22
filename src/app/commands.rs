@@ -21,8 +21,9 @@ use crate::workspace::{
 use super::state::{
     App, ConfirmAction, Focus, HScrollHit, MenuAction, MenuItem, Overlay, PendingRename,
     PromptKind, SearchKind, SearchScope, clamp_explorer_scroll, decode_diagnostic_pos,
-    explorer_index_at, explorer_inner_rows, git_footer_layout, git_list_rows, is_ident_char,
-    max_explorer_scroll, max_git_scroll,
+    editor_body_rows, editor_shows_hscroll, editor_text_columns, explorer_index_at,
+    explorer_inner_rows, git_footer_layout, git_list_rows, is_ident_char, max_explorer_scroll,
+    max_git_scroll,
 };
 
 pub fn save_active(app: &mut App) {
@@ -209,16 +210,12 @@ pub fn move_sel(app: &mut App, movement: Movement, selecting: bool) {
         overlay_move(app, movement);
         return;
     }
-    let height = app.editor_area.3.saturating_sub(2) as usize;
+    let height = editor_rows(app);
+    let width = editor_columns(app);
     let Some(id) = app.active else { return };
     if let (Some(doc), Some(view)) = (app.documents.get(&id), app.views.get_mut(&id)) {
         move_cursor(view, &doc.rope, movement, selecting, height.max(1));
-        view.ensure_visible(
-            &doc.rope,
-            height.max(1),
-            app.editor_area.2.saturating_sub(app.gutter_width) as usize,
-            app.config.tab_width,
-        );
+        view.ensure_visible(&doc.rope, height.max(1), width, app.config.tab_width);
     }
     reveal_cursor(app, id);
     app.settle_conflict_cursor();
@@ -566,8 +563,12 @@ pub fn hover(app: &mut App) {
         .active_view()
         .map(|view| view.cursor)
         .unwrap_or_default();
-    let x = app.editor_area.0.saturating_add(app.gutter_width + 2);
-    let y = app.editor_area.1.saturating_add(2);
+    let x = app
+        .editor_area
+        .0
+        .saturating_add(app.gutter_width)
+        .saturating_add(1);
+    let y = app.editor_area.1.saturating_add(1);
     app.hover_anchor = Some((token, x, y, origin));
     let _ = app.lsp.tx.send(LspCmd::Hover {
         token,
@@ -1807,8 +1808,8 @@ fn place_and_reveal(
     id: crate::editor::DocumentId,
     place: impl FnOnce(&mut EditorView, &Rope),
 ) {
-    let height = app.editor_area.3.saturating_sub(2).max(1) as usize;
-    let width = app.editor_area.2.saturating_sub(app.gutter_width) as usize;
+    let height = editor_rows(app);
+    let width = editor_columns(app);
     let tab_width = app.config.tab_width;
     if let (Some(doc), Some(view)) = (app.documents.get(&id), app.views.get_mut(&id)) {
         place(view, &doc.rope);
@@ -2295,27 +2296,38 @@ pub fn click_editor(app: &mut App, x: u16, y: u16, selecting: bool) {
     let Some(pos) = editor_position_at(app, x, y) else {
         return;
     };
-    let eh = app.editor_area.3;
+    let rows = editor_rows(app);
+    let columns = editor_columns(app);
     if let (Some(doc), Some(view)) = (app.documents.get(&id), app.views.get_mut(&id)) {
         set_cursor(view, &doc.rope, pos, selecting);
-        view.ensure_visible(
-            &doc.rope,
-            eh as usize,
-            app.editor_area.2.saturating_sub(app.gutter_width) as usize,
-            app.config.tab_width,
-        );
+        view.ensure_visible(&doc.rope, rows, columns, app.config.tab_width);
     }
     reveal_cursor(app, id);
 }
 
+fn editor_columns(app: &App) -> usize {
+    editor_text_columns(app.editor_area.2, app.gutter_width)
+}
+
+fn editor_rows(app: &App) -> usize {
+    let height = app.editor_area.3;
+    let columns = editor_columns(app);
+    let content = app
+        .active
+        .and_then(|id| app.documents.get(&id))
+        .map(|doc| max_line_display_width(&doc.rope, app.config.tab_width))
+        .unwrap_or(0);
+    editor_body_rows(height, editor_shows_hscroll(height, columns, content)).max(1)
+}
+
 fn visual_row_at(app: &App, x: u16, y: u16) -> Option<crate::workspace::VisualRow> {
     let id = app.active?;
-    let (ex, ey, _ew, eh) = app.editor_area;
-    if y <= ey || x <= ex {
+    let (ex, ey, ew, eh) = app.editor_area;
+    if y < ey || y >= ey.saturating_add(eh) || x < ex || x >= ex.saturating_add(ew) {
         return None;
     }
-    let rel_y = y.saturating_sub(ey).saturating_sub(1);
-    if rel_y >= eh.saturating_sub(2) {
+    let rel_y = y.saturating_sub(ey);
+    if rel_y as usize >= editor_rows(app) {
         return None;
     }
     let visual = app.views.get(&id)?.viewport.top + rel_y as usize;
@@ -2326,13 +2338,13 @@ pub fn editor_position_at(app: &App, x: u16, y: u16) -> Option<Position> {
     let id = app.active?;
     let doc = app.documents.get(&id)?;
     let view = app.views.get(&id)?;
-    let (ex, ey, _ew, eh) = app.editor_area;
-    if y <= ey || x <= ex {
+    let (ex, ey, ew, eh) = app.editor_area;
+    if y < ey || y >= ey.saturating_add(eh) || x < ex || x >= ex.saturating_add(ew) {
         return None;
     }
-    let rel_x = x.saturating_sub(ex).saturating_sub(1);
-    let rel_y = y.saturating_sub(ey).saturating_sub(1);
-    if rel_y >= eh.saturating_sub(2) || rel_x < app.gutter_width {
+    let rel_x = x.saturating_sub(ex);
+    let rel_y = y.saturating_sub(ey);
+    if rel_y as usize >= editor_rows(app) || rel_x < app.gutter_width {
         return None;
     }
     let visual = view.viewport.top + rel_y as usize;
@@ -2365,7 +2377,7 @@ pub fn reveal_cursor(app: &mut App, id: crate::editor::DocumentId) {
     let line = app.views.get(&id).map(|view| view.cursor.line).unwrap_or(0);
     let rows = app.visual_rows(id);
     let index = crate::workspace::visual_index_for_line(&rows, line).unwrap_or(0);
-    let height = app.editor_area.3.saturating_sub(2).max(1) as usize;
+    let height = editor_rows(app);
     if let Some(view) = app.views.get_mut(&id) {
         if index < view.viewport.top {
             view.viewport.top = index;
@@ -2530,7 +2542,7 @@ pub fn drag_hscroll(app: &mut App, x: u16) {
 
 fn assign_horizontal(app: &mut App, left: i32) {
     let Some(id) = app.active else { return };
-    let width = app.editor_area.2.saturating_sub(2 + app.gutter_width) as usize;
+    let width = editor_columns(app);
     let tab_width = app.config.tab_width;
     let content = app
         .documents

@@ -527,7 +527,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             }) {
                 app.explorer_visible = !app.explorer_visible;
             } else if in_tabs && !scroll_tabs(app, x) {
-                if let Some(tab) = app
+                if let Some((hit_x, hit_y, width)) = app.restore_hit
+                    && y == hit_y
+                    && x >= hit_x
+                    && x < hit_x.saturating_add(width)
+                {
+                    commands::restore_active(app);
+                } else if let Some(tab) = app
                     .tab_hit_boxes
                     .iter()
                     .find(|tab| x >= tab.x && x < tab.x + tab.width)
@@ -597,16 +603,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                 app.git_message_focus = false;
                 app.git_body_focus = false;
                 app.focus = Focus::Editor;
-                if y == app.editor_area.1 {
-                    if let Some((hit_x, hit_y, width)) = app.restore_hit
-                        && y == hit_y
-                        && x >= hit_x
-                        && x < hit_x.saturating_add(width)
-                    {
-                        commands::restore_active(app);
-                    }
-                    return;
-                }
                 if !commands::begin_hscroll_drag(app, x, y) {
                     if mouse.modifiers.contains(KeyModifiers::CONTROL) {
                         commands::click_editor(app, x, y, false);
@@ -672,7 +668,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                     app.explorer_selected = idx;
                 }
                 commands::show_explorer_menu(app, x, y);
-            } else if in_editor && y != app.editor_area.1 && app.file_content_showing() {
+            } else if in_editor && app.file_content_showing() {
                 app.focus = Focus::Editor;
                 commands::click_editor(app, x, y, false);
                 commands::show_editor_menu(app, x, y);

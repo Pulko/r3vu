@@ -2716,6 +2716,22 @@ pub fn explorer_inner_rows(height: u16) -> usize {
     height.saturating_sub(2) as usize
 }
 
+pub fn editor_text_columns(area_width: u16, gutter: u16) -> usize {
+    area_width.saturating_sub(gutter) as usize
+}
+
+pub fn editor_shows_hscroll(area_height: u16, columns: usize, content_width: usize) -> bool {
+    area_height >= 3 && columns > 0 && content_width > columns
+}
+
+pub fn editor_body_rows(area_height: u16, hscroll: bool) -> usize {
+    if hscroll {
+        area_height.saturating_sub(1) as usize
+    } else {
+        area_height as usize
+    }
+}
+
 pub fn git_list_rows(height: u16, body_open: bool, commits: usize) -> usize {
     let inner = explorer_inner_rows(height);
     inner.saturating_sub(git_footer_layout(inner, body_open, commits).rows)

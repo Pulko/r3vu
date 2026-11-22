@@ -309,8 +309,9 @@ mod tests {
             .collect::<String>();
         assert!(explorer.contains("Explorer"));
         assert!(!explorer.contains("Changes"));
-        assert!(editor.contains("Editor"));
+        assert!(editor.contains("Open a file"));
         assert!(!editor.contains("Diff"));
+        assert!(!editor.contains("│"));
         assert!(!status.contains("topic"));
         assert_eq!(app.side_tabs.len(), 1);
         assert!(app.content_tabs.is_empty());
@@ -332,17 +333,16 @@ mod tests {
             })
             .collect();
         let row = symbols.concat();
-        let editor = symbols
-            .windows(6)
-            .position(|cells| cells.concat() == "Editor")
-            .expect("file title");
+        assert!(row.contains("Open a file"));
+        assert!(!row.contains("Editor"));
         assert!(!row.contains("Diff"));
+        assert!(!row.contains("│"));
         assert!(app.content_tabs.is_empty());
-        let accent = Color::Rgb(110, 186, 196);
         let buffer = terminal.backend().buffer();
-        let editor_cell = &buffer[(app.editor_area.0 + editor as u16, y)];
-        assert_eq!(editor_cell.symbol(), "E");
-        assert_eq!(editor_cell.fg, accent);
+        assert_eq!(buffer[(app.editor_area.0, y)].symbol(), "O");
+        let seam = app.editor_area.0.saturating_sub(1);
+        assert_eq!(buffer[(seam, y.saturating_add(1))].symbol(), "│");
+        assert_ne!(buffer[(app.editor_area.0, y.saturating_add(1))].symbol(), "│");
         let status = (0..app.status_area.2)
             .map(|col| {
                 buffer[(app.status_area.0 + col, app.status_area.1)]

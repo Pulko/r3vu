@@ -706,16 +706,17 @@ fn render_completions(frame: &mut Frame, app: &App, selected: usize, theme: Them
     let selected = selected.min(items.len() - 1);
     let (ex, ey, ew, eh) = app.editor_area;
     let origin = app.active_view().map(|v| v.cursor).unwrap_or_default();
-    let y = ey.saturating_add(1).saturating_add(
+    let y = ey.saturating_add(
         (origin
             .line
-            .saturating_sub(app.active_view().map(|v| v.viewport.top).unwrap_or(0))) as u16,
+            .saturating_sub(app.active_view().map(|v| v.viewport.top).unwrap_or(0)))
+            as u16,
     );
     let mut height = (items.len() as u16 + 2).min(12).min(eh.saturating_sub(1));
     let mut rect = Rect {
-        x: (ex + app.gutter_width + 2).min(ex + ew.saturating_sub(24)),
+        x: (ex + app.gutter_width + 1).min(ex + ew.saturating_sub(24)),
         y: (y + 1).min(ey + eh.saturating_sub(height)),
-        width: 40.min(ew.saturating_sub(2)).max(16),
+        width: 40.min(ew).max(16),
         height,
     };
     if rect.y + rect.height > ey + eh {

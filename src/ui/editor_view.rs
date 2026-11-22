@@ -1,14 +1,15 @@
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Position as TermPos, Rect};
+use ratatui::layout::{Position as TermPos, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
 use crate::app::state::{
     BlameHit, DiffHit, Focus, HScrollHit, HunkAction, SearchKind, SearchScope, TabHitBox,
+    editor_body_rows, editor_shows_hscroll, editor_text_columns,
 };
 use crate::editor::{
     Range, display_col, hscroll_bar, line_display_width, line_text, max_line_display_width,
@@ -28,9 +29,7 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
     render_tabs(frame, tabs, app, theme);
     let Some(id) = app.active else {
         frame.render_widget(
-            Paragraph::new("Open a file from the explorer or press Ctrl+P")
-                .style(theme.text())
-                .block(content_block(area, app, "Editor")),
+            Paragraph::new("Open a file from the explorer or press Ctrl+P").style(theme.text()),
             area,
         );
         return;
@@ -58,8 +57,10 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
     let hunks = app.present_hunks(id);
     let gutter = number_width + 1;
     app.gutter_width = gutter;
-    let inner_h = area.height.saturating_sub(2) as usize;
-    let inner_w = area.width.saturating_sub(2 + gutter) as usize;
+    let inner_w = editor_text_columns(area.width, gutter);
+    let content_width = max_line_display_width(&doc.rope, tab_width);
+    let hscroll = editor_shows_hscroll(area.height, inner_w, content_width);
+    let inner_h = editor_body_rows(area.height, hscroll);
     let visible_lines: Vec<usize> = rows
         .iter()
         .skip(view.viewport.top)
@@ -101,7 +102,7 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
             lines.push(Line::from(""));
             continue;
         };
-        let y = area.y.saturating_add(1).saturating_add(lines.len() as u16);
+        let y = area.y.saturating_add(lines.len() as u16);
         if let VisualRow::Bar { anchor } = visual {
             let bar = if anchor == KEEP_DELETE_ANCHOR {
                 HunkBar::KeepOrDelete
@@ -122,7 +123,7 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
                 theme,
                 number_width,
                 inner_w,
-                area.x.saturating_add(1),
+                area.x,
                 y,
             );
             bar_hits.extend(hits);
@@ -206,7 +207,6 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
                 spans.push(Span::styled(" ".to_string(), style));
                 let arrow_x = area
                     .x
-                    .saturating_add(1)
                     .saturating_add(gutter)
                     .saturating_add(inner_w as u16)
                     .saturating_sub(1);
@@ -230,17 +230,6 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
         lines.push(Line::from(spans));
     }
 
-    let deleted = app.absent.contains(&id);
-    let title = doc
-        .path
-        .as_ref()
-        .map(|p| app.relative(p))
-        .unwrap_or_else(|| "untitled".into());
-    let title = if deleted {
-        format!("Deleted {title}")
-    } else {
-        title
-    };
     let cursor = app.views.get(&id).and_then(|view| {
         let text = line_text(&doc.rope, view.cursor.line);
         let col = display_col(&text, view.cursor.column, tab_width);
@@ -252,14 +241,17 @@ pub fn render(frame: &mut Frame, tabs: Rect, area: Rect, app: &mut App) {
             && col >= view.viewport.left
             && col < view.viewport.left + inner_w)
             .then_some(TermPos {
-                x: area.x + 1 + gutter + (col - view.viewport.left) as u16,
-                y: area.y + 1 + (cursor_row - view.viewport.top) as u16,
+                x: area
+                    .x
+                    .saturating_add(gutter)
+                    .saturating_add((col - view.viewport.left) as u16),
+                y: area
+                    .y
+                    .saturating_add((cursor_row - view.viewport.top) as u16),
             })
     });
     app.diff_hits.extend(bar_hits);
-    let block = content_block(area, app, &title);
-    let block = restore_title(block, area, app, deleted);
-    frame.render_widget(Paragraph::new(lines).style(theme.text()).block(block), area);
+    frame.render_widget(Paragraph::new(lines).style(theme.text()), area);
     if let Some(cursor) = cursor
         && app.focus == Focus::Editor
         && matches!(
@@ -295,7 +287,7 @@ fn paint_hscroll(frame: &mut Frame, area: Rect, app: &mut App, theme: Theme, inn
             view.viewport.left,
         )
     };
-    let track_x = area.x.saturating_add(1).saturating_add(gutter);
+    let track_x = area.x.saturating_add(gutter);
     let Some(bar) = hscroll_bar(track_x, inner_w as u16, inner_w, content, left) else {
         return;
     };
@@ -587,83 +579,9 @@ fn line_wash(changes: &LineChanges, line_idx: usize, theme: Theme) -> Option<Col
     }
 }
 
-fn restore_title(block: Block<'static>, area: Rect, app: &mut App, show: bool) -> Block<'static> {
-    if !show {
-        return block;
-    }
-    let label = " Restore ";
-    let width = UnicodeWidthStr::width(label) as u16;
-    if width.saturating_add(2) >= area.width {
-        return block;
-    }
-    let x = area
-        .x
-        .saturating_add(area.width)
-        .saturating_sub(width)
-        .saturating_sub(1);
-    let style = Style::default()
-        .fg(app.theme().accent)
-        .add_modifier(Modifier::BOLD);
-    app.restore_hit = Some((x, area.y, width));
-    block.title(Line::from(Span::styled(label, style)).alignment(Alignment::Right))
-}
-
-fn content_block(area: Rect, app: &mut App, title: &str) -> Block<'static> {
-    let theme = app.theme();
-    let focused = app.focus == Focus::Editor;
-    app.content_tabs.clear();
-    let room = area.width.saturating_sub(2) as usize;
-    let label = fit_border_title(title, room);
-    let border = if focused { theme.accent } else { theme.border };
-    let title_style = if focused {
-        Style::default()
-            .fg(theme.accent)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.fg_muted)
-    };
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border))
-        .style(theme.text())
-        .title(Line::from(Span::styled(label, title_style)).alignment(Alignment::Left))
-}
-
-fn fit_border_title(title: &str, max_width: usize) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-    let padded = format!(" {title} ");
-    if UnicodeWidthStr::width(padded.as_str()) <= max_width {
-        return padded;
-    }
-    if max_width <= 2 {
-        return title.graphemes(true).take(max_width).collect();
-    }
-    let inner = max_width - 2;
-    let mut body = String::new();
-    let mut width = 0usize;
-    for grapheme in title.graphemes(true) {
-        let next = UnicodeWidthStr::width(grapheme);
-        if width + next + 1 > inner {
-            break;
-        }
-        body.push_str(grapheme);
-        width += next;
-    }
-    format!(" {body}… ")
-}
-
 fn render_markdown(frame: &mut Frame, area: Rect, app: &mut App, theme: Theme) {
-    let width = area.width.saturating_sub(2) as usize;
-    let height = area.height.saturating_sub(2) as usize;
-    let title = app
-        .markdown_preview
-        .as_ref()
-        .and_then(|preview| app.documents.get(&preview.document_id))
-        .and_then(|doc| doc.path.as_ref().map(|path| app.relative(path)))
-        .map(|name| format!("Preview {name}"))
-        .unwrap_or_else(|| "Preview".into());
+    let width = area.width as usize;
+    let height = area.height as usize;
     let refresh = app.markdown_preview.as_ref().and_then(|preview| {
         let doc = app.documents.get(&preview.document_id)?;
         Some((
@@ -683,12 +601,7 @@ fn render_markdown(frame: &mut Frame, area: Rect, app: &mut App, theme: Theme) {
         .as_ref()
         .map(|preview| preview.visible(height.max(1)))
         .unwrap_or_default();
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(theme.text())
-            .block(content_block(area, app, &title)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).style(theme.text()), area);
 }
 
 const TAB_CHEVRON: u16 = 2;
@@ -732,10 +645,24 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &mut App, theme: Theme) {
     } else {
         area.width
     };
+    let restore_label = " Restore ";
+    let restore_w = if app.active.is_some_and(|id| app.absent.contains(&id)) {
+        UnicodeWidthStr::width(restore_label) as u16
+    } else {
+        0
+    };
+    let restore_reserve = if restore_w == 0 {
+        0
+    } else {
+        restore_w.saturating_add(1)
+    };
     let mut strip = layout_tab_strip(
         &labels,
         app.tab_scroll,
-        area.width.saturating_sub(reserved),
+        area
+            .width
+            .saturating_sub(reserved)
+            .saturating_sub(restore_reserve),
         active_index,
         reveal,
     );
@@ -803,7 +730,22 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &mut App, theme: Theme) {
     if let Some(x) = strip.right {
         push_gap(&mut spans, &mut cursor, x);
         spans.push(Span::styled(">>", Style::default().fg(theme.fg_dim)));
+        cursor = cursor.saturating_add(TAB_CHEVRON);
         app.tab_scroll_right = Some((area.x.saturating_add(x), TAB_CHEVRON));
+    }
+    if restore_w > 0 {
+        let restore_x = area.width.saturating_sub(restore_w);
+        if restore_x >= cursor {
+            push_gap(&mut spans, &mut cursor, restore_x);
+            spans.push(Span::styled(
+                restore_label,
+                Style::default()
+                    .fg(theme.accent)
+                    .bg(theme.bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            app.restore_hit = Some((area.x.saturating_add(restore_x), area.y, restore_w));
+        }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)).style(theme.text()), area);
 }

@@ -821,6 +821,8 @@ fn fence_language(info: &str) -> Option<LanguageId> {
         "yaml" | "yml" => Some(LanguageId::Yaml),
         "html" | "htm" => Some(LanguageId::Html),
         "css" => Some(LanguageId::Css),
+        "python" | "py" => Some(LanguageId::Python),
+        "java" => Some(LanguageId::Java),
         _ => None,
     }
 }
@@ -967,6 +969,14 @@ mod tests {
         assert!(!body.style.add_modifier.contains(Modifier::BOLD));
         let smaller = span_with(&lines, "Smaller");
         assert_eq!(smaller.style.fg, Some(theme.type_name));
+    }
+
+    #[test]
+    fn python_and_java_fences_map_to_their_languages() {
+        assert_eq!(fence_language("python"), Some(LanguageId::Python));
+        assert_eq!(fence_language("py"), Some(LanguageId::Python));
+        assert_eq!(fence_language("java"), Some(LanguageId::Java));
+        assert_eq!(fence_language("jsp"), None);
     }
 
     #[test]

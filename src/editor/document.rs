@@ -24,6 +24,8 @@ pub enum LanguageId {
     Html,
     Css,
     Markdown,
+    Python,
+    Java,
     PlainText,
 }
 
@@ -45,6 +47,8 @@ impl LanguageId {
             "html" | "htm" => Self::Html,
             "css" => Self::Css,
             "md" | "markdown" => Self::Markdown,
+            "py" | "pyi" | "pyw" => Self::Python,
+            "java" => Self::Java,
             _ => Self::PlainText,
         }
     }
@@ -60,6 +64,8 @@ impl LanguageId {
             Self::Html => "HTML",
             Self::Css => "CSS",
             Self::Markdown => "Markdown",
+            Self::Python => "Python",
+            Self::Java => "Java",
             Self::PlainText => "Plain Text",
         }
     }
@@ -75,6 +81,8 @@ impl LanguageId {
             Self::Html => "html",
             Self::Css => "css",
             Self::Markdown => "markdown",
+            Self::Python => "python",
+            Self::Java => "java",
             Self::PlainText => "plaintext",
         }
     }
@@ -643,6 +651,34 @@ mod tests {
             LanguageId::Markdown
         );
         assert_eq!(LanguageId::Markdown.as_str(), "Markdown");
+    }
+
+    #[test]
+    fn python_and_java_paths_use_their_languages() {
+        assert_eq!(
+            LanguageId::from_path(Path::new("app.py")),
+            LanguageId::Python
+        );
+        assert_eq!(
+            LanguageId::from_path(Path::new("types.pyi")),
+            LanguageId::Python
+        );
+        assert_eq!(
+            LanguageId::from_path(Path::new("script.pyw")),
+            LanguageId::Python
+        );
+        assert_eq!(
+            LanguageId::from_path(Path::new("src/App.java")),
+            LanguageId::Java
+        );
+        assert_eq!(
+            LanguageId::from_path(Path::new("module-info.java")),
+            LanguageId::Java
+        );
+        assert_eq!(LanguageId::Python.as_str(), "Python");
+        assert_eq!(LanguageId::Python.lsp_language_id(), "python");
+        assert_eq!(LanguageId::Java.as_str(), "Java");
+        assert_eq!(LanguageId::Java.lsp_language_id(), "java");
     }
 
     #[test]

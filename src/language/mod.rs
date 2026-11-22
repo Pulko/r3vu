@@ -160,13 +160,17 @@ pub enum LspCmd {
     },
     Restart {
         root: PathBuf,
+        server: ServerKind,
     },
     Shutdown,
 }
 
 #[derive(Debug)]
 pub enum LspEvent {
-    Status(LspStatus),
+    Status {
+        server: ServerKind,
+        status: LspStatus,
+    },
     Diagnostics {
         path: PathBuf,
         items: Vec<Diagnostic>,
@@ -198,6 +202,102 @@ pub enum LspEvent {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ServerKind {
+    TypeScript,
+    Python,
+    Java,
+}
+
+impl ServerKind {
+    pub fn all() -> [Self; 3] {
+        [Self::TypeScript, Self::Python, Self::Java]
+    }
+}
+
+pub const TYPES_INSTALL: &str = "npm install -g typescript typescript-language-server";
+pub const PYTHON_INSTALL: &str = "npm install -g pyright";
+pub const JAVA_INSTALL: &str = "brew install jdtls";
+
+pub fn server_for(language: LanguageId) -> ServerKind {
+    match language {
+        LanguageId::Python => ServerKind::Python,
+        LanguageId::Java => ServerKind::Java,
+        _ => ServerKind::TypeScript,
+    }
+}
+
+pub fn server_for_path(path: &Path) -> ServerKind {
+    server_for(LanguageId::from_path(path))
+}
+
+pub fn server_binary(server: ServerKind) -> &'static str {
+    match server {
+        ServerKind::TypeScript => "typescript-language-server",
+        ServerKind::Python => "pyright-langserver",
+        ServerKind::Java => "jdtls",
+    }
+}
+
+pub fn server_requirement(server: ServerKind) -> &'static str {
+    match server {
+        ServerKind::TypeScript => "typescript-language-server on PATH.",
+        ServerKind::Python => "pyright-langserver on PATH.",
+        ServerKind::Java => "jdtls on PATH.",
+    }
+}
+
+pub fn install_command(server: ServerKind) -> &'static str {
+    match server {
+        ServerKind::TypeScript => TYPES_INSTALL,
+        ServerKind::Python => PYTHON_INSTALL,
+        ServerKind::Java => JAVA_INSTALL,
+    }
+}
+
+pub fn server_installed(server: ServerKind) -> bool {
+    which::which(server_binary(server)).is_ok()
+}
+
+#[derive(Clone, Debug)]
+pub struct LspServers {
+    pub typescript: LspStatus,
+    pub python: LspStatus,
+    pub java: LspStatus,
+}
+
+impl LspServers {
+    pub fn starting() -> Self {
+        Self {
+            typescript: LspStatus::Starting,
+            python: LspStatus::Starting,
+            java: LspStatus::Starting,
+        }
+    }
+
+    pub fn get(&self, server: ServerKind) -> &LspStatus {
+        match server {
+            ServerKind::TypeScript => &self.typescript,
+            ServerKind::Python => &self.python,
+            ServerKind::Java => &self.java,
+        }
+    }
+
+    pub fn get_mut(&mut self, server: ServerKind) -> &mut LspStatus {
+        match server {
+            ServerKind::TypeScript => &mut self.typescript,
+            ServerKind::Python => &mut self.python,
+            ServerKind::Java => &mut self.java,
+        }
+    }
+}
+
+impl Default for LspServers {
+    fn default() -> Self {
+        Self::starting()
+    }
+}
+
 pub struct LanguageClient {
     pub tx: mpsc::UnboundedSender<LspCmd>,
 }
@@ -218,6 +318,32 @@ struct Server {
     pending: HashMap<i64, Pending>,
 }
 
+struct Session {
+    server: Option<Server>,
+    open_docs: HashMap<PathBuf, (LanguageId, String, i64)>,
+    restarts: u32,
+    generation: u64,
+    launch_attempted: bool,
+}
+
+impl Session {
+    fn new() -> Self {
+        Self {
+            server: None,
+            open_docs: HashMap::new(),
+            restarts: 0,
+            generation: 0,
+            launch_attempted: false,
+        }
+    }
+}
+
+struct Incoming {
+    kind: ServerKind,
+    generation: u64,
+    msg: Value,
+}
+
 enum Pending {
     Completion(u64),
     Hover(u64),
@@ -233,12 +359,12 @@ async fn run_client(
     mut rx: mpsc::UnboundedReceiver<LspCmd>,
     events: mpsc::UnboundedSender<LspEvent>,
 ) {
-    let mut server: Option<Server> = None;
-    let mut reader_task_alive = false;
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
-    let mut restarts = 0u32;
+    let mut sessions: HashMap<ServerKind, Session> = HashMap::new();
+    for kind in ServerKind::all() {
+        sessions.insert(kind, Session::new());
+    }
     let mut last_root: Option<PathBuf> = None;
-    let mut open_docs: HashMap<PathBuf, (LanguageId, String, i64)> = HashMap::new();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Incoming>();
 
     loop {
         tokio::select! {
@@ -246,103 +372,202 @@ async fn run_client(
                 let Some(cmd) = cmd else { break; };
                 match cmd {
                     LspCmd::Shutdown => {
-                        if let Some(mut s) = server.take() {
-                            let _ = write_rpc(&mut s.writer, json!({"jsonrpc":"2.0","id":s.next_id,"method":"shutdown","params":null})).await;
-                            let _ = s.child.kill().await;
+                        for session in sessions.values_mut() {
+                            if let Some(mut server) = session.server.take() {
+                                let _ = write_rpc(&mut server.writer, json!({"jsonrpc":"2.0","id":server.next_id,"method":"shutdown","params":null})).await;
+                                let _ = server.child.kill().await;
+                            }
                         }
                         break;
                     }
-                    LspCmd::Initialize { root } | LspCmd::Restart { root } => {
+                    LspCmd::Initialize { root } => {
                         last_root = Some(root.clone());
-                        if let Some(mut s) = server.take() {
-                            let _ = s.child.kill().await;
-                        }
-                        match start_server(&root, &events, out_tx.clone()).await {
-                            Ok(s) => {
-                                reader_task_alive = true;
-                                let _ = events.send(LspEvent::Status(LspStatus::Starting));
-                                server = Some(s);
-                                restarts = 0;
-                            }
-                            Err(err) => {
-                                let _ = events.send(LspEvent::Status(LspStatus::Unavailable(err)));
+                        launch(&mut sessions, ServerKind::TypeScript, &root, &events, &out_tx).await;
+                        for kind in [ServerKind::Python, ServerKind::Java] {
+                            let pending = sessions.get(&kind).is_some_and(|session| {
+                                session.server.is_none()
+                                    && !session.launch_attempted
+                                    && !session.open_docs.is_empty()
+                            });
+                            if pending {
+                                launch(&mut sessions, kind, &root, &events, &out_tx).await;
                             }
                         }
                     }
+                    LspCmd::Restart { root, server } => {
+                        last_root = Some(root.clone());
+                        if let Some(session) = sessions.get_mut(&server) {
+                            session.restarts = 0;
+                            if let Some(mut running) = session.server.take() {
+                                let _ = running.child.kill().await;
+                            }
+                        }
+                        launch(&mut sessions, server, &root, &events, &out_tx).await;
+                    }
                     other => {
-                        if server.is_none() {
-                            if matches!(other, LspCmd::DidOpen { .. }) {
+                        let kind = kind_of_cmd(&other);
+                        let server_up = sessions.get(&kind).is_some_and(|session| session.server.is_some());
+                        if !server_up {
+                            let start = {
+                                let Some(session) = sessions.get_mut(&kind) else { continue };
                                 if let LspCmd::DidOpen { path, language, text, version } = &other {
-                                    open_docs.insert(path.clone(), (*language, text.clone(), *version));
+                                    session.open_docs.insert(path.clone(), (*language, text.clone(), *version));
                                 }
+                                !session.launch_attempted
+                                    && last_root.is_some()
+                                    && matches!(other, LspCmd::DidOpen { .. })
+                            };
+                            if start && let Some(root) = last_root.clone() {
+                                launch(&mut sessions, kind, &root, &events, &out_tx).await;
                             }
                             continue;
                         }
-                        if let Some(s) = server.as_mut() {
-                            match handle_cmd(s, other, &mut open_docs).await {
-                                Ok(()) => {}
-                                Err(err) => {
-                                    tracing::warn!("lsp command failed: {err}");
-                                    let _ = s.child.kill().await;
-                                    server = None;
-                                    let _ = events.send(LspEvent::Status(LspStatus::Error(err)));
+                        let failed = {
+                            let Some(session) = sessions.get_mut(&kind) else { continue };
+                            if let Some(server) = session.server.as_mut() {
+                                handle_cmd(server, other, &mut session.open_docs).await.err()
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(err) = failed {
+                            tracing::warn!("lsp command failed: {err}");
+                            if let Some(session) = sessions.get_mut(&kind) {
+                                if let Some(mut server) = session.server.take() {
+                                    let _ = server.child.kill().await;
                                 }
                             }
+                            let _ = events.send(LspEvent::Status {
+                                server: kind,
+                                status: LspStatus::Error(err),
+                            });
                         }
                     }
                 }
             }
-            msg = out_rx.recv() => {
-                let Some(msg) = msg else { break; };
-                if msg.get("method").and_then(|m| m.as_str()) == Some("exit") || msg.get("closed").is_some() {
-                    let _ = events.send(LspEvent::Status(LspStatus::Error("language server exited".into())));
-                    server = None;
-                    if restarts < 5 {
+            incoming = out_rx.recv() => {
+                let Some(incoming) = incoming else { break; };
+                let current = sessions.get(&incoming.kind).map(|session| session.generation);
+                if current != Some(incoming.generation) {
+                    continue;
+                }
+                let closed = incoming.msg.get("method").and_then(|method| method.as_str()) == Some("exit")
+                    || incoming.msg.get("closed").is_some();
+                if closed {
+                    let attempt = {
+                        let Some(session) = sessions.get_mut(&incoming.kind) else { continue };
+                        session.server = None;
+                        if session.restarts < 5 {
+                            session.restarts += 1;
+                            Some(session.restarts)
+                        } else {
+                            None
+                        }
+                    };
+                    let _ = events.send(LspEvent::Status {
+                        server: incoming.kind,
+                        status: LspStatus::Error("language server exited".into()),
+                    });
+                    if let Some(attempt) = attempt {
                         if let Some(root) = last_root.clone() {
-                            restarts += 1;
-                            tokio::time::sleep(Duration::from_millis(300 * restarts as u64)).await;
-                            if let Ok(s) = start_server(&root, &events, out_tx.clone()).await {
-                                let _ = events.send(LspEvent::Status(LspStatus::Starting));
-                                // replay docs after initialize response
-                                server = Some(s);
-                            }
+                            tokio::time::sleep(Duration::from_millis(300 * u64::from(attempt))).await;
+                            launch(&mut sessions, incoming.kind, &root, &events, &out_tx).await;
                         }
                     }
                     continue;
                 }
-                if let Some(s) = server.as_mut() {
-                    dispatch_message(s, msg, &events, &mut open_docs).await;
+                let Some(session) = sessions.get_mut(&incoming.kind) else { continue };
+                if incoming.generation != session.generation {
+                    continue;
+                }
+                if let Some(server) = session.server.as_mut() {
+                    dispatch_message(server, incoming.msg, &events, &mut session.open_docs, incoming.kind).await;
                 }
             }
         }
-        let _ = reader_task_alive;
+    }
+}
+
+fn kind_of_cmd(cmd: &LspCmd) -> ServerKind {
+    match cmd {
+        LspCmd::DidOpen { language, .. } => server_for(*language),
+        LspCmd::DidChange { path, .. }
+        | LspCmd::DidClose { path }
+        | LspCmd::Completion { path, .. }
+        | LspCmd::Hover { path, .. }
+        | LspCmd::Signature { path, .. }
+        | LspCmd::Definition { path, .. }
+        | LspCmd::References { path, .. }
+        | LspCmd::Rename { path, .. } => server_for_path(path),
+        LspCmd::WillRename { from, .. } => server_for_path(from),
+        LspCmd::Initialize { .. } | LspCmd::Restart { .. } | LspCmd::Shutdown => {
+            ServerKind::TypeScript
+        }
+    }
+}
+
+async fn launch(
+    sessions: &mut HashMap<ServerKind, Session>,
+    kind: ServerKind,
+    root: &Path,
+    events: &mpsc::UnboundedSender<LspEvent>,
+    out_tx: &mpsc::UnboundedSender<Incoming>,
+) {
+    let (generation, existing) = {
+        let Some(session) = sessions.get_mut(&kind) else {
+            return;
+        };
+        session.launch_attempted = true;
+        session.generation = session.generation.wrapping_add(1);
+        (session.generation, session.server.take())
+    };
+    if let Some(mut server) = existing {
+        let _ = server.child.kill().await;
+    }
+    match start_server(kind, root, out_tx.clone(), generation).await {
+        Ok(server) => {
+            let _ = events.send(LspEvent::Status {
+                server: kind,
+                status: LspStatus::Starting,
+            });
+            if let Some(session) = sessions.get_mut(&kind) {
+                session.server = Some(server);
+            }
+        }
+        Err(err) => {
+            let _ = events.send(LspEvent::Status {
+                server: kind,
+                status: LspStatus::Unavailable(err),
+            });
+        }
     }
 }
 
 async fn start_server(
+    kind: ServerKind,
     root: &Path,
-    events: &mpsc::UnboundedSender<LspEvent>,
-    out_tx: mpsc::UnboundedSender<Value>,
+    out_tx: mpsc::UnboundedSender<Incoming>,
+    generation: u64,
 ) -> Result<Server, String> {
-    let exe = which::which("typescript-language-server")
-        .map_err(|_| "typescript-language-server not found".to_string())?;
-    let mut child = Command::new(exe)
-        .arg("--stdio")
+    let (exe, args) = server_command(kind, root)?;
+    let mut command = Command::new(exe);
+    command
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| e.to_string())?;
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|err| err.to_string())?;
     let stdout = child.stdout.take().ok_or("missing stdout")?;
     let stderr = child.stderr.take();
     let writer = child.stdin.take().ok_or("missing stdin")?;
-    tokio::spawn(read_lsp(stdout, out_tx.clone()));
+    let label = server_binary(kind);
+    tokio::spawn(read_lsp(stdout, kind, generation, out_tx));
     if let Some(stderr) = stderr {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                tracing::debug!("tsserver: {line}");
+                tracing::debug!("{label}: {line}");
             }
         });
     }
@@ -357,6 +582,13 @@ async fn start_server(
     let id = server.next_id;
     server.next_id += 1;
     server.pending.insert(id, Pending::Initialize);
+    let init_options = match kind {
+        ServerKind::TypeScript => {
+            json!({ "preferences": { "includeCompletionsForModuleExports": true } })
+        }
+        ServerKind::Python => json!({}),
+        ServerKind::Java => json!({ "bundles": [] }),
+    };
     write_rpc(
         &mut server.writer,
         json!({
@@ -390,17 +622,51 @@ async fn start_server(
                         "publishDiagnostics": {}
                     }
                 },
-                "initializationOptions": { "preferences": { "includeCompletionsForModuleExports": true } },
+                "initializationOptions": init_options,
                 "workspaceFolders": [{ "uri": uri, "name": root.file_name().and_then(|n| n.to_str()).unwrap_or("workspace") }]
             }
         }),
     )
     .await?;
-    let _ = events;
     Ok(server)
 }
 
-async fn read_lsp<R: tokio::io::AsyncRead + Unpin>(reader: R, tx: mpsc::UnboundedSender<Value>) {
+fn server_command(kind: ServerKind, root: &Path) -> Result<(PathBuf, Vec<String>), String> {
+    let binary = server_binary(kind);
+    let exe = which::which(binary).map_err(|_| format!("{binary} not found"))?;
+    let args = match kind {
+        ServerKind::TypeScript | ServerKind::Python => vec!["--stdio".to_string()],
+        ServerKind::Java => {
+            let data = jdtls_data_dir(root);
+            std::fs::create_dir_all(&data).map_err(|err| err.to_string())?;
+            vec!["-data".to_string(), data.display().to_string()]
+        }
+    };
+    Ok((exe, args))
+}
+
+fn jdtls_data_dir(root: &Path) -> PathBuf {
+    let base = dirs::data_dir()
+        .or_else(dirs::config_dir)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("r3vu").join("jdtls").join(workspace_key(root))
+}
+
+fn workspace_key(root: &Path) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in root.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+async fn read_lsp<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    kind: ServerKind,
+    generation: u64,
+    tx: mpsc::UnboundedSender<Incoming>,
+) {
     let mut reader = BufReader::new(reader);
     loop {
         let mut header = String::new();
@@ -409,12 +675,20 @@ async fn read_lsp<R: tokio::io::AsyncRead + Unpin>(reader: R, tx: mpsc::Unbounde
             header.clear();
             match reader.read_line(&mut header).await {
                 Ok(0) => {
-                    let _ = tx.send(json!({"closed": true}));
+                    let _ = tx.send(Incoming {
+                        kind,
+                        generation,
+                        msg: json!({"closed": true}),
+                    });
                     return;
                 }
                 Ok(_) => {}
                 Err(_) => {
-                    let _ = tx.send(json!({"closed": true}));
+                    let _ = tx.send(Incoming {
+                        kind,
+                        generation,
+                        msg: json!({"closed": true}),
+                    });
                     return;
                 }
             }
@@ -431,11 +705,19 @@ async fn read_lsp<R: tokio::io::AsyncRead + Unpin>(reader: R, tx: mpsc::Unbounde
         };
         let mut buf = vec![0u8; len];
         if reader.read_exact(&mut buf).await.is_err() {
-            let _ = tx.send(json!({"closed": true}));
+            let _ = tx.send(Incoming {
+                kind,
+                generation,
+                msg: json!({"closed": true}),
+            });
             return;
         }
         if let Ok(value) = serde_json::from_slice(&buf) {
-            let _ = tx.send(value);
+            let _ = tx.send(Incoming {
+                kind,
+                generation,
+                msg: value,
+            });
         }
     }
 }
@@ -688,8 +970,22 @@ async fn dispatch_message(
     msg: Value,
     events: &mpsc::UnboundedSender<LspEvent>,
     open_docs: &mut HashMap<PathBuf, (LanguageId, String, i64)>,
+    kind: ServerKind,
 ) {
     if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
+        if msg.get("id").is_some() {
+            let id = msg.get("id").cloned().unwrap_or(Value::Null);
+            let _ = write_rpc(
+                &mut server.writer,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": client_request_result(method, &msg),
+                }),
+            )
+            .await;
+            return;
+        }
         if method == "textDocument/publishDiagnostics" {
             if let Some(params) = msg.get("params") {
                 let uri = params.get("uri").and_then(|u| u.as_str()).unwrap_or("");
@@ -716,9 +1012,10 @@ async fn dispatch_message(
     match pending {
         Pending::Initialize => {
             if msg.get("error").is_some() {
-                let _ = events.send(LspEvent::Status(LspStatus::Error(
-                    "initialize failed".into(),
-                )));
+                let _ = events.send(LspEvent::Status {
+                    server: kind,
+                    status: LspStatus::Error("initialize failed".into()),
+                });
                 return;
             }
             let caps = msg.pointer("/result/capabilities/textDocumentSync");
@@ -732,7 +1029,10 @@ async fn dispatch_message(
                 json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
             )
             .await;
-            let _ = events.send(LspEvent::Status(LspStatus::Ready));
+            let _ = events.send(LspEvent::Status {
+                server: kind,
+                status: LspStatus::Ready,
+            });
             let docs: Vec<_> = open_docs
                 .iter()
                 .map(|(p, (l, t, v))| (p.clone(), *l, t.clone(), *v))
@@ -792,6 +1092,21 @@ async fn dispatch_message(
                 });
             }
         }
+    }
+}
+
+fn client_request_result(method: &str, msg: &Value) -> Value {
+    match method {
+        "workspace/configuration" => {
+            let count = msg
+                .pointer("/params/items")
+                .and_then(|items| items.as_array())
+                .map(|items| items.len())
+                .unwrap_or(0);
+            Value::Array(vec![Value::Null; count])
+        }
+        "workspace/applyEdit" => json!({ "applied": false }),
+        _ => Value::Null,
     }
 }
 
@@ -1289,5 +1604,74 @@ mod tests {
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].new_text, "x");
         assert_eq!(edits[0].path, PathBuf::from("/repo/use.ts"));
+    }
+
+    #[test]
+    fn python_and_java_commands_do_not_use_the_typescript_server() {
+        let python = LspCmd::DidOpen {
+            path: PathBuf::from("app.py"),
+            language: LanguageId::Python,
+            text: String::new(),
+            version: 1,
+        };
+        let java = LspCmd::DidOpen {
+            path: PathBuf::from("App.java"),
+            language: LanguageId::Java,
+            text: String::new(),
+            version: 1,
+        };
+        assert_eq!(kind_of_cmd(&python), ServerKind::Python);
+        assert_eq!(kind_of_cmd(&java), ServerKind::Java);
+        assert_ne!(kind_of_cmd(&python), ServerKind::TypeScript);
+        assert_eq!(
+            kind_of_cmd(&LspCmd::Completion {
+                token: 1,
+                path: PathBuf::from("app.py"),
+                position: Position::default(),
+            }),
+            ServerKind::Python
+        );
+        assert_eq!(
+            kind_of_cmd(&LspCmd::WillRename {
+                token: 1,
+                from: PathBuf::from("A.java"),
+                to: PathBuf::from("B.java"),
+            }),
+            ServerKind::Java
+        );
+        assert_eq!(
+            kind_of_cmd(&LspCmd::DidOpen {
+                path: PathBuf::from("a.ts"),
+                language: LanguageId::TypeScript,
+                text: String::new(),
+                version: 1,
+            }),
+            ServerKind::TypeScript
+        );
+    }
+
+    #[test]
+    fn server_requests_get_an_empty_result() {
+        let msg = json!({
+            "id": 3,
+            "method": "workspace/configuration",
+            "params": { "items": [{ "section": "python" }, { "section": "python.analysis" }] }
+        });
+        assert_eq!(
+            client_request_result("workspace/configuration", &msg),
+            json!([null, null])
+        );
+        assert_eq!(
+            client_request_result("workspace/applyEdit", &json!({})),
+            json!({ "applied": false })
+        );
+        assert_eq!(
+            client_request_result("client/registerCapability", &json!({})),
+            Value::Null
+        );
+        assert_eq!(
+            client_request_result("window/workDoneProgress/create", &json!({})),
+            Value::Null
+        );
     }
 }

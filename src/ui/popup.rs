@@ -7,8 +7,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
-use crate::app::commands::TYPES_INSTALL;
 use crate::app::state::{Overlay, ScopeHit, SearchKind, SearchScope};
+use crate::language::{ServerKind, install_command, server_requirement};
 use crate::ui::theme::Theme;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -376,7 +376,7 @@ fn render_themes(
 fn render_types_note(frame: &mut Frame, app: &mut App, theme: Theme) {
     let width = 62u16.min(frame.area().width.saturating_sub(2)).max(24);
     let copy = " Copy ";
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled(
             " Editing works without it.",
             Style::default().fg(theme.fg),
@@ -387,12 +387,12 @@ fn render_types_note(frame: &mut Frame, app: &mut App, theme: Theme) {
             Style::default().fg(theme.fg),
         )),
         Line::from(Span::styled(
-            " typescript-language-server on PATH.",
+            format!(" {}", server_requirement(app.types_note_server)),
             Style::default().fg(theme.fg),
         )),
         Line::from(""),
         Line::from(Span::styled(
-            format!(" {TYPES_INSTALL}"),
+            format!(" {}", install_command(app.types_note_server)),
             Style::default().fg(theme.accent),
         )),
         Line::from(Span::styled(
@@ -402,6 +402,15 @@ fn render_types_note(frame: &mut Frame, app: &mut App, theme: Theme) {
                 .bg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         )),
+    ];
+    if app.types_note_server == ServerKind::Java {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            " It also needs a JDK 21 or newer.",
+            Style::default().fg(theme.fg),
+        )));
+    }
+    lines.extend([
         Line::from(""),
         Line::from(Span::styled(
             " Click ⊘ types off to check again, or restart r3vu.",
@@ -411,7 +420,7 @@ fn render_types_note(frame: &mut Frame, app: &mut App, theme: Theme) {
             " Enter dismisses this note.",
             Style::default().fg(theme.fg_muted),
         )),
-    ];
+    ]);
     let copy_row = 6u16;
     let height = (lines.len() as u16 + 2)
         .min(frame.area().height.saturating_sub(2))

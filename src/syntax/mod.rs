@@ -107,6 +107,18 @@ impl SyntaxService {
         );
         install(
             &mut grammars,
+            LanguageId::Python,
+            tree_sitter_python::LANGUAGE.into(),
+            &[tree_sitter_python::HIGHLIGHTS_QUERY],
+        );
+        install(
+            &mut grammars,
+            LanguageId::Java,
+            tree_sitter_java::LANGUAGE.into(),
+            &[tree_sitter_java::HIGHLIGHTS_QUERY],
+        );
+        install(
+            &mut grammars,
             LanguageId::Markdown,
             tree_sitter_md::LANGUAGE.into(),
             &[tree_sitter_md::HIGHLIGHT_QUERY_BLOCK],
@@ -608,6 +620,18 @@ mod tests {
             kind_at(&spans, 2, line.find("gone").unwrap()),
             Some(HighlightKind::Strike)
         );
+    }
+
+    #[test]
+    fn highlights_python_def_and_java_class() {
+        let (python, syntax) = open("app.py", "def greet():\n    return 1\n");
+        let spans = syntax.highlights(python.id, python.language, &python.rope, 0, 2);
+        assert_eq!(kind_at(&spans, 0, 0), Some(HighlightKind::Keyword));
+        let (java, syntax) = open("App.java", "class Box {\n    int n;\n}\n");
+        let spans = syntax.highlights(java.id, java.language, &java.rope, 0, 3);
+        assert_eq!(kind_at(&spans, 0, 0), Some(HighlightKind::Keyword));
+        let name = "class Box {".find("Box").unwrap();
+        assert_eq!(kind_at(&spans, 0, name), Some(HighlightKind::Type));
     }
 
     #[test]

@@ -11,7 +11,8 @@ use crate::editor::{
     Clipboard, Document, DocumentChange, DocumentId, EditorView, LanguageId, Position, Range,
 };
 use crate::language::{
-    CompletionItem, Diagnostic, LanguageClient, Location, LspCmd, LspStatus, TextEdit,
+    CompletionItem, Diagnostic, LanguageClient, Location, LspCmd, LspServers, LspStatus,
+    ServerKind, TextEdit, server_for,
 };
 use crate::syntax::SyntaxService;
 use crate::workspace::{
@@ -360,7 +361,8 @@ pub struct App {
     pub clipboard: Clipboard,
     pub syntax: SyntaxService,
     pub lsp: LanguageClient,
-    pub lsp_status: LspStatus,
+    pub lsp_servers: LspServers,
+    pub types_note_server: ServerKind,
     pub diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
     pub file_finder: FileFinder,
     pub workspace_files: Vec<String>,
@@ -499,7 +501,8 @@ impl App {
             clipboard: Clipboard::new(),
             syntax: SyntaxService::new(),
             lsp,
-            lsp_status: LspStatus::Starting,
+            lsp_servers: LspServers::starting(),
+            types_note_server: ServerKind::TypeScript,
             diagnostics: HashMap::new(),
             file_finder: FileFinder::new(),
             workspace_files: crate::workspace::list_workspace_files(&root),
@@ -1721,6 +1724,16 @@ impl App {
 
     pub fn active_doc(&self) -> Option<&Document> {
         self.active.and_then(|id| self.documents.get(&id))
+    }
+
+    pub fn active_server(&self) -> ServerKind {
+        self.active_doc()
+            .map(|doc| server_for(doc.language))
+            .unwrap_or(ServerKind::TypeScript)
+    }
+
+    pub fn active_lsp_status(&self) -> &LspStatus {
+        self.lsp_servers.get(self.active_server())
     }
 
     pub fn active_doc_mut(&mut self) -> Option<&mut Document> {

@@ -220,6 +220,34 @@ mod tests {
     }
 
     #[test]
+    fn python_and_java_notes_show_their_install_commands() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(PathBuf::from("."), LanguageClient { tx });
+        app.overlay = Overlay::TypesNote;
+        app.types_note_server = crate::language::ServerKind::Python;
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("npm install -g pyright"));
+        assert!(text.contains("pyright-langserver on PATH."));
+        let (x, y, _) = app.types_copy.expect("copy button");
+        crate::app::commands::click_types_note(&mut app, x, y);
+        assert_eq!(app.message.as_deref(), Some("Copied"));
+
+        app.types_note_server = crate::language::ServerKind::Java;
+        app.message = None;
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("brew install jdtls"));
+        assert!(text.contains("jdtls on PATH."));
+        assert!(text.contains("JDK 21"));
+        let (x, y, _) = app.types_copy.expect("copy button");
+        crate::app::commands::click_types_note(&mut app, x, y);
+        assert_eq!(app.message.as_deref(), Some("Copied"));
+    }
+
+    #[test]
     fn explorer_border_puts_changes_on_the_right() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(PathBuf::from("."), LanguageClient { tx });

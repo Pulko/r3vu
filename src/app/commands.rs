@@ -11,7 +11,7 @@ use crate::editor::{
 };
 use crate::language::{
     CompletionItem, LspCmd, LspStatus, TextEdit, completion_prefix, filter_completions,
-    strip_snippets, utf16_position_to_doc,
+    install_command, server_for_path, server_installed, strip_snippets, utf16_position_to_doc,
 };
 use crate::workspace::{
     GitWrite, WatchEvent, WholeFileAction, create_path, find_in_document, rename_path,
@@ -968,7 +968,10 @@ pub fn submit_prompt(app: &mut App) {
                 if to == from {
                     return;
                 }
-                if matches!(app.lsp_status, LspStatus::Ready) {
+                if matches!(
+                    app.lsp_servers.get(server_for_path(&from)),
+                    LspStatus::Ready
+                ) {
                     let token = app.next_token();
                     let _ = app.lsp.tx.send(LspCmd::WillRename {
                         token,
@@ -1735,7 +1738,9 @@ pub fn click_themes(app: &mut App, y: u16) {
 }
 
 pub fn click_types_status(app: &mut App) {
-    if which::which("typescript-language-server").is_ok() {
+    let server = app.active_server();
+    app.types_note_server = server;
+    if server_installed(server) {
         refresh_types(app);
     } else {
         app.overlay = Overlay::TypesNote;
@@ -1743,20 +1748,22 @@ pub fn click_types_status(app: &mut App) {
 }
 
 pub fn refresh_types(app: &mut App) {
-    app.lsp_status = LspStatus::Starting;
+    let server = app.active_server();
+    *app.lsp_servers.get_mut(server) = LspStatus::Starting;
     let _ = app.lsp.tx.send(LspCmd::Restart {
         root: app.root.clone(),
+        server,
     });
 }
 
-pub const TYPES_INSTALL: &str = "npm install -g typescript typescript-language-server";
+pub use crate::language::TYPES_INSTALL;
 
 pub fn click_types_note(app: &mut App, x: u16, y: u16) {
     let Some((hit_x, hit_y, width)) = app.types_copy else {
         return;
     };
     if y == hit_y && x >= hit_x && x < hit_x.saturating_add(width) {
-        app.clipboard.copy(TYPES_INSTALL);
+        app.clipboard.copy(install_command(app.types_note_server));
         app.message = Some("Copied".into());
     }
 }
@@ -1855,7 +1862,7 @@ pub fn editor_context_labels() -> [&'static str; 3] {
 }
 
 pub fn show_editor_menu(app: &mut App, x: u16, y: u16) {
-    let lsp_ok = matches!(app.lsp_status, LspStatus::Ready);
+    let lsp_ok = matches!(app.active_lsp_status(), LspStatus::Ready);
     let token = app.next_token();
     app.hover_token = token;
     app.overlay = Overlay::ContextMenu {

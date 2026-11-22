@@ -636,7 +636,10 @@ fn log_lines(
         let prefix = if last { "└─ " } else { "├─ " };
         let prefix_shown = fit(prefix, inner_w);
         let prefix_w = UnicodeWidthStr::width(prefix_shown.as_str());
-        let subject = fill(&fit(&commit.subject, inner_w - prefix_w), inner_w - prefix_w);
+        let subject = fill(
+            &fit(&commit.subject, inner_w - prefix_w),
+            inner_w - prefix_w,
+        );
         hit(
             app,
             x,

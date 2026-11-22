@@ -4,11 +4,11 @@ use crate::app::commands;
 use crate::app::state::{
     App, ConfirmAction, Focus, Overlay, SearchKind, SearchScope, click_was_double,
 };
-use crate::language::{LspEvent, LspStatus};
+use crate::language::{LspEvent, LspStatus, ServerKind};
 
 pub fn handle_lsp(app: &mut App, event: LspEvent) {
     match event {
-        LspEvent::Status(status) => apply_lsp_status(app, status),
+        LspEvent::Status { server, status } => apply_lsp_status(app, server, status),
         LspEvent::Diagnostics { path, mut items } => {
             if let Some(doc) = app
                 .documents
@@ -114,21 +114,19 @@ pub fn handle_lsp(app: &mut App, event: LspEvent) {
     }
 }
 
-pub fn apply_lsp_status(app: &mut App, status: LspStatus) {
+pub fn apply_lsp_status(app: &mut App, server: ServerKind, status: LspStatus) {
     let missing = matches!(status, LspStatus::Unavailable(_));
     let ready = matches!(status, LspStatus::Ready);
-    app.lsp_status = status;
-    if matches!(
-        app.lsp_status,
-        LspStatus::Unavailable(_) | LspStatus::Error(_)
-    ) {
+    *app.lsp_servers.get_mut(server) = status.clone();
+    if matches!(status, LspStatus::Unavailable(_) | LspStatus::Error(_)) {
         commands::abandon_file_rename(app);
     }
-    if ready && matches!(app.overlay, Overlay::TypesNote) {
+    if ready && matches!(app.overlay, Overlay::TypesNote) && app.types_note_server == server {
         app.overlay = Overlay::None;
         return;
     }
     if missing && !app.config.types_note_dismissed && matches!(app.overlay, Overlay::None) {
+        app.types_note_server = server;
         app.overlay = Overlay::TypesNote;
     }
 }
@@ -218,7 +216,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::app::state::{App, Overlay};
-    use crate::language::{LanguageClient, LspCmd, LspStatus};
+    use crate::language::{LanguageClient, LspCmd, LspStatus, ServerKind};
 
     use super::{apply_lsp_status, status_text};
 
@@ -244,16 +242,50 @@ mod tests {
         app.overlay = Overlay::None;
         apply_lsp_status(
             &mut app,
+            ServerKind::TypeScript,
             LspStatus::Unavailable("typescript-language-server not found".into()),
         );
         assert!(matches!(app.overlay, Overlay::TypesNote));
+        assert_eq!(app.types_note_server, ServerKind::TypeScript);
         app.overlay = Overlay::None;
         app.config.types_note_dismissed = true;
         apply_lsp_status(
             &mut app,
+            ServerKind::TypeScript,
             LspStatus::Unavailable("typescript-language-server not found".into()),
         );
         assert!(matches!(app.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn a_missing_python_server_is_separate_from_typescript() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(PathBuf::from("."), LanguageClient { tx });
+        app.config.types_note_dismissed = false;
+        apply_lsp_status(&mut app, ServerKind::TypeScript, LspStatus::Ready);
+        apply_lsp_status(
+            &mut app,
+            ServerKind::Python,
+            LspStatus::Unavailable("pyright-langserver not found".into()),
+        );
+        assert!(matches!(
+            app.lsp_servers.get(ServerKind::TypeScript),
+            LspStatus::Ready
+        ));
+        assert!(matches!(app.overlay, Overlay::TypesNote));
+        assert_eq!(app.types_note_server, ServerKind::Python);
+        app.overlay = Overlay::None;
+        app.config.types_note_dismissed = true;
+        apply_lsp_status(
+            &mut app,
+            ServerKind::Java,
+            LspStatus::Unavailable("jdtls not found".into()),
+        );
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(matches!(
+            app.lsp_servers.get(ServerKind::Java),
+            LspStatus::Unavailable(_)
+        ));
     }
 
     #[test]
@@ -261,8 +293,9 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(PathBuf::from("."), LanguageClient { tx });
         app.overlay = Overlay::TypesNote;
+        app.types_note_server = ServerKind::TypeScript;
         app.config.types_note_dismissed = false;
-        apply_lsp_status(&mut app, LspStatus::Ready);
+        apply_lsp_status(&mut app, ServerKind::TypeScript, LspStatus::Ready);
         assert!(matches!(app.overlay, Overlay::None));
         assert!(!app.config.types_note_dismissed);
     }
@@ -272,9 +305,18 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = App::new(PathBuf::from("."), LanguageClient { tx });
         let _ = rx.try_recv();
-        app.lsp_status = LspStatus::Unavailable("missing".into());
+        *app.lsp_servers.get_mut(ServerKind::TypeScript) = LspStatus::Unavailable("missing".into());
         crate::app::commands::refresh_types(&mut app);
-        assert!(matches!(app.lsp_status, LspStatus::Starting));
-        assert!(matches!(rx.try_recv(), Ok(LspCmd::Restart { .. })));
+        assert!(matches!(
+            app.lsp_servers.get(ServerKind::TypeScript),
+            LspStatus::Starting
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(LspCmd::Restart {
+                server: ServerKind::TypeScript,
+                ..
+            })
+        ));
     }
 }

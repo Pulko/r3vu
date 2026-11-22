@@ -58,11 +58,27 @@ claude_enabled = false
 
 ## Optional
 
-Types and completion use the TypeScript language server. Editing continues if it is missing.
+Types and completion use a language server. Editing continues if it is missing.
+
+TypeScript and JavaScript:
 
 ```bash
 npm install -g typescript typescript-language-server
 ```
+
+Python:
+
+```bash
+npm install -g pyright
+```
+
+Java:
+
+```bash
+brew install jdtls
+```
+
+The Java server also needs a JDK 21 or newer.
 
 ## Benchmarks
 
@@ -85,4 +101,4 @@ Loading the tree-sitter grammars took 29.5 ms. Finding a file among 20,000 paths
 ## Limits
 
 - Git marks need a worktree.
-- JSON, YAML, HTML, CSS, and Markdown are colored. Markdown can be previewed with Ctrl+Shift+M. Types and completion stay TypeScript and JavaScript. Other files still edit and save.
+- JSON, YAML, HTML, CSS, Markdown, Python, and Java are colored. Markdown can be previewed with Ctrl+Shift+M. Types and completion are available for TypeScript, JavaScript, Python, and Java. Other files still edit and save.

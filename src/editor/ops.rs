@@ -344,10 +344,11 @@ pub fn indent_for_newline(doc: &Document, view: &EditorView) -> String {
     let mut indent = indent_of_line(&doc.rope, view.cursor.line);
     let line = line_text(&doc.rope, view.cursor.line);
     let before: String = line.chars().take(view.cursor.column).collect();
-    if before.trim_end().ends_with('{')
-        || before.trim_end().ends_with('(')
-        || before.trim_end().ends_with('[')
-    {
+    let trimmed = before.trim_end();
+    let opener = trimmed.ends_with('{') || trimmed.ends_with('(') || trimmed.ends_with('[');
+    let python_block =
+        doc.language == super::document::LanguageId::Python && trimmed.ends_with(':');
+    if opener || python_block {
         indent.push_str("    ");
     }
     indent
@@ -478,6 +479,30 @@ pub fn clamp_horizontal_left(left: i32, content_width: usize, view_width: usize)
 mod tests {
     use super::*;
     use crate::editor::document::DocumentId;
+
+    #[test]
+    fn python_newline_indents_after_a_colon() {
+        let doc = Document::new(DocumentId(1), Some("app.py".into()), "def greet():".into());
+        let mut view = EditorView::new(doc.id);
+        view.cursor = Position::new(0, doc.rope.len_chars());
+        assert_eq!(indent_for_newline(&doc, &view), "    ");
+        let doc = Document::new(DocumentId(1), Some("app.py".into()), "x = 1".into());
+        let mut view = EditorView::new(doc.id);
+        view.cursor = Position::new(0, doc.rope.len_chars());
+        assert_eq!(indent_for_newline(&doc, &view), "");
+    }
+
+    #[test]
+    fn java_newline_indents_after_a_brace() {
+        let doc = Document::new(DocumentId(1), Some("App.java".into()), "class Box {".into());
+        let mut view = EditorView::new(doc.id);
+        view.cursor = Position::new(0, doc.rope.len_chars());
+        assert_eq!(indent_for_newline(&doc, &view), "    ");
+        let doc = Document::new(DocumentId(1), Some("App.java".into()), "int x = 1;".into());
+        let mut view = EditorView::new(doc.id);
+        view.cursor = Position::new(0, doc.rope.len_chars());
+        assert_eq!(indent_for_newline(&doc, &view), "");
+    }
 
     #[test]
     fn insert_and_move() {

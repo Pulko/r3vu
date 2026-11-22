@@ -48,11 +48,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     } else {
         Style::default().fg(theme.fg_muted)
     };
-    let types_off = matches!(app.lsp_status, LspStatus::Unavailable(_));
-    let types_down = matches!(
-        app.lsp_status,
-        LspStatus::Unavailable(_) | LspStatus::Error(_)
-    );
+    let lsp_status = app.active_lsp_status().clone();
+    let types_off = matches!(lsp_status, LspStatus::Unavailable(_));
+    let types_down = matches!(lsp_status, LspStatus::Unavailable(_) | LspStatus::Error(_));
     let types_style = if matches!(app.overlay, Overlay::TypesNote) {
         Style::default()
             .fg(theme.on_accent)
@@ -60,7 +58,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             .add_modifier(Modifier::BOLD)
     } else if types_off {
         Style::default().fg(theme.deleted)
-    } else if matches!(app.lsp_status, LspStatus::Error(_)) {
+    } else if matches!(lsp_status, LspStatus::Error(_)) {
         Style::default().fg(theme.warning)
     } else {
         Style::default().fg(theme.fg_dim)
@@ -88,7 +86,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             action: markdown.then_some(StatusAction::Markdown),
         },
         Piece {
-            text: format!(" {} ", status_text(&app.lsp_status)),
+            text: format!(" {} ", status_text(&lsp_status)),
             style: types_style,
             action: types_down.then_some(StatusAction::Types),
         },

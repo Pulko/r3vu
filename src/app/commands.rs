@@ -1994,6 +1994,16 @@ pub(crate) fn discard_git_path(app: &mut App, path: PathBuf) {
         .cloned()
         .collect();
     paths.sort();
+    let restore_tree = paths.iter().all(|child| {
+        app.git_status.get(child).copied().is_some_and(|status| {
+            status.conflict.is_none()
+                && whole_file_action(status) == Some(WholeFileAction::Restore)
+        })
+    });
+    if restore_tree {
+        app.enqueue_git_write(GitWrite::Restore(path));
+        return;
+    }
     for child in paths {
         discard_one(app, child);
     }
@@ -3027,28 +3037,12 @@ pub fn open_selected_git(app: &mut App) {
 
 pub fn toggle_selected_git(app: &mut App) {
     let rows = app.git_rows();
-    let (path, staged, deleted_dir) = match rows.get(app.git_selected) {
-        Some(crate::workspace::GitPanelRow::File { path, staged, .. }) => {
-            (path.clone(), *staged, false)
-        }
-        Some(crate::workspace::GitPanelRow::Dir {
-            path,
-            staged,
-            deleted: true,
-            ..
-        }) => (path.clone(), *staged, true),
-        Some(crate::workspace::GitPanelRow::Dir {
-            path,
-            staged,
-            deleted: false,
-            ..
-        }) => {
-            app.toggle_git_folder(path.clone(), *staged);
-            return;
-        }
+    let (path, staged) = match rows.get(app.git_selected) {
+        Some(crate::workspace::GitPanelRow::File { path, staged, .. })
+        | Some(crate::workspace::GitPanelRow::Dir { path, staged, .. }) => (path.clone(), *staged),
         _ => return,
     };
-    if !deleted_dir && deleted_conflict(app, &path) {
+    if app.git_status.contains_key(&path) && deleted_conflict(app, &path) {
         app.resolve_delete(path);
         return;
     }
@@ -3189,6 +3183,7 @@ pub fn receive_git_write(app: &mut App, result: crate::workspace::GitWriteResult
     let branch = result.branch;
     let message = result.message.clone();
     app.note_git_write(result);
+    let idle = app.git_writes_idle();
     if branch {
         if ok {
             if matches!(app.overlay, Overlay::Branches { .. }) {
@@ -3224,13 +3219,17 @@ pub fn receive_git_write(app: &mut App, result: crate::workspace::GitWriteResult
                 app.close_document(id);
             }
         }
-        let open = app.order.clone();
-        for id in open {
-            app.request_inline_diff(id);
+        if idle {
+            let open = app.order.clone();
+            for id in open {
+                app.request_inline_diff(id);
+            }
         }
     }
-    app.refresh_git_status();
-    app.refresh_open_reviews();
+    if idle {
+        app.refresh_git_status();
+        app.refresh_open_reviews();
+    }
 }
 
 pub fn click_explorer(app: &mut App, y: u16) {

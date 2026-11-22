@@ -278,7 +278,7 @@ fn dir_line(
         &mark,
         color,
         discard,
-        deleted.then_some(staged),
+        Some(staged),
         row_hovered(app, path, staged),
         theme,
         name_style,

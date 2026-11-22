@@ -569,7 +569,7 @@ pub(crate) fn shortcut_rows(git: bool) -> Vec<(&'static str, &'static str)> {
         rows.extend([
             ("Ctrl+Shift+G", "Git panel"),
             ("Click Changes", "Stage and commit"),
-            ("Space", "Stage or unstage the file"),
+            ("Space", "Stage or unstage the file or folder"),
             ("Click ↩", "Discard or restore the file or folder"),
             ("Click ▾", "Fold or unfold a change"),
             ("Click Stage", "Stage, unstage, discard, or revert a hunk"),

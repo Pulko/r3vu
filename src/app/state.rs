@@ -418,6 +418,7 @@ pub struct App {
     pub git_status: HashMap<PathBuf, GitPathStatus>,
     git_status_running: bool,
     git_status_again: bool,
+    git_status_after_write: bool,
     git_status_at: Option<Instant>,
     git_external: bool,
     pub diff_baselines: HashMap<DocumentId, FileBaselines>,
@@ -558,6 +559,7 @@ impl App {
             git_status: HashMap::new(),
             git_status_running: false,
             git_status_again: false,
+            git_status_after_write: false,
             git_status_at: None,
             git_external: false,
             diff_baselines: HashMap::new(),
@@ -704,12 +706,18 @@ impl App {
         if !due {
             return;
         }
+        if self.git_write_running || !self.git_write_queue.is_empty() {
+            self.git_status_after_write = true;
+            self.git_status_at = None;
+            return;
+        }
         if self.git_status_running {
             self.git_status_again = true;
             self.git_status_at = None;
             return;
         }
         self.git_status_at = None;
+        self.git_status_after_write = false;
         self.git_status_running = true;
         crate::workspace::spawn_git_status(self.root.clone(), self.git_status_tx.clone());
     }
@@ -1015,10 +1023,12 @@ impl App {
                 if external && !follow_up {
                     crate::app::commands::settle_external_git(self);
                 }
-                let open: Vec<_> = self.order.clone();
-                for id in open {
-                    self.request_inline_diff(id);
-                    self.request_review_patches(id);
+                if self.git_write_queue.is_empty() {
+                    let open: Vec<_> = self.order.clone();
+                    for id in open {
+                        self.request_inline_diff(id);
+                        self.request_review_patches(id);
+                    }
                 }
             }
             Err(crate::workspace::GitStatusError::NotARepository) => {
@@ -1029,8 +1039,14 @@ impl App {
                 self.absorb_turn_status(&self.git_status.clone());
             }
         }
-        if self.git_status_again {
-            self.git_status_again = false;
+        self.git_status_again = false;
+        if !self.git_write_queue.is_empty() {
+            if follow_up || self.git_status_at.is_some() {
+                self.git_status_after_write = true;
+                self.git_status_at = None;
+            }
+            self.start_queued_git_write();
+        } else if follow_up {
             if self.git_status_at.is_none() {
                 self.git_status_at = Some(Instant::now());
             }
@@ -1123,7 +1139,7 @@ impl App {
             self.message = Some(message);
             return;
         }
-        if self.git_write_running {
+        if self.git_write_running || self.git_status_running {
             self.git_write_queue.push_back(write);
             return;
         }
@@ -1133,6 +1149,19 @@ impl App {
     fn start_git_write(&mut self, write: GitWrite) {
         self.git_write_running = true;
         crate::workspace::spawn_git_write(self.root.clone(), write, self.git_write_tx.clone());
+    }
+
+    fn start_queued_git_write(&mut self) {
+        if self.git_write_running || self.git_status_running {
+            return;
+        }
+        if let Some(next) = self.git_write_queue.pop_front() {
+            self.start_git_write(next);
+        }
+    }
+
+    pub(crate) fn git_writes_idle(&self) -> bool {
+        !self.git_write_running && self.git_write_queue.is_empty()
     }
 
     pub fn note_git_write(&mut self, result: GitWriteResult) {
@@ -1153,6 +1182,9 @@ impl App {
             }
         } else if !result.message.is_empty() {
             self.message = Some(result.message);
+        }
+        if self.git_status_running {
+            return;
         }
         if let Some(next) = self.git_write_queue.pop_front() {
             self.start_git_write(next);
@@ -1189,10 +1221,79 @@ impl App {
     }
 
     pub fn toggle_stage(&mut self, path: PathBuf, staged: bool) {
+        if self.git_status.contains_key(&path) {
+            if staged {
+                self.unstage_path(path);
+            } else {
+                self.stage_path(path);
+            }
+            return;
+        }
+        self.toggle_stage_folder(path, staged);
+    }
+
+    fn toggle_stage_folder(&mut self, dir: PathBuf, staged: bool) {
+        self.git_publish_armed = false;
+        let mut children: Vec<_> = self
+            .git_status
+            .iter()
+            .filter(|(path, _)| path.starts_with(&dir) && path.as_path() != dir.as_path())
+            .map(|(path, status)| (path.clone(), *status))
+            .collect();
+        children.sort_by(|left, right| left.0.cmp(&right.0));
         if staged {
-            self.unstage_path(path);
+            let targets: Vec<_> = children
+                .iter()
+                .filter(|(_, status)| status.staged.is_some() && status.conflict.is_none())
+                .map(|(path, _)| path.clone())
+                .collect();
+            if targets.is_empty() {
+                self.message = Some("Nothing staged".into());
+                return;
+            }
+            if targets.iter().any(|path| self.buffer_dirty(path)) {
+                self.message = Some("Save first".into());
+                return;
+            }
+            if children.iter().any(|(path, _)| self.conflict_blocks(path)) {
+                for path in targets {
+                    self.enqueue_git_write(GitWrite::Unstage(path));
+                }
+            } else {
+                self.enqueue_git_write(GitWrite::Unstage(dir));
+            }
+            return;
+        }
+        let targets: Vec<_> = children
+            .iter()
+            .filter(|(path, status)| {
+                !self.conflict_blocks(path)
+                    && (status.unstaged.is_some()
+                        || status.conflict == Some(crate::workspace::ConflictKind::Both))
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        if targets.is_empty() {
+            self.message = Some(
+                if children.iter().any(|(path, _)| self.conflict_blocks(path)) {
+                    "Resolve the conflicts first"
+                } else {
+                    "No changes to stage"
+                }
+                .into(),
+            );
+            return;
+        }
+        if targets.iter().any(|path| self.buffer_dirty(path)) {
+            self.message = Some("Save first".into());
+            return;
+        }
+        if children.iter().any(|(path, _)| self.conflict_blocks(path)) {
+            for path in targets {
+                self.enqueue_git_write(GitWrite::Stage(path));
+            }
         } else {
-            self.stage_path(path);
+            self.enqueue_git_write(GitWrite::Stage(dir));
         }
     }
 
@@ -2862,6 +2963,165 @@ mod tests {
             vec![GitWrite::Restore(kept), GitWrite::Restore(other)]
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn staging_a_folder_stages_the_directory() {
+        with_runtime(|| {
+            let mut app = test_app();
+            app.git_repo = true;
+            app.git_write_running = true;
+            let root = PathBuf::from("/repo");
+            app.root = root.clone();
+            let kept = root.join("src/kept.rs");
+            let other = root.join("src/other.rs");
+            let outside = root.join("notes.txt");
+            for path in [&kept, &other, &outside] {
+                app.git_status.insert(
+                    path.clone(),
+                    GitPathStatus {
+                        staged: None,
+                        unstaged: Some(GitFileStatus::Modified),
+                        conflict: None,
+                    },
+                );
+            }
+            app.toggle_stage(root.join("src"), false);
+            assert_eq!(
+                app.git_write_queue.iter().cloned().collect::<Vec<_>>(),
+                vec![GitWrite::Stage(root.join("src"))]
+            );
+
+            app.git_write_queue.clear();
+            app.git_status.get_mut(&kept).unwrap().staged = Some(GitFileStatus::Modified);
+            app.git_status.get_mut(&kept).unwrap().unstaged = None;
+            app.git_status.get_mut(&other).unwrap().staged = Some(GitFileStatus::Modified);
+            app.git_status.get_mut(&other).unwrap().unstaged = None;
+            app.toggle_stage(root.join("src"), true);
+            assert_eq!(
+                app.git_write_queue.iter().cloned().collect::<Vec<_>>(),
+                vec![GitWrite::Unstage(root.join("src"))]
+            );
+        });
+    }
+
+    #[test]
+    fn staging_a_folder_skips_conflicts_and_unsaved_files() {
+        with_runtime(|| {
+            let mut app = test_app();
+            app.git_repo = true;
+            app.git_write_running = true;
+            let root = PathBuf::from("/repo");
+            app.root = root.clone();
+            let kept = root.join("src/kept.rs");
+            let fight = root.join("src/fight.rs");
+            app.git_status.insert(
+                kept.clone(),
+                GitPathStatus {
+                    staged: None,
+                    unstaged: Some(GitFileStatus::Modified),
+                    conflict: None,
+                },
+            );
+            app.git_status.insert(
+                fight,
+                GitPathStatus {
+                    staged: None,
+                    unstaged: None,
+                    conflict: Some(crate::workspace::ConflictKind::Both),
+                },
+            );
+            app.toggle_stage(root.join("src"), false);
+            assert_eq!(
+                app.git_write_queue.iter().cloned().collect::<Vec<_>>(),
+                vec![GitWrite::Stage(kept.clone())]
+            );
+
+            app.git_write_queue.clear();
+            let id = DocumentId(app.next_id);
+            app.next_id += 1;
+            let mut doc = Document::new(id, Some(kept.clone()), "fn main() {}\n".into());
+            doc.apply_replace(
+                crate::editor::Range::new(
+                    crate::editor::Position::new(0, 0),
+                    crate::editor::Position::new(0, 0),
+                ),
+                "x",
+                false,
+            );
+            app.documents.insert(id, doc);
+            app.toggle_stage(root.join("src"), false);
+            assert!(app.git_write_queue.is_empty());
+            assert_eq!(app.message.as_deref(), Some("Save first"));
+        });
+    }
+
+    #[test]
+    fn restoring_a_nested_deleted_folder_is_one_git_command() {
+        with_runtime(|| {
+            let mut app = test_app();
+            app.root = PathBuf::from("/repo");
+            app.git_repo = true;
+            app.git_write_running = true;
+            let child = PathBuf::from("/repo/app/dashboard");
+            for name in ["page.tsx", "panel.tsx"] {
+                app.git_status.insert(
+                    child.join(name),
+                    GitPathStatus {
+                        staged: None,
+                        unstaged: Some(GitFileStatus::Deleted),
+                        conflict: None,
+                    },
+                );
+            }
+            app.git_status.insert(
+                PathBuf::from("/repo/app/components/nav.tsx"),
+                GitPathStatus {
+                    staged: None,
+                    unstaged: Some(GitFileStatus::Deleted),
+                    conflict: None,
+                },
+            );
+            crate::app::commands::discard_git_path(&mut app, child.clone());
+            assert_eq!(
+                app.git_write_queue.iter().cloned().collect::<Vec<_>>(),
+                vec![GitWrite::Restore(child)]
+            );
+        });
+    }
+
+    #[test]
+    fn a_git_write_waits_until_status_releases_the_index() {
+        with_runtime(|| {
+            let root = std::env::temp_dir().join(format!("p0-index-lock-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let mut app = test_app();
+            app.root = root.clone();
+            app.git_repo = true;
+            app.git_status_running = true;
+            let path = root.join("app/dashboard");
+            app.enqueue_git_write(GitWrite::Restore(path.clone()));
+            assert!(!app.git_write_running);
+            assert_eq!(
+                app.git_write_queue.iter().cloned().collect::<Vec<_>>(),
+                vec![GitWrite::Restore(path)]
+            );
+            app.git_status_at = Some(std::time::Instant::now());
+            app.pump_git_status();
+            assert!(app.git_status_running);
+            assert!(app.git_status_after_write);
+            assert!(app.git_status_at.is_none());
+            app.receive_git_status(Err(GitStatusError::Unavailable));
+            assert!(app.git_write_running);
+            assert!(app.git_write_queue.is_empty());
+            assert!(!app.git_status_running);
+            app.git_status_at = Some(std::time::Instant::now());
+            app.pump_git_status();
+            assert!(!app.git_status_running);
+            assert!(app.git_status_after_write);
+            let _ = std::fs::remove_dir_all(&root);
+        });
     }
 
     #[test]

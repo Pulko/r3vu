@@ -829,6 +829,7 @@ pub fn delete_path(path: &Path) -> io::Result<()> {
 pub fn spawn_git_status(root: PathBuf, tx: mpsc::UnboundedSender<GitStatusUpdate>) {
     tokio::spawn(async move {
         let output = Command::new("git")
+            .arg("--no-optional-locks")
             .arg("-C")
             .arg(&root)
             .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])

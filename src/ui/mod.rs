@@ -825,9 +825,29 @@ mod tests {
         assert!(chevron_x >= fold.x && chevron_x < fold.x.saturating_add(fold.width));
         assert!(slice_text(&buffer, discard.x, discard.y, discard.width).contains("↩"));
         assert_eq!(buffer[(discard.x, discard.y)].fg, app.theme().deleted);
-        assert!(!app.git_hits.iter().any(|hit| {
-            hit.y == discard.y && matches!(hit.action, crate::app::state::GitClick::Toggle { .. })
-        }));
+        let stage = app
+            .git_hits
+            .iter()
+            .find(|hit| {
+                hit.y == discard.y
+                    && matches!(
+                        &hit.action,
+                        crate::app::state::GitClick::Toggle {
+                            path,
+                            staged: false,
+                        } if path.ends_with("src")
+                    )
+            })
+            .expect("folder stage");
+        let inner_end = app.explorer_area.0 + app.explorer_area.2 - 1;
+        let letter = inner_end.saturating_sub(1);
+        assert_eq!(buffer[(letter, stage.y)].symbol(), "M");
+        assert!(stage.x.saturating_add(stage.width) < letter);
+        assert_eq!(
+            stage.x,
+            discard.x.saturating_add(discard.width).saturating_add(1)
+        );
+        assert!(slice_text(&buffer, stage.x, stage.y, stage.width).contains("+"));
         assert!(!app.git_hits.iter().any(|hit| {
             matches!(
                 &hit.action,

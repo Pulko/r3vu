@@ -85,7 +85,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 return;
             }
             KeyCode::Char('q') | KeyCode::Char('Q') => return commands::maybe_quit(app),
-            KeyCode::Char('w') | KeyCode::Char('W') => return app.close_active(false),
+            KeyCode::Char('w') | KeyCode::Char('W') => return app.close_active(),
             KeyCode::Char('c') | KeyCode::Char('C') => return commands::copy(app),
             KeyCode::Char('x') | KeyCode::Char('X') => return commands::cut(app),
             KeyCode::Char('v') | KeyCode::Char('V') => {
@@ -503,7 +503,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                     .copied()
                 {
                     if x == tab.close_x {
-                        app.close_document(tab.document_id, false);
+                        app.close_document(tab.document_id);
                     } else {
                         app.active = Some(tab.document_id);
                         app.focus = Focus::Editor;
@@ -572,7 +572,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                         && x >= hit_x
                         && x < hit_x.saturating_add(width)
                     {
-                        commands::confirm_restore_active(app);
+                        commands::restore_active(app);
                     }
                     return;
                 }
@@ -610,7 +610,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                 .find(|tab| x >= tab.x && x < tab.x + tab.width)
                 .copied()
             {
-                app.close_document(tab.document_id, false);
+                app.close_document(tab.document_id);
             }
         }
         MouseEventKind::Down(MouseButton::Right) => {

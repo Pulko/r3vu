@@ -16,7 +16,7 @@ use crate::language::{
 use crate::syntax::SyntaxService;
 use crate::workspace::{
     ExplorerEntry, FileBaselines, FileDiffResult, FileFinder, GitDiffResult, GitFileStatus,
-    GitPathStatus, GitWrite, GitWriteResult, LineChanges, ParsedGitDiff, SearchMatch,
+    GitPathStatus, GitWrite, GitWriteResult, LineChanges, ParsedGitDiff, SearchMatch, delete_path,
 };
 
 use super::config::Config;
@@ -39,15 +39,7 @@ pub enum PromptKind {
 
 #[derive(Clone, Debug)]
 pub enum ConfirmAction {
-    DeletePath(PathBuf),
-    Quit,
     Reload(DocumentId),
-    Close(DocumentId),
-    CloseMany(Vec<DocumentId>),
-    DiscardHunk { patch: String, path: PathBuf },
-    RestoreFile(PathBuf),
-    DiscardAdded(PathBuf),
-    ResolveDelete(PathBuf),
 }
 
 #[derive(Clone, Debug)]
@@ -1299,7 +1291,7 @@ impl App {
             return;
         }
         if action == HunkAction::DeleteFile {
-            self.confirm_delete_conflict();
+            self.delete_conflict();
             return;
         }
         let Some(path) = self.documents.get(&id).and_then(|doc| doc.path.clone()) else {
@@ -1370,12 +1362,7 @@ impl App {
                 reverse: true,
                 reload: None,
             }),
-            HunkAction::Discard => {
-                self.overlay = Overlay::Confirm {
-                    message: "Discard this hunk?".into(),
-                    action: ConfirmAction::DiscardHunk { patch, path },
-                };
-            }
+            HunkAction::Discard => self.discard_hunk(patch, path),
             HunkAction::Revert
             | HunkAction::Fold
             | HunkAction::Current
@@ -1790,19 +1777,8 @@ impl App {
         }
     }
 
-    pub fn close_active(&mut self, force: bool) {
+    pub fn close_active(&mut self) {
         let Some(id) = self.active else { return };
-        if !force {
-            if let Some(doc) = self.documents.get(&id) {
-                if doc.is_dirty() {
-                    self.overlay = Overlay::Confirm {
-                        message: "Unsaved changes. Close anyway?".into(),
-                        action: ConfirmAction::Close(id),
-                    };
-                    return;
-                }
-            }
-        }
         if let Some(doc) = self.documents.remove(&id) {
             self.syntax.close(id);
             if let Some(path) = doc.path {
@@ -1885,36 +1861,22 @@ impl App {
         };
     }
 
-    pub fn close_document(&mut self, id: DocumentId, force: bool) {
+    pub fn close_document(&mut self, id: DocumentId) {
         if self.documents.contains_key(&id) {
             self.active = Some(id);
-            self.close_active(force);
+            self.close_active();
         }
     }
 
-    pub fn close_documents(&mut self, ids: &[DocumentId], force: bool) {
+    pub fn close_documents(&mut self, ids: &[DocumentId]) {
         let targets: Vec<DocumentId> = ids
             .iter()
             .copied()
             .filter(|id| self.documents.contains_key(id))
             .collect();
-        if targets.is_empty() {
-            return;
-        }
-        if !force
-            && targets
-                .iter()
-                .any(|id| self.documents.get(id).is_some_and(|doc| doc.is_dirty()))
-        {
-            self.overlay = Overlay::Confirm {
-                message: "Unsaved changes. Close anyway?".into(),
-                action: ConfirmAction::CloseMany(targets),
-            };
-            return;
-        }
         for id in targets {
             self.active = Some(id);
-            self.close_active(true);
+            self.close_active();
         }
     }
 
@@ -2270,15 +2232,52 @@ impl App {
         self.enqueue_git_write(GitWrite::Stage(path));
     }
 
-    pub fn confirm_delete_conflict(&mut self) {
+    pub fn delete_conflict(&mut self) {
         let Some(path) = self.active_doc().and_then(|doc| doc.path.clone()) else {
             return;
         };
-        let name = self.relative(&path);
-        self.overlay = Overlay::Confirm {
-            message: format!("Delete {name}?"),
-            action: ConfirmAction::ResolveDelete(path),
-        };
+        self.resolve_delete(path);
+    }
+
+    pub fn resolve_delete(&mut self, path: PathBuf) {
+        if path.exists() {
+            if let Err(err) = delete_path(&path) {
+                self.message = Some(format!("delete failed: {err}"));
+                return;
+            }
+            self.close_documents_under(&path);
+            self.refresh_explorer();
+        }
+        self.git_publish_armed = false;
+        self.enqueue_git_write(GitWrite::Stage(path));
+        self.refresh_git_status();
+    }
+
+    pub fn delete_path_now(&mut self, path: PathBuf) {
+        if let Err(err) = delete_path(&path) {
+            self.message = Some(format!("delete failed: {err}"));
+            return;
+        }
+        self.close_documents_under(&path);
+        self.refresh_explorer();
+        self.refresh_git_status();
+    }
+
+    fn close_documents_under(&mut self, path: &Path) {
+        let ids: Vec<_> = self
+            .documents
+            .iter()
+            .filter(|(_, doc)| {
+                doc.path
+                    .as_ref()
+                    .is_some_and(|item| item == path || item.starts_with(path))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.active = Some(id);
+            self.close_active();
+        }
     }
 
     pub fn settle_conflict_cursor(&mut self) {

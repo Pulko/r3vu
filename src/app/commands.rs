@@ -14,7 +14,7 @@ use crate::language::{
     strip_snippets, utf16_position_to_doc,
 };
 use crate::workspace::{
-    GitWrite, WatchEvent, WholeFileAction, create_path, delete_path, find_in_document, rename_path,
+    GitWrite, WatchEvent, WholeFileAction, create_path, find_in_document, rename_path,
     whole_file_action,
 };
 
@@ -819,52 +819,20 @@ fn completion_replacement(
 }
 
 pub fn confirm_yes(app: &mut App) {
-    let Overlay::Confirm { action, .. } = app.overlay.clone() else {
+    let Overlay::Confirm {
+        action: ConfirmAction::Reload(id),
+        ..
+    } = app.overlay.clone()
+    else {
         return;
     };
     app.overlay = Overlay::None;
-    match action {
-        ConfirmAction::Quit => app.should_quit = true,
-        ConfirmAction::Close(id) => {
-            app.active = Some(id);
-            app.close_active(true);
-        }
-        ConfirmAction::CloseMany(ids) => app.close_documents(&ids, true),
-        ConfirmAction::Reload(id) => {
-            if let Some(doc) = app.documents.get(&id) {
-                if let Some(path) = doc.path.clone() {
-                    app.documents.remove(&id);
-                    app.views.remove(&id);
-                    app.order.retain(|x| *x != id);
-                    app.open_path(path);
-                }
-            }
-        }
-        ConfirmAction::DiscardHunk { patch, path } => app.discard_hunk(patch, path),
-        ConfirmAction::RestoreFile(path) => app.enqueue_git_write(GitWrite::Restore(path)),
-        ConfirmAction::DiscardAdded(path) => app.enqueue_git_write(GitWrite::Remove(path)),
-        ConfirmAction::ResolveDelete(path) => resolve_delete(app, path),
-        ConfirmAction::DeletePath(path) => {
-            if let Err(err) = delete_path(&path) {
-                app.message = Some(format!("delete failed: {err}"));
-            } else {
-                let ids: Vec<_> = app
-                    .documents
-                    .iter()
-                    .filter(|(_, d)| {
-                        d.path
-                            .as_ref()
-                            .is_some_and(|p| p == &path || p.starts_with(&path))
-                    })
-                    .map(|(id, _)| *id)
-                    .collect();
-                for id in ids {
-                    app.active = Some(id);
-                    app.close_active(true);
-                }
-                app.refresh_explorer();
-                app.refresh_git_status();
-            }
+    if let Some(doc) = app.documents.get(&id) {
+        if let Some(path) = doc.path.clone() {
+            app.documents.remove(&id);
+            app.views.remove(&id);
+            app.order.retain(|x| *x != id);
+            app.open_path(path);
         }
     }
 }
@@ -1976,34 +1944,7 @@ pub fn show_git_menu(app: &mut App, x: u16, y: u16) {
     };
 }
 
-fn resolve_delete(app: &mut App, path: PathBuf) {
-    if path.exists() {
-        if let Err(err) = delete_path(&path) {
-            app.message = Some(format!("delete failed: {err}"));
-            return;
-        }
-        let ids: Vec<_> = app
-            .documents
-            .iter()
-            .filter(|(_, doc)| {
-                doc.path
-                    .as_ref()
-                    .is_some_and(|item| item == &path || item.starts_with(&path))
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for id in ids {
-            app.active = Some(id);
-            app.close_active(true);
-        }
-        app.refresh_explorer();
-    }
-    app.git_publish_armed = false;
-    app.enqueue_git_write(GitWrite::Stage(path));
-    app.refresh_git_status();
-}
-
-fn confirm_selected_git_file(app: &mut App) {
+fn apply_selected_git_file(app: &mut App) {
     let rows = app.git_rows();
     if let Some(crate::workspace::GitPanelRow::Dir {
         path,
@@ -2011,11 +1952,7 @@ fn confirm_selected_git_file(app: &mut App) {
         ..
     }) = rows.get(app.git_selected)
     {
-        let name = app.relative(path);
-        app.overlay = Overlay::Confirm {
-            message: format!("Restore {name}/?"),
-            action: ConfirmAction::RestoreFile(path.clone()),
-        };
+        app.enqueue_git_write(GitWrite::Restore(path.clone()));
         return;
     }
     let Some(crate::workspace::GitPanelRow::File { path, .. }) = rows.get(app.git_selected) else {
@@ -2025,24 +1962,15 @@ fn confirm_selected_git_file(app: &mut App) {
     let Some(status) = app.git_status.get(&path).copied() else {
         return;
     };
-    let name = app.relative(&path);
-    let (message, action) = match whole_file_action(status) {
-        Some(WholeFileAction::Restore) => {
-            (format!("Restore {name}?"), ConfirmAction::RestoreFile(path))
-        }
-        Some(WholeFileAction::Remove) => (
-            format!("Discard {name}?"),
-            ConfirmAction::DiscardAdded(path),
-        ),
-        Some(WholeFileAction::Delete) => {
-            (format!("Delete {name}?"), ConfirmAction::DeletePath(path))
-        }
-        None => return,
-    };
-    app.overlay = Overlay::Confirm { message, action };
+    match whole_file_action(status) {
+        Some(WholeFileAction::Restore) => app.enqueue_git_write(GitWrite::Restore(path)),
+        Some(WholeFileAction::Remove) => app.enqueue_git_write(GitWrite::Remove(path)),
+        Some(WholeFileAction::Delete) => app.delete_path_now(path),
+        None => {}
+    }
 }
 
-pub fn confirm_restore_active(app: &mut App) {
+pub fn restore_active(app: &mut App) {
     let Some(id) = app.active else {
         return;
     };
@@ -2052,11 +1980,7 @@ pub fn confirm_restore_active(app: &mut App) {
     let Some(path) = app.documents.get(&id).and_then(|doc| doc.path.clone()) else {
         return;
     };
-    let name = app.relative(&path);
-    app.overlay = Overlay::Confirm {
-        message: format!("Restore {name}?"),
-        action: ConfirmAction::RestoreFile(path),
-    };
+    app.enqueue_git_write(GitWrite::Restore(path));
 }
 
 pub fn complete_file_rename(app: &mut App, token: u64, items: Vec<TextEdit>, failed: bool) {
@@ -2209,36 +2133,25 @@ pub fn run_menu(app: &mut App, action: MenuAction) {
                 .copied()
                 .filter(|open| *open != id)
                 .collect();
-            app.close_documents(&ids, false);
+            app.close_documents(&ids);
         }
         MenuAction::CloseAll => {
             let ids = app.order.clone();
-            app.close_documents(&ids, false);
+            app.close_documents(&ids);
         }
         MenuAction::AskClaude => start_thread(app),
-        MenuAction::DiscardFile => confirm_selected_git_file(app),
-        MenuAction::RestoreFile => confirm_selected_git_file(app),
+        MenuAction::DiscardFile => apply_selected_git_file(app),
+        MenuAction::RestoreFile => apply_selected_git_file(app),
         MenuAction::DeletePath => {
             if let Some(entry) = app.explorer_entries.get(app.explorer_selected) {
-                app.overlay = Overlay::Confirm {
-                    message: format!("Delete {}?", entry.name),
-                    action: ConfirmAction::DeletePath(entry.path.clone()),
-                };
+                app.delete_path_now(entry.path.clone());
             }
         }
     }
 }
 
 pub fn maybe_quit(app: &mut App) {
-    let dirty = app.documents.values().any(|d| d.is_dirty());
-    if dirty {
-        app.overlay = Overlay::Confirm {
-            message: "Unsaved changes. Quit anyway?".into(),
-            action: ConfirmAction::Quit,
-        };
-    } else {
-        app.should_quit = true;
-    }
+    app.should_quit = true;
 }
 
 fn utf16(doc: &crate::editor::Document, pos: Position) -> Position {
@@ -3027,7 +2940,7 @@ pub fn open_selected_git(app: &mut App) {
     let path = path.clone();
     let staged = *staged;
     if deleted_conflict(app, &path) {
-        confirm_resolve_delete(app, path);
+        app.resolve_delete(path);
         return;
     }
     app.open_git_entry(path, staged);
@@ -3057,7 +2970,7 @@ pub fn toggle_selected_git(app: &mut App) {
         _ => return,
     };
     if !deleted_dir && deleted_conflict(app, &path) {
-        confirm_resolve_delete(app, path);
+        app.resolve_delete(path);
         return;
     }
     app.toggle_stage(path, staged);
@@ -3067,14 +2980,6 @@ fn deleted_conflict(app: &App, path: &std::path::Path) -> bool {
     app.git_status
         .get(path)
         .is_some_and(|status| status.conflict == Some(crate::workspace::ConflictKind::Deleted))
-}
-
-fn confirm_resolve_delete(app: &mut App, path: PathBuf) {
-    let name = app.relative(&path);
-    app.overlay = Overlay::Confirm {
-        message: format!("Delete {name}?"),
-        action: ConfirmAction::ResolveDelete(path),
-    };
 }
 
 pub fn git_file_index_at(app: &App, y: u16) -> Option<usize> {
@@ -3139,7 +3044,7 @@ pub fn click_git(app: &mut App, x: u16, y: u16) {
                 app.toggle_git_folder(path, staged);
             }
             crate::app::state::GitClick::DeleteConflict { path } => {
-                confirm_resolve_delete(app, path);
+                app.resolve_delete(path);
             }
             crate::app::state::GitClick::Open { path, staged } => {
                 app.git_selected = app
@@ -3214,7 +3119,7 @@ pub fn receive_git_write(app: &mut App, result: crate::workspace::GitWriteResult
                 .map(|(id, _)| *id)
                 .collect();
             for id in ids {
-                app.close_document(id, true);
+                app.close_document(id);
             }
         }
         let open = app.order.clone();
@@ -3250,8 +3155,8 @@ mod tests {
     use crate::language::LanguageClient;
 
     use super::{
-        MenuAction, WheelAction, WheelAxis, confirm_yes, editor_context_labels, editor_search_seed,
-        open_search, open_search_file, run_menu, search_seed, set_search_scope, wheel_action,
+        MenuAction, WheelAction, WheelAxis, editor_context_labels, editor_search_seed, open_search,
+        open_search_file, run_menu, search_seed, set_search_scope, wheel_action,
     };
 
     fn with_runtime<T>(body: impl FnOnce() -> T) -> T {
@@ -3521,27 +3426,17 @@ mod tests {
     }
 
     #[test]
-    fn close_others_confirms_before_dropping_a_dirty_tab() {
+    fn close_others_drops_a_dirty_tab() {
         let (mut app, ids) = app_with_tabs(3);
         app.documents.get_mut(&ids[2]).unwrap().revision = 1;
         run_menu(&mut app, MenuAction::CloseOthers(ids[1]));
-        match &app.overlay {
-            Overlay::Confirm {
-                action: ConfirmAction::CloseMany(targets),
-                ..
-            } => {
-                assert_eq!(targets, &vec![ids[0], ids[2]]);
-            }
-            other => panic!("expected confirm, got {other:?}"),
-        }
-        assert_eq!(app.order, ids);
-        confirm_yes(&mut app);
+        assert!(matches!(app.overlay, Overlay::None));
         assert_eq!(app.order, vec![ids[1]]);
         assert_eq!(app.active, Some(ids[1]));
     }
 
     #[test]
-    fn close_others_skips_the_prompt_when_only_the_kept_tab_is_dirty() {
+    fn close_others_keeps_a_dirty_tab_that_stays_open() {
         let (mut app, ids) = app_with_tabs(2);
         app.documents.get_mut(&ids[0]).unwrap().revision = 1;
         run_menu(&mut app, MenuAction::CloseOthers(ids[0]));
@@ -3775,7 +3670,7 @@ mod tests {
     }
 
     #[test]
-    fn a_deleted_folder_confirms_one_restore() {
+    fn a_deleted_folder_restores_without_a_prompt() {
         let root = std::env::temp_dir().join(format!("p0-restore-dir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -3803,17 +3698,9 @@ mod tests {
                 )
             })
             .expect("deleted folder");
-        super::run_menu(&mut app, MenuAction::RestoreFile);
-        match &app.overlay {
-            Overlay::Confirm {
-                action: ConfirmAction::RestoreFile(path),
-                message,
-            } => {
-                assert_eq!(path, &gone);
-                assert_eq!(message, "Restore src/old/?");
-            }
-            other => panic!("expected confirm, got {other:?}"),
-        }
+        with_runtime(|| super::run_menu(&mut app, MenuAction::RestoreFile));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.git_busy());
         let _ = std::fs::remove_dir_all(&root);
     }
 

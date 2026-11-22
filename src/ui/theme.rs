@@ -25,6 +25,7 @@ pub struct Theme {
     pub border: Color,
     pub accent: Color,
     pub folder: Color,
+    pub file: Color,
     pub added: Color,
     pub added_bg: Color,
     pub modified: Color,
@@ -88,7 +89,8 @@ const P0: Theme = Theme {
     operator: Color::Rgb(168, 168, 168),
     border: Color::Rgb(90, 90, 90),
     accent: Color::Rgb(110, 186, 196),
-    folder: Color::Rgb(196, 208, 214),
+    folder: Color::Rgb(156, 184, 200),
+    file: Color::Rgb(174, 174, 174),
     added: Color::Rgb(46, 160, 67),
     added_bg: Color::Rgb(22, 48, 32),
     modified: Color::Rgb(56, 132, 214),
@@ -122,7 +124,8 @@ const LIGHT: Theme = Theme {
     operator: Color::Rgb(80, 80, 80),
     border: Color::Rgb(180, 180, 180),
     accent: Color::Rgb(0, 92, 150),
-    folder: Color::Rgb(36, 72, 104),
+    folder: Color::Rgb(62, 96, 118),
+    file: Color::Rgb(88, 92, 98),
     added: Color::Rgb(20, 120, 50),
     added_bg: Color::Rgb(214, 240, 220),
     modified: Color::Rgb(20, 80, 170),
@@ -156,7 +159,8 @@ const CONTRAST: Theme = Theme {
     operator: Color::Rgb(220, 220, 220),
     border: Color::Rgb(200, 200, 200),
     accent: Color::Rgb(80, 200, 255),
-    folder: Color::Rgb(200, 230, 255),
+    folder: Color::Rgb(170, 206, 224),
+    file: Color::Rgb(196, 196, 196),
     added: Color::Rgb(0, 220, 80),
     added_bg: Color::Rgb(0, 48, 16),
     modified: Color::Rgb(80, 160, 255),
@@ -190,7 +194,8 @@ const OCEAN: Theme = Theme {
     operator: Color::Rgb(160, 180, 196),
     border: Color::Rgb(60, 90, 110),
     accent: Color::Rgb(127, 209, 200),
-    folder: Color::Rgb(190, 214, 226),
+    folder: Color::Rgb(176, 180, 214),
+    file: Color::Rgb(190, 180, 168),
     added: Color::Rgb(80, 190, 120),
     added_bg: Color::Rgb(16, 52, 40),
     modified: Color::Rgb(90, 160, 230),
@@ -224,7 +229,8 @@ const EMBER: Theme = Theme {
     operator: Color::Rgb(180, 164, 148),
     border: Color::Rgb(90, 74, 62),
     accent: Color::Rgb(224, 159, 109),
-    folder: Color::Rgb(230, 210, 190),
+    folder: Color::Rgb(168, 186, 200),
+    file: Color::Rgb(196, 184, 170),
     added: Color::Rgb(120, 180, 90),
     added_bg: Color::Rgb(40, 48, 28),
     modified: Color::Rgb(120, 150, 210),
@@ -291,5 +297,85 @@ mod tests {
             assert_ne!(theme.untracked, theme.added, "{name}");
             assert_ne!(theme.untracked, theme.fg_dim, "{name}");
         }
+    }
+
+    #[test]
+    fn folder_and_file_stay_pale_and_readable() {
+        for name in theme_names() {
+            let theme = by_name(name);
+            assert_ne!(theme.folder, theme.file, "{name}");
+            assert!(
+                contrast(theme.file, theme.bg) >= 4.5,
+                "{name} file contrast"
+            );
+            assert!(
+                contrast(theme.folder, theme.bg) >= 4.5,
+                "{name} folder contrast"
+            );
+            assert!(spread(theme.file) <= 40, "{name} file chroma");
+            assert!(spread(theme.folder) <= 70, "{name} folder chroma");
+            let pair = distance(theme.folder, theme.file);
+            for status in [
+                theme.added,
+                theme.deleted,
+                theme.warning,
+                theme.untracked,
+                theme.accent,
+            ] {
+                assert!(
+                    distance(theme.folder, status) > pair,
+                    "{name} folder stays quieter than status"
+                );
+                assert!(
+                    distance(theme.file, status) > pair,
+                    "{name} file stays quieter than status"
+                );
+            }
+        }
+    }
+
+    fn rgb(color: Color) -> (u8, u8, u8) {
+        match color {
+            Color::Rgb(r, g, b) => (r, g, b),
+            other => panic!("theme color is not rgb: {other:?}"),
+        }
+    }
+
+    fn channel(component: u8) -> f64 {
+        let s = f64::from(component) / 255.0;
+        if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn contrast(a: Color, b: Color) -> f64 {
+        let luminance = |color: Color| {
+            let (r, g, b) = rgb(color);
+            0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+        };
+        let left = luminance(a);
+        let right = luminance(b);
+        let (hi, lo) = if left > right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    fn distance(a: Color, b: Color) -> f64 {
+        let (ar, ag, ab) = rgb(a);
+        let (br, bg, bb) = rgb(b);
+        let dr = f64::from(ar) - f64::from(br);
+        let dg = f64::from(ag) - f64::from(bg);
+        let db = f64::from(ab) - f64::from(bb);
+        (dr * dr + dg * dg + db * db).sqrt()
+    }
+
+    fn spread(color: Color) -> u8 {
+        let (r, g, b) = rgb(color);
+        r.max(g).max(b) - r.min(g).min(b)
     }
 }

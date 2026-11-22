@@ -218,7 +218,7 @@ fn row_line(
             depth,
         } => {
             let indent = " ".repeat(depth.saturating_mul(2));
-            let name_style = paint(theme.fg_muted);
+            let name_style = paint(theme.file);
             let discard = file_discardable(app, path);
             let open = GitClick::Open {
                 path: path.clone(),
@@ -260,7 +260,7 @@ fn dir_line(
     y: u16,
 ) -> Line<'static> {
     let indent = " ".repeat(depth.saturating_mul(2));
-    let name_style = Style::default().fg(theme.fg_muted);
+    let name_style = Style::default().fg(theme.folder);
     let color = super::explorer::git_mark_color(status, staged, theme);
     let mark = format!(" {}", letter(status));
     let marker = if expanded { "▾ " } else { "▸ " };

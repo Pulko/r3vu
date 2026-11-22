@@ -166,7 +166,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         let style = Style::default().fg(status.unwrap_or(if entry.is_dir {
             theme.folder
         } else {
-            theme.fg_muted
+            theme.file
         }));
         let mark = status_mark(dirty, git);
         let mark_style = status
